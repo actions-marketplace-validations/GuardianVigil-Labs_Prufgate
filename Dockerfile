@@ -51,7 +51,7 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
 # ==============================================================================
 # Stage 2: runtime
 # ==============================================================================
-FROM python:3.14-slim-bookworm@sha256:945c2676dc2b18e0c1f16879244122c57c0ffede60006bf3df159c507a31bcae AS core
+FROM python:3.15-slim-bookworm@sha256:575f8bc12ec26542e0678bc6b60e385218248019d433157ec327264a78c3a853 AS core
 
 # tests/test_workflows.py keeps the version equal to prufgate.__version__.
 LABEL org.opencontainers.image.title="PrufGate" \
