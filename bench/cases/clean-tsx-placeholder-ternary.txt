@@ -1,0 +1,20 @@
+-- label.yaml --
+category: clean
+description: "Example addresses in a multi-line placeholder and in a 'for example' hint."
+must_fire: []
+must_not_fire: [documentation-address]
+-- base/src/Field.tsx --
+export const Field = () => <input />;
+-- head/src/Field.tsx --
+export const Field = ({ kind }: { kind: string }) => (
+  <input
+    placeholder={
+      kind === "url" ? "https://example.com/path"
+      : "name"
+    }
+  />
+);
+
+export function hint(): string {
+  return "Enter a full URL, for example https://api.example.com/hook.";
+}

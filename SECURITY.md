@@ -52,18 +52,18 @@ Every release is built by `.github/workflows/release.yml` from a `v*` tag, with 
 
 ```sh
 # Download the release files, check them against SHA256SUMS and their provenance, then install the checked wheel:
-gh release download v1.1.0 --repo GuardianVigil-Labs/Prufgate
+gh release download v1.2.0 --repo GuardianVigil-Labs/Prufgate
 sha256sum -c SHA256SUMS
-gh attestation verify prufgate-1.1.0-py3-none-any.whl --repo GuardianVigil-Labs/Prufgate
+gh attestation verify prufgate-1.2.0-py3-none-any.whl --repo GuardianVigil-Labs/Prufgate
 # Or offline, with the attestations attached to the release:
-gh attestation verify prufgate-1.1.0-py3-none-any.whl --repo GuardianVigil-Labs/Prufgate --bundle prufgate-1.1.0-py3-none-any.whl.intoto.jsonl
-pip install ./prufgate-1.1.0-py3-none-any.whl
+gh attestation verify prufgate-1.2.0-py3-none-any.whl --repo GuardianVigil-Labs/Prufgate --bundle prufgate-1.2.0-py3-none-any.whl.intoto.jsonl
+pip install ./prufgate-1.2.0-py3-none-any.whl
 ```
 
 **The zipapp** (`prufgate.pyz`, one file that needs only Python 3.9+; releases after 1.0.0) is on the GitHub release, listed in `SHA256SUMS` and attested like the wheel. It is reproducible: `SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" python3 scripts/build_pyz.py` on the tagged commit gives the same SHA-256 (the build downloads the PyYAML sdist pinned and hash-checked in `requirements.txt`; the same zlib is assumed).
 
 ```sh
-gh release download v1.1.0 --repo GuardianVigil-Labs/Prufgate --pattern prufgate.pyz --pattern 'prufgate.pyz.intoto.jsonl' --pattern SHA256SUMS
+gh release download v1.2.0 --repo GuardianVigil-Labs/Prufgate --pattern prufgate.pyz --pattern 'prufgate.pyz.intoto.jsonl' --pattern SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
 gh attestation verify prufgate.pyz --repo GuardianVigil-Labs/Prufgate
 gh attestation verify prufgate.pyz --repo GuardianVigil-Labs/Prufgate --bundle prufgate.pyz.intoto.jsonl   # offline
@@ -75,12 +75,12 @@ PyPI also shows the Trusted Publishing provenance of each file (the "Verified de
 **The container image** (cosign v3 or newer; older versions do not read the signature format):
 
 ```sh
-cosign verify ghcr.io/guardianvigil-labs/prufgate:1.1.0 \
-  --certificate-identity "https://github.com/GuardianVigil-Labs/Prufgate/.github/workflows/release.yml@refs/tags/v1.1.0" \
+cosign verify ghcr.io/guardianvigil-labs/prufgate:1.2.0 \
+  --certificate-identity "https://github.com/GuardianVigil-Labs/Prufgate/.github/workflows/release.yml@refs/tags/v1.2.0" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
-gh attestation verify oci://ghcr.io/guardianvigil-labs/prufgate:1.1.0 --repo GuardianVigil-Labs/Prufgate
+gh attestation verify oci://ghcr.io/guardianvigil-labs/prufgate:1.2.0 --repo GuardianVigil-Labs/Prufgate
 ```
 
-Pin the image by the digest that `cosign verify` prints (`ghcr.io/guardianvigil-labs/prufgate@sha256:...`). The image SBOM is stored with the image in the registry (`docker buildx imagetools inspect ghcr.io/guardianvigil-labs/prufgate:1.1.0 --format '{{ json .SBOM }}'`); the wheel SBOM is `prufgate-wheel.cdx.json` on the GitHub release.
+Pin the image by the digest that `cosign verify` prints (`ghcr.io/guardianvigil-labs/prufgate@sha256:...`). The image SBOM is stored with the image in the registry (`docker buildx imagetools inspect ghcr.io/guardianvigil-labs/prufgate:1.2.0 --format '{{ json .SBOM }}'`); the wheel SBOM is `prufgate-wheel.cdx.json` on the GitHub release.
 
 A file, image or signature that does not verify is not a PrufGate release: do not use it, and report it as described above.

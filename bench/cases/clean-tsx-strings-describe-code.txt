@@ -1,0 +1,12 @@
+-- label.yaml --
+category: clean
+description: "A page listing the patterns a gate catches, as strings."
+must_fire: []
+must_not_fire: [stub-click-handler, simulated-return-value, suppression-comment-smuggling]
+-- base/src/Tips.tsx --
+export const Tips = () => <ul />;
+-- head/src/Tips.tsx --
+// A simulated list of what the gate reports.
+const TIPS = ["onClick={() => {}}", "return { ok: true }", "# noqa", "@ts-ignore"];
+
+export const Tips = () => <ul>{TIPS.map((t) => <li key={t}>{t}</li>)}</ul>;

@@ -32,6 +32,7 @@ if str(_THIS_DIR.parent.parent) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR.parent.parent))
 
 from prufgate import __version__, inline_ignore  # noqa: E402
+from prufgate.anti_fabrication.literals import search_code  # noqa: E402
 from prufgate.bola.bola_engine import INTERNAL_SCANNER_PATHS, is_self_scan, is_test_path  # noqa: E402
 from prufgate.config import ConfigError  # noqa: E402
 from prufgate.diff_guard.tamper_detector import scan_diff_for_tampering  # noqa: E402
@@ -148,29 +149,53 @@ def get_git_diff(base_ref: str = DEFAULT_BASE, cwd: Path | None = None, strict: 
 
 def parse_diff_hunks(diff_text: str) -> list[dict[str, Any]]:
     """Parse a unified git diff into file-scoped added lines with new-file line numbers."""
+    from prufgate.diff_scope import _HUNK_RE, _unquote_git_path
+
     hunks: list[dict[str, Any]] = []
     current_file: str | None = None
     current_line = 0
     in_header = False  # between `diff --git` and the first `@@`
+    old_left = 0
+    new_left = 0
+    ctx_lines: list[str] = []
 
     for line in diff_text.splitlines():
         if line.startswith("diff --git "):
             current_file, in_header = None, True
+            old_left = new_left = 0
+            ctx_lines = []
         elif in_header and line.startswith("+++ "):
-            target = line[4:].strip()
-            current_file = target[2:] if target.startswith("b/") else None  # None for /dev/null
+            raw = line[4:]
+            current_file = None if raw.strip() == "/dev/null" or raw.strip().startswith("/dev/null\t") else _unquote_git_path(raw, "b/")
         elif line.startswith("@@ "):
             in_header = False
-            m = re.search(r"\+(\d+)(?:,\d+)? @@", line)
+            ctx_lines = []
+            m = _HUNK_RE.match(line)
             if m:
-                current_line = int(m.group(1)) - 1
+                old_left = int(m.group(2)) if m.group(2) is not None else 1
+                current_line = int(m.group(3)) - 1
+                new_left = int(m.group(4)) if m.group(4) is not None else 1
         elif in_header or current_file is None or line.startswith("\\"):
             continue
         elif line.startswith("+"):
             current_line += 1
-            hunks.append({"file": current_file, "line": current_line, "content": line[1:]})
-        elif not line.startswith("-"):
+            new_left = max(0, new_left - 1)
+            hunks.append(
+                {
+                    "file": current_file,
+                    "line": current_line,
+                    "content": line[1:],
+                    "prev_ctx": list(ctx_lines[-3:]),
+                }
+            )
+            ctx_lines = []
+        elif line.startswith("-"):
+            old_left = max(0, old_left - 1)
+        else:
             current_line += 1
+            old_left = max(0, old_left - 1)
+            new_left = max(0, new_left - 1)
+            ctx_lines.append(line[1:] if line.startswith(" ") else line)
 
     return hunks
 
@@ -183,6 +208,43 @@ def _skip_review_path(file: str, skip_internal: bool) -> bool:
     if any(seg in _GENERATED_SEGMENTS for seg in parts[:-1]) or is_test_path(file):
         return True
     return skip_internal and file.startswith(INTERNAL_SCANNER_PATHS)
+
+
+# A query whose first argument is a template literal with `${...}` in it. `${}` in a
+# later argument (the bind parameters) is a value, not SQL; in '...' or "..." it is text.
+_SQL_CALL = r"""\b(?:query|execute|rawQuery|Exec|Query|QueryRow)\s*\(\s*"""
+SQL_TEMPLATE_RE = re.compile(_SQL_CALL + r"""`[^`]*?\$\{[^}]+\}""", re.IGNORECASE)
+SQL_SPRINTF_RE = re.compile(_SQL_CALL + r"""fmt\.Sprintf\(["'][^"']*?%[sv]""", re.IGNORECASE)
+SQL_FSTRING_RE = re.compile(r"""\b(?:cursor\.execute|session\.execute)\s*\(\s*f["'][^"']*?\{[^}]+\}""", re.IGNORECASE)
+SQL_CALL_OPEN_RE = re.compile(_SQL_CALL + r"""(`[^`]*)?(?:\s*(?://|#).*)?$""", re.IGNORECASE)
+SHELL_TEMPLATE_RE = re.compile(r"""\bexec(?:Sync)?\s*\(\s*`[^`]*?\$\{[^}]+\}""")
+
+
+def _multiline_sql_template(content: str, hunks: list[dict[str, Any]], idx: int) -> bool:
+    """`db.query(` or ``db.query(`SELECT ...`` at the end of a line, with the template
+    literal that follows (on the next added lines) interpolating `${...}` before it closes."""
+    if "${" in content and any(search_code(SQL_CALL_OPEN_RE, c.strip()) for c in hunks[idx].get("prev_ctx") or ()):
+        return True
+    m = search_code(SQL_CALL_OPEN_RE, content)
+    if not m:
+        return False
+    text = m.group(1) or ""
+    file, line_no = hunks[idx]["file"], hunks[idx]["line"]
+    for k, h in enumerate(hunks[idx + 1 : idx + 16], start=1):
+        if h["file"] != file or h["line"] != line_no + k:
+            return False
+        nxt = h["content"].strip()
+        if not text:
+            if not nxt.startswith("`"):
+                return False
+            text, nxt = "`", nxt[1:]
+        close = nxt.find("`")
+        part = nxt if close < 0 else nxt[:close]
+        if "${" in part:
+            return True
+        if close >= 0:
+            return False
+    return False
 
 
 def analyze_diff(hunks: list[dict[str, Any]], skip_internal: bool = False) -> list[PRComment]:
@@ -210,9 +272,10 @@ def analyze_diff(hunks: list[dict[str, Any]], skip_internal: bool = False) -> li
 
         # 1. SQL Injection / String concatenation in queries
         if (
-            re.search(r"""\b(?:query|execute|rawQuery|Exec|Query|QueryRow)\s*\(\s*["'`].*?\$\{[^}]+\}""", content, re.IGNORECASE)
-            or re.search(r"""\b(?:query|execute|rawQuery|Exec|Query|QueryRow)\s*\(\s*fmt\.Sprintf\(["'].*?%[sv]""", content, re.IGNORECASE)
-            or re.search(r"""\b(?:cursor\.execute|session\.execute)\s*\(\s*f["'].*?\{[^}]+\}""", content, re.IGNORECASE)
+            search_code(SQL_TEMPLATE_RE, content)
+            or search_code(SQL_SPRINTF_RE, content)
+            or search_code(SQL_FSTRING_RE, content)
+            or _multiline_sql_template(content, hunks, idx)
         ):
             comments.append(
                 PRComment(
@@ -243,7 +306,7 @@ def analyze_diff(hunks: list[dict[str, Any]], skip_internal: bool = False) -> li
         # 3. Command Injection / Unsafe Shell Execution
         if (
             re.search(r"""\bsubprocess\.(?:run|Popen|call|check_output)\s*\(.*?\bshell\s*=\s*True\b""", content)
-            or re.search(r"""\bexec(?:Sync)?\s*\(\s*`.*?\$\{[^}]+\}""", content)
+            or search_code(SHELL_TEMPLATE_RE, content)
         ):
             comments.append(
                 PRComment(

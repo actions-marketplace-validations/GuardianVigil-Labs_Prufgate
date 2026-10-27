@@ -1,0 +1,19 @@
+-- label.yaml --
+category: clean
+description: "A catch that answers a failure as a failure, with the reason."
+must_fire: []
+must_not_fire: [canned-error-fallback]
+-- base/src/notes.ts --
+export async function saveNote(text: string) {
+  await store.put(text);
+  return { success: true };
+}
+-- head/src/notes.ts --
+export async function saveNote(text: string) {
+  try {
+    await store.put(text);
+    return { success: true };
+  } catch {
+    return { success: false, error: "The note could not be saved." };
+  }
+}

@@ -61,7 +61,14 @@ SUPPORTED_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".
 
 
 def _git_paths(workspace: Path, args: list[str]) -> list[str]:
-    res = subprocess.run(["git", *args], cwd=workspace, capture_output=True, text=True, timeout=30, check=False)
+    res = subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
     if res.returncode != 0:
         raise RuntimeError(f"git {args[0]} failed: {res.stderr.strip()[:200]}")
     return [p for p in res.stdout.split("\0") if p]
@@ -76,7 +83,11 @@ def _changed_files(workspace: Path, base: str | None = None) -> list[Path] | Non
     if base is not None and (not base or base.startswith("-")):
         raise ValueError(f"invalid base ref: {base!r}")
     probe = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"], cwd=workspace, capture_output=True, text=True, check=False
+        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "rev-parse", "--is-inside-work-tree"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if probe.returncode != 0:
         if base is not None:
@@ -108,24 +119,58 @@ def _added_lines(workspace: Path, base: str | None) -> dict[str, set[int]]:
     tree) is treated as wholly added by the caller; a file whose diff adds no lines (a mode
     change) maps to an empty set. Outside a repository there is no diff ({}); inside one,
     a diff that cannot be computed raises GitDiffError: it must not pass."""
-    probe = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=workspace, capture_output=True, check=False)
+    from prufgate.diff_scope import _HUNK_RE, _unquote_git_path
+
+    probe = subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "rev-parse", "--is-inside-work-tree"],
+        cwd=workspace,
+        capture_output=True,
+        check=False,
+    )
     if probe.returncode != 0 and base is None:
         return {}
     commit = _diff_base(base, workspace)
-    diff = _git(["diff", "-U0", "--no-color", "--no-ext-diff", "--relative", commit], workspace)
+    diff = _git(
+        ["-c", "core.quotePath=false", "diff", "-U0", "-M", "--text", "--no-color", "--no-ext-diff", "--relative", commit],
+        workspace,
+    )
     added: dict[str, set[int]] = {}
     current = None
+    old_left = 0
+    new_left = 0
     for line in diff.splitlines():
-        header = re.match(r"diff --git a/.* b/(.*)$", line)
-        if header:
-            current = added.setdefault(header.group(1), set())
-        elif line.startswith("+++ "):
-            current = added.setdefault(line[6:], set()) if line.startswith("+++ b/") else None
-        elif line.startswith("@@ ") and current is not None:
-            m = re.search(r"\+(\d+)(?:,(\d+))?", line)
-            if m:
-                start, count = int(m.group(1)), int(m.group(2) or "1")
-                current.update(range(start, start + count))
+        if old_left > 0 or new_left > 0:
+            if line.startswith("-") and old_left > 0:
+                old_left -= 1
+                continue
+            if line.startswith("+") and new_left > 0:
+                new_left -= 1
+                continue
+            if line.startswith(" ") and old_left > 0 and new_left > 0:
+                old_left -= 1
+                new_left -= 1
+                continue
+            if line.startswith("\\"):
+                continue
+        if line.startswith("diff --git "):
+            header = re.match(r"diff --git a/.* b/(.*)$", line)
+            current = added.setdefault(header.group(1), set()) if header else None
+            old_left = new_left = 0
+        elif line.startswith("rename to ") and old_left == 0 and new_left == 0:
+            rel = _unquote_git_path(line[len("rename to "):])
+            if rel:
+                current = added.setdefault(rel, set())
+        elif line.startswith("--- ") and old_left == 0:
+            new_left = 0
+        elif line.startswith("+++ ") and new_left == 0:
+            rel = _unquote_git_path(line[4:], prefix="b/")
+            current = added.setdefault(rel, set()) if rel else None
+            old_left = 0
+        elif current is not None and (m := _HUNK_RE.match(line)):
+            old_left = int(m.group(2) or "1")
+            start, count = int(m.group(3)), int(m.group(4) or "1")
+            new_left = count
+            current.update(range(start, start + count))
     return added
 
 

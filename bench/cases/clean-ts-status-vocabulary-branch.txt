@@ -1,0 +1,24 @@
+-- label.yaml --
+category: clean
+description: "A new branch on a status value the code already names; the test exercises it."
+must_fire: []
+must_not_fire: [test-input-special-casing]
+-- base/src/status.ts --
+type Status = "active" | "retired";
+
+export function isLive(s: Status): boolean {
+  return true;
+}
+-- head/src/status.ts --
+type Status = "active" | "retired";
+
+export function isLive(s: Status): boolean {
+  if (s === "retired") return false;
+  return true;
+}
+-- head/src/status.test.ts --
+import { isLive } from "./status";
+
+it("treats retired as not live", () => {
+  expect(isLive("retired")).toBe(false);
+});

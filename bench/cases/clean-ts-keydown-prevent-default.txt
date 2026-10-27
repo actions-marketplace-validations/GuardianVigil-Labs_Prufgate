@@ -1,0 +1,23 @@
+-- label.yaml --
+category: clean
+description: "preventDefault in a keyboard handler and in a submit handler that does its work."
+must_fire: []
+must_not_fire: [disconnected-form-submit]
+-- base/src/tabs.ts --
+export const KEYS = ["Home", "End"];
+-- head/src/tabs.ts --
+export const KEYS = ["Home", "End"];
+
+export function wire(el: HTMLElement, form: HTMLFormElement, input: HTMLInputElement) {
+  el.addEventListener("keydown", (e) => {
+    if (e.key !== "End") return;
+    e.preventDefault();
+    go("last");
+  });
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const v = input.value.trim();
+    if (!v) return;
+    show(await scanSite(v));
+  });
+}

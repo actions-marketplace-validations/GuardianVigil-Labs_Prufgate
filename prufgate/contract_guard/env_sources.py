@@ -12,7 +12,9 @@ A variable read in code counts as documented when one of these declares it:
   nothing, so the variables of that workload still need another source;
 - Helm `values*.yaml` (`env:` blocks) and chart templates (`- name: UPPER_CASE`; Kubernetes
   object names are lower case, so an upper-case name there is an environment variable);
-- GitHub Actions workflow `env:` blocks.
+- GitHub Actions workflow `env:` blocks;
+- Cloudflare Workers: `[vars]` (and `[env.<name>.vars]`) in `wrangler.toml`, `vars` (top level
+  and per environment) in `wrangler.json` / `wrangler.jsonc`, and the dotenv-style `.dev.vars*`.
 
 Only conventional paths are read, files over `MAX_SOURCE_BYTES` are skipped, and the `exclude`
 configuration applies. A file that cannot be read or parsed is skipped with a warning on stderr,
@@ -22,6 +24,7 @@ like an unreadable `.env.example`: skipping a source can only add findings, neve
 from __future__ import annotations
 
 import ast
+import json
 import re
 import sys
 from pathlib import Path
@@ -220,6 +223,74 @@ def _collect(node: dict[Any, Any], sink: dict[str, Any]) -> None:
                         sink["env_from"].append((str(ref["name"]), str(item.get("prefix") or "")))
 
 
+# --- Cloudflare wrangler -------------------------------------------------------------------------
+
+_TOML_TABLE_RE = re.compile(r"""^\s*\[\[?\s*([A-Za-z0-9_."' -]+(?:\.[A-Za-z0-9_."' -]+)*)\s*\]\]?\s*(?:#.*)?$""")
+_TOML_KEY_RE = re.compile(r"""^\s*["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*=""")
+_TOML_INLINE_VARS_RE = re.compile(r"""^\s*vars\s*=\s*\{([^}]*)\}""", re.MULTILINE)
+_INLINE_KEY_RE = re.compile(r"""(?:^|,)\s*["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*=""")
+
+
+def wrangler_toml_vars(text: str) -> set[str]:
+    """Keys of `[vars]` / `[env.<name>.vars]` tables and of inline `vars = { ... }`."""
+    names: set[str] = set()
+    in_vars = False
+    bracket_depth = 0
+    for line in text.splitlines():
+        code_line = line.split("#", 1)[0]
+        if bracket_depth <= 0 and (table := _TOML_TABLE_RE.match(line)):
+            parts = [p.strip().strip("\"'") for p in table.group(1).split(".")]
+            in_vars = parts == ["vars"] or (len(parts) == 3 and parts[0] == "env" and parts[2] == "vars")
+            bracket_depth = 0
+            continue
+        if in_vars and bracket_depth <= 0 and (m := _TOML_KEY_RE.match(line)):
+            names.add(m.group(1))
+        rhs = code_line.split("=", 1)[1] if (bracket_depth <= 0 and "=" in code_line) else code_line
+        bracket_depth = max(0, bracket_depth + rhs.count("[") - rhs.count("]"))
+    for m in _TOML_INLINE_VARS_RE.finditer(text):
+        names |= set(_INLINE_KEY_RE.findall(m.group(1)))
+    return names
+
+
+def _strip_jsonc(text: str) -> str:
+    """JSON with comments and trailing commas (wrangler.jsonc) as plain JSON."""
+    out, i, n, in_str = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(c)
+        elif text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def wrangler_json_vars(text: str) -> set[str]:
+    """Keys of `vars`, top level and under each `env.<name>`, in wrangler.json(c)."""
+    data = json.loads(_strip_jsonc(text))
+    if not isinstance(data, dict):
+        return set()
+    envs = data.get("env")
+    blocks = [data] + ([e for e in envs.values() if isinstance(e, dict)] if isinstance(envs, dict) else [])
+    return {str(k) for b in blocks if isinstance(b.get("vars"), dict) for k in b["vars"]}
+
+
 def _is_yaml_source(rel: str) -> bool:
     parts = rel.lower().split("/")
     name = parts[-1]
@@ -248,13 +319,27 @@ def load_env_sources(workspace: Path, config: PrufGateConfig | None = None) -> s
     compose_env_files: list[tuple[Path, str]] = []
     root = workspace.resolve()
 
-    for path in iter_workspace_files(workspace, _JS_SUFFIXES | _YAML_SUFFIXES | {".py"}):
+    for path in iter_workspace_files(workspace, _JS_SUFFIXES | _YAML_SUFFIXES | {".py", ".toml", ".json", ".jsonc", ".vars", ".example"}):
         rel = str(path.relative_to(workspace)).replace("\\", "/")
         if cfg.is_excluded(rel) or is_test_path(rel) or not path.resolve().is_relative_to(root):
             continue  # a symlink to a file outside the workspace documents nothing
         suffix = path.suffix.lower()
         stem = path.name.lower()
-        if suffix in _JS_SUFFIXES:
+        if stem.startswith(".dev.vars"):
+            if (text := _read(path, rel)) is not None:
+                names |= _dotenv_keys(text)
+        elif stem in ("wrangler.json", "wrangler.jsonc"):
+            if (text := _read(path, rel)) is not None:
+                try:
+                    names |= wrangler_json_vars(text)
+                except ValueError as e:
+                    _warn(rel, f"invalid JSON: {e}")
+        elif stem == "wrangler.toml":
+            if (text := _read(path, rel)) is not None:
+                names |= wrangler_toml_vars(text)
+        elif suffix in (".toml", ".json", ".jsonc", ".vars", ".example"):
+            continue
+        elif suffix in _JS_SUFFIXES:
             if "env" in stem and (text := _read(path, rel)) is not None:
                 names |= zod_env_vars(text)
         elif suffix == ".py":

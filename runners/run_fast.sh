@@ -78,6 +78,18 @@ if [ "${FULL}" -eq 0 ] || in_git_repo; then
   printf '%s\n' "${BASE_REF}" >"${RAW_DIR}/base_ref"
 fi
 
+# A changed-files run judges only what the change touched: the lines it added or
+# modified (prufgate/diff_scope.py). The synthesizer drops findings elsewhere, and
+# ast-grep, zizmor and BOLA get only the changed files. A full run writes no scope.
+export PRUFGATE_CHANGED_FILES=""
+if [ "${FULL}" -eq 0 ] && [ "${DIFF_OK}" -eq 1 ]; then
+  PRUFGATE_CHANGED_FILES="${RAW_DIR}/changed_files.txt"
+  if ! python3 "${ENGINE}/diff_scope.py" "--base=${BASE_REF}" --json-out="${RAW_DIR}/changed_lines.json" \
+      >"${PRUFGATE_CHANGED_FILES}" 2>"${RAW_DIR}/diff-scope.log"; then
+    record_tool_status "diff-scope" "config" "error" 2 0 "$(tr '\n' ' ' <"${RAW_DIR}/diff-scope.log")"
+  fi
+fi
+
 echo "▶ [PrufGate] Starting verification gate (scope: ${SCAN_SCOPE}${BASE_REF:+, base: ${BASE_REF}})"
 
 # Optional structural and workflow checks (ast-grep, zizmor)
@@ -88,7 +100,17 @@ fi
 # Optional secret scan
 if command -v gitleaks >/dev/null 2>&1; then
   echo "  Running gitleaks secret scan..."
-  if in_git_repo; then
+  if in_git_repo && [ -n "${PRUFGATE_CHANGED_FILES}" ]; then
+    # Changed scope: the branch's commits, and uncommitted edits (line-scoped later).
+    if [ -n "${BASE_REF}" ]; then
+      run_step gitleaks security gitleaks git --no-banner --log-opts="${BASE_REF}..HEAD" --config "$(gitleaks_config)" --report-format json --report-path "${RAW_DIR}/gitleaks.json"
+    else
+      echo "[]" >"${RAW_DIR}/gitleaks.json"
+    fi
+    if [ -n "$(git -C "${WORKSPACE}" -c core.hooksPath=/dev/null -c core.fsmonitor=false status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+      run_step gitleaks-worktree security gitleaks dir --no-banner --config "$(gitleaks_config)" --report-format json --report-path "${RAW_DIR}/gitleaks_worktree.json" .
+    fi
+  elif in_git_repo; then
     run_step gitleaks security gitleaks git --no-banner --config "$(gitleaks_config)" --report-format json --report-path "${RAW_DIR}/gitleaks.json"
   else
     run_step gitleaks security gitleaks detect --no-git --config "$(gitleaks_config)" --report-format json --report-path "${RAW_DIR}/gitleaks.json"
@@ -139,6 +161,8 @@ else
 fi
 # A changed-files run reads the PrufGate configuration at the base ref, like engines 1-4.
 [ "${FULL}" -eq 0 ] && [ -n "${BASE_REF}" ] && BOLA_ARGS+=("--base=${BASE_REF}")
+# Only the changed route, action and migration files.
+[ -n "${PRUFGATE_CHANGED_FILES}" ] && BOLA_ARGS+=("--changed")
 bola_json() { python3 "${ENGINE}/cli.py" bola "${WORKSPACE}" "${BOLA_ARGS[@]}" --format json >"${RAW_DIR}/bola_matrix.json"; }
 run_step bola-matrix security bola_json
 

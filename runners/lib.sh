@@ -50,7 +50,7 @@ gitleaks_config() {
 # A git repository gitleaks can read: `git rev-parse`, not `[ -d .git ]`,
 # because in a worktree or submodule .git is a file.
 in_git_repo() {
-  git -C "${WORKSPACE}" rev-parse --is-inside-work-tree >/dev/null 2>&1
+  git -C "${WORKSPACE}" -c core.hooksPath=/dev/null -c core.fsmonitor=false rev-parse --is-inside-work-tree >/dev/null 2>&1
 }
 
 MANIFEST_FILE="${RAW_DIR}/execution_manifest.jsonl"

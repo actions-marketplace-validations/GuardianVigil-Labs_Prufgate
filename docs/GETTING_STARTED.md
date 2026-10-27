@@ -11,7 +11,7 @@
 | Method | What you get |
 |---|---|
 | `pipx install prufgate` or `pip install prufgate` | The `prufgate` and `prufgate-mcp` commands from PyPI: every engine, the CLI, the MCP server and the API. The `prufgate.sh` shell gate is not part of the wheel. |
-| `docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.1.0` | The signed release image (amd64 and arm64): the `prufgate` command plus the full `prufgate.sh` gate with ast-grep, gitleaks and zizmor. With no arguments it runs `fast` on the mounted repository; `... prufgate:1.1.0 prufgate check .` runs the CLI. |
+| `docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.2.0` | The signed release image (amd64 and arm64): the `prufgate` command plus the full `prufgate.sh` gate with ast-grep, gitleaks and zizmor. With no arguments it runs `fast` on the mounted repository; `... prufgate:1.2.0 prufgate check .` runs the CLI. |
 | `pip install .` (in a checkout) | The same commands from a checkout. |
 | `./install.sh` | A `prufgate` launcher in `~/.local/bin` (or `/usr/local/bin`) that runs this checkout. Keep the checkout where it is. |
 | `make build`, then `bin/prufgate --docker ...` | A container image built from your checkout, the same as the release image. It is about 460 MB uncompressed (about 100 MB gzipped): the Python base and git, plus the three scanners (ast-grep about 55 MB, zizmor 27 MB, gitleaks 22 MB). The pip install and the GitHub Action need none of that. |
@@ -67,6 +67,16 @@ With `--changed`, PrufGate compares against a base ref and includes uncommitted 
 5. on a clean working tree only: `HEAD~1`
 
 A candidate the branch is not ahead of (for example `origin/HEAD` right after a pull) is skipped. A base ref that does not exist, or no usable base on a clean tree (often a shallow clone), is an error (exit 2), never "nothing changed". `prufgate base-ref` shows which base would be used. In CI, check out with full history (`fetch-depth: 0`).
+
+### A changed scan judges only the changed lines
+
+A pull request is judged on what it changed. With `--changed` (and in `prufgate.sh fast`, the GitHub Action and the container's default run), the engines still read whole files for context, but a finding is reported only when it sits on a line the change added or modified: debt already in a file you touched, and files you did not touch, are left to a full scan.
+
+- A finding on a line that opens a block (a function, a test, an `if`, `catch` or `except` body) covers the block, and a BOLA finding covers its handler: deleting a test's assertions or a handler's guard is a change to that test or route.
+- Rules about the diff itself keep working whatever line they point at: deleted test files, weakened assertions, skips and suppressions (`diff-*`, engine 3, the reviewer, configuration and baseline changes).
+- BOLA reports only route, action and migration files the change touched. Auth configured application-wide is still read from the whole repository.
+- In `prufgate.sh fast`, ast-grep gets only the changed files, zizmor only the changed workflows (a finding is kept when any of its locations, such as the trigger it depends on, is on a changed line), and gitleaks only the branch's commits (`<base>..HEAD`) plus uncommitted edits.
+- A full scan (`prufgate check` without `--changed`, `./prufgate.sh full`) applies no scope and reports everything. The number of findings left out goes to stderr.
 
 ## Auto-fix: `prufgate fix`
 

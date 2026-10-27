@@ -40,13 +40,14 @@ if str(_THIS_DIR.parent) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR.parent))
 
 import prufgate.contract_guard as cg_engine  # noqa: E402
-from prufgate import PROJECT_URL, __version__, inline_ignore  # noqa: E402
+from prufgate import PROJECT_URL, __version__, diff_scope, inline_ignore  # noqa: E402
 from prufgate.anti_fabrication import detector as af_detector  # noqa: E402
 from prufgate.anti_reward_hacking import test_integrity as ti_engine  # noqa: E402
 from prufgate.bola import bola_engine  # noqa: E402
 from prufgate.config import (  # noqa: E402
     AiAdjudicate,
     ConfigError,
+    GitDiffError,
     PrufGateConfig,
     expand_rule_aliases,
     rules_match,
@@ -112,26 +113,11 @@ def _collect_unified_findings(
     try:
         with inline_ignore.recording() as records:
             found = _collect_in_workspace(
-                workspace, target_path, changed_only, base_ref, config_path, ai_dismissed, ai_provider
+                workspace, target_path, changed_only, base_ref, config_path, ai_dismissed, ai_provider,
+                records=records, honoured=honoured,
             )
     finally:
         os.chdir(previous_cwd)
-    for e in records:
-        if e["kind"] == "missing-reason":
-            found.append(
-                {
-                    "engine": e["engine"],
-                    "rule": inline_ignore.MISSING_REASON_RULE,
-                    "severity": "P2",
-                    "file": e["file"],
-                    "line": e["line"],
-                    "message": f"{inline_ignore.MISSING_REASON_MESSAGE} It names `{e['rule']}`, which is still reported.",
-                    "snippet": "",
-                    "confidence": rule_confidence(inline_ignore.MISSING_REASON_RULE),
-                }
-            )
-        elif honoured is not None:
-            honoured.append(e)
     return found
 
 
@@ -214,9 +200,14 @@ def _collect_in_workspace(
     config_path: str | None,
     ai_dismissed: list[dict[str, Any]] | None = None,
     ai_provider: str | None = None,
+    records: list[dict[str, Any]] | None = None,
+    honoured: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    # A changed scan judges only the lines the change touched (prufgate/diff_scope.py).
+    ranges: diff_scope.Ranges | None = None
     if changed_only:
         base_ref = resolve_base_ref(base_ref)
+        ranges = diff_scope.changed_lines(base_ref, workspace)
     # With a base ref every engine applies the configuration at the base: the
     # branch's own edits take effect after merge. Engine 3 compares the two.
     head_cfg = PrufGateConfig.load(workspace, config_path)
@@ -250,6 +241,7 @@ def _collect_in_workspace(
                     "severity": "P0",
                     "file": rel_f,
                     "line": f.line,
+                    "end_line": f.end_line,
                     "message": f"Fabrication pattern '{f.rule}': {f.text}",
                     "snippet": f.text,
                 }
@@ -268,6 +260,7 @@ def _collect_in_workspace(
                             "severity": df.severity,
                             "file": df.path,
                             "line": df.line,
+                            "end_line": df.end_line,
                             "message": df.message,
                             "snippet": df.text,
                         }
@@ -302,6 +295,7 @@ def _collect_in_workspace(
                     "severity": tf_finding.severity,
                     "file": rel_tf,
                     "line": tf_finding.line,
+                    "end_line": tf_finding.end_line,
                     "message": tf_finding.message,
                     "snippet": tf_finding.text,
                 }
@@ -346,7 +340,9 @@ def _collect_in_workspace(
     # 5. Engine 5: Static Multi-Tenant BOLA Verification
     if target_path.is_dir():
         with redirect_stdout(io.StringIO()):
-            bola_findings = bola_engine.run_static_matrix_audit(workspace, config=cfg)
+            bola_findings = bola_engine.run_static_matrix_audit(
+                workspace, config=cfg, changed_files=set(ranges) if ranges is not None else None
+            )
         for bf in bola_findings:
             unified.append(
                 {
@@ -355,10 +351,20 @@ def _collect_in_workspace(
                     "severity": bf.severity,
                     "file": bf.endpoint_or_file,
                     "line": bf.line,
+                    "end_line": bf.end_line,
                     "message": bf.message,
                     "snippet": bf.details,
                 }
             )
+
+    if ranges is not None:
+        unified = [
+            f for f in unified
+            if diff_scope.in_scope(
+                ranges, str(f["engine"]), str(f["rule"]), str(f["file"]),
+                [(int(f["line"]), int(f.get("end_line") or f["line"]))], workspace,
+            )
+        ]
 
     # Deduplicate by (file, line, rule)
     deduped: list[dict[str, Any]] = []
@@ -393,14 +399,38 @@ def _collect_in_workspace(
                     "confidence": rule_confidence("debt-ceiling-breached"),
                 }
             )
-    elif cfg.known_debt_ceilings:
+    elif cfg.known_debt_ceilings and not changed_only:
         # A loosened configuration is never debt: the configuration under review sets the ceilings.
+        # In a changed scan, only changed lines were counted, so a repo-wide numeric ceiling
+        # cannot excuse brand-new findings on changed lines.
         deduped = [
             f
             for f in deduped
             if f["rule"] == "prufgate-config-self-exemption"
             or not any(rules_match(str(f["rule"]), r) for r in cfg.known_debt_ceilings)
         ]
+
+    for e in records or ():
+        if ranges is not None and not diff_scope.in_scope(
+            ranges, str(e.get("engine") or ""), str(e.get("rule") or ""), str(e.get("file") or ""),
+            [(int(e.get("line") or 1), int(e.get("line") or 1))], workspace,
+        ):
+            continue
+        if e["kind"] == "missing-reason":
+            deduped.append(
+                {
+                    "engine": e["engine"],
+                    "rule": inline_ignore.MISSING_REASON_RULE,
+                    "severity": "P2",
+                    "file": e["file"],
+                    "line": e["line"],
+                    "message": f"{inline_ignore.MISSING_REASON_MESSAGE} It names `{e['rule']}`, which is still reported.",
+                    "snippet": "",
+                    "confidence": rule_confidence(inline_ignore.MISSING_REASON_RULE),
+                }
+            )
+        elif honoured is not None:
+            honoured.append(e)
     # After the debt ratchet, so a dismissal never lowers a known_debt count.
     # AI adjudication only loosens the gate, so only the configuration in effect (read at
     # the base ref) turns it on; `--ai-adjudicate` alone is a request, never enough.
@@ -643,7 +673,16 @@ def _cmd_bola(args: argparse.Namespace) -> int:
 
     try:
         ws = Path(args.path).resolve()
-        cfg = PrufGateConfig.load(ws, args.config, ref=args.base)
+        base_ref = args.base
+        if args.changed and ws.is_dir():
+            prev_cwd = Path.cwd()
+            os.chdir(ws)
+            try:
+                base_ref = resolve_base_ref(args.base)
+            finally:
+                os.chdir(prev_cwd)
+        cfg_ref = base_ref or ("HEAD" if args.changed else None)
+        cfg = PrufGateConfig.load(ws, args.config, ref=cfg_ref)
         findings: list[bola_engine.BolaFinding] = []
         extra_paths: list[str] = []
         if args.max_routes < 0:
@@ -705,7 +744,15 @@ def _cmd_bola(args: argparse.Namespace) -> int:
                     ))
         if ws.exists():
             with redirect_stdout(io.StringIO()):
-                findings.extend(bola_engine.run_static_matrix_audit(ws, config=cfg))
+                ranges = diff_scope.changed_lines(base_ref, ws) if args.changed else None
+                changed = set(ranges) if ranges is not None else None
+                static_findings = bola_engine.run_static_matrix_audit(ws, config=cfg, changed_files=changed)
+                if ranges is not None:
+                    static_findings = [
+                        f for f in static_findings
+                        if diff_scope.in_scope(ranges, "bola", f.rule_id, f.endpoint_or_file, [(f.line, f.end_line)], ws)
+                    ]
+                findings.extend(static_findings)
         findings = visible(findings, cfg.enable_low_confidence)
 
         if args.format == "json":
@@ -718,7 +765,7 @@ def _cmd_bola(args: argparse.Namespace) -> int:
                 for f in findings:
                     print(f"  [{f.severity}] [{f.rule_id}] {f.endpoint_or_file}:{f.line} — {f.message}")
         return 1 if any(f.severity in ("P0", "P1") for f in findings) else 0
-    except ConfigError as exc:
+    except (ConfigError, GitDiffError) as exc:
         print(f"prufgate bola: {exc}", file=sys.stderr)
         return 2
     finally:
@@ -980,6 +1027,8 @@ def main(argv: list[str] | None = None) -> int:
     p_bola.add_argument("--static-only", action="store_true", help="Run only static route & query scoping checks")
     p_bola.add_argument("--config", default=None, help="Path to .prufgate/config.yaml")
     p_bola.add_argument("--base", default=None, help="Read the PrufGate configuration as it is at this base ref (changed-files runs)")
+    p_bola.add_argument("--changed", action="store_true",
+                        help="Static checks report only files changed against --base (else HEAD), untracked files included")
     p_bola.add_argument("--format", choices=("text", "json"), default="text")
     p_bola.add_argument(
         "--routes-from", action="append", default=[], metavar="FILE",

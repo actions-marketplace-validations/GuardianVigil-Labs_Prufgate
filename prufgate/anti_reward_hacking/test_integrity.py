@@ -48,6 +48,7 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,7 @@ class Finding:
     text: str
     severity: str = "P0"
     message: str = ""
+    end_line: int = 0
 
     def __post_init__(self) -> None:
         self.text = self.text.strip()[:140]
@@ -84,7 +86,7 @@ class Finding:
             self.message = f"Test integrity violation ({self.rule}): {self.text}"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "file": self.path,
             "line": self.line,
             "rule": self.rule,
@@ -92,6 +94,9 @@ class Finding:
             "message": self.message,
             "snippet": self.text,
         }
+        if self.end_line > self.line:
+            d["end_line"] = self.end_line
+        return d
 
     def __str__(self) -> str:
         return f"{self.path}:{self.line}\n    [{self.severity}] [{self.rule}] {self.text}"
@@ -298,16 +303,24 @@ def is_test_file(path: str | Path, content: str = "") -> bool:
     return False
 
 
-def _infer_subject_stem(path: Path) -> str:
-    """Infer the primary module/unit name under test from a test file path."""
-    name = path.name
-    for suffix in sorted(TEST_FILE_SUFFIXES, key=len, reverse=True):
+_SORTED_TEST_FILE_SUFFIXES = tuple(sorted(TEST_FILE_SUFFIXES, key=len, reverse=True))
+
+
+@lru_cache(maxsize=4096)
+def _infer_subject_stem_str(path_str: str) -> str:
+    name = path_str.replace("\\", "/").rsplit("/", 1)[-1]
+    for suffix in _SORTED_TEST_FILE_SUFFIXES:
         if name.endswith(suffix):
-            stem = name[: -len(suffix)]
-            return stem.lower()
+            return name[: -len(suffix)].lower()
     if name.startswith("test_") and name.endswith(".py"):
         return name[len("test_") : -3].lower()
-    return path.stem.lower()
+    stem, dot, _ = name.rpartition(".")
+    return (stem if dot else name).lower()
+
+
+def _infer_subject_stem(path: Path | str) -> str:
+    """Infer the primary module/unit name under test from a test file path."""
+    return _infer_subject_stem_str(str(path))
 
 
 def _strip_comments_and_strings_Preserve_len(text: str, keep_strings: bool = False) -> str:
@@ -776,6 +789,8 @@ ASSERTION_PATTERNS_BY_LANG: dict[str, re.Pattern[str]] = {
         r"|\.toThrow\w*\s*\("
         r"|\.rejects\b"
         r"|\b(?:assert|verify|check|expect)\w*\s*\("
+        # `if (!ok) throw new Error("...")`: the test fails when the check does.
+        r"|\bthrow\s+new\s+\w*Error\s*\("
     ),
     "javascript": re.compile(
         r"\bexpect\s*\("
@@ -787,6 +802,8 @@ ASSERTION_PATTERNS_BY_LANG: dict[str, re.Pattern[str]] = {
         r"|\.toThrow\w*\s*\("
         r"|\.rejects\b"
         r"|\b(?:assert|verify|check|expect)\w*\s*\("
+        # `if (!ok) throw new Error("...")`: the test fails when the check does.
+        r"|\bthrow\s+new\s+\w*Error\s*\("
     ),
     "go": re.compile(
         r"\b(?:t|b|s)\.(?:Error|Errorf|Fatal|Fatalf|Fail|FailNow)\s*\("
@@ -918,16 +935,28 @@ def _block_is_skipped_or_expected_panic(block: TestBlock) -> bool:
     return False
 
 
+_THROW_ASSERT_RE = re.compile(r"\bthrow\s+new\s+\w*Error\s*\(")
+
+
 def _find_assertion_lines_in_block(block: TestBlock) -> list[tuple[int, str]]:
     pat = ASSERTION_PATTERNS_BY_LANG.get(block.language)
     if pat is None:
         return []
     hits: list[tuple[int, str]] = []
+    mock_depth = 0
     for ln, raw in block.body_lines:
         s = raw.strip()
         if not s or s.startswith(("#", "//", "/*", "*")):
             continue
+        started_mock = bool(_MOCK_SETUP_RE.search(s))
+        in_mock = mock_depth > 0 or started_mock
+        if started_mock or mock_depth > 0:
+            mock_depth += s.count("(") + s.count("{") - s.count(")") - s.count("}")
+            if mock_depth < 0:
+                mock_depth = 0
         if pat.search(s):
+            if in_mock and _THROW_ASSERT_RE.search(s) and not pat.search(_THROW_ASSERT_RE.sub("", s)):
+                continue
             hits.append((ln, s))
     return hits
 
@@ -950,6 +979,23 @@ def _check_python_swallowed_exception(block: TestBlock, rel_path: str) -> list[F
                         if re.search(r"\b(?:assert|fail|check|verify|pytest\.fail)", call_str):
                             has_action = True
                             break
+                if not has_action and handler.name:
+                    # `except E as e: err = e` and `assert err` after the try: checked, not ignored.
+                    stored = {
+                        t.id
+                        for stmt in handler.body
+                        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Name) and stmt.value.id == handler.name
+                        for t in stmt.targets
+                        if isinstance(t, ast.Name)
+                    }
+                    end = getattr(node, "end_lineno", None) or node.lineno
+                    has_action = any(
+                        isinstance(a, ast.Assert)
+                        and a.lineno > end
+                        and not isinstance(a.test, (ast.Constant, ast.Tuple))
+                        and any(isinstance(n, ast.Name) and n.id in stored for n in ast.walk(a.test))
+                        for a in ast.walk(block.ast_node)
+                    )
                 if not has_action:
                     findings.append(
                         Finding(
@@ -959,6 +1005,7 @@ def _check_python_swallowed_exception(block: TestBlock, rel_path: str) -> list[F
                             severity="P0",
                             text=f"try/except in {block.name} swallows exception without asserting or re-raising",
                             message=f"Test '{block.name}' catches and ignores an exception, allowing failing test code to pass silently.",
+                            end_line=getattr(handler, "end_lineno", None) or block.end_line,
                         )
                     )
     return findings
@@ -973,11 +1020,25 @@ def _check_brace_swallowed_exception(block: TestBlock, rel_path: str) -> list[Fi
         catch_body = m.group(1).strip()
         # Remove comments inside catch body
         cleaned = re.sub(r"//[^\n]*|/\*.*?\*/", "", catch_body, flags=re.DOTALL).strip()
+        # `catch (e) { err = e }` and `expect(err)` after the try: the error is checked, not ignored.
+        caught = re.match(r"catch\s*\(\s*([A-Za-z_$][\w$]*)", m.group(0))
+        stored = {
+            v for v in re.findall(r"([A-Za-z_$][\w$]*)\s*=(?!=)\s*([A-Za-z_$][\w$]*)", cleaned)
+            if caught and v[1] == caught.group(1)
+        }
+        after_clean = _strip_comments_and_strings_Preserve_len(body_str[m.end():])
+        if any(
+            re.search(rf"\b(?:expect|assert)\w*\s*\([^\n]*\b{re.escape(v)}\b", after_clean)
+            and not re.search(rf"\bassert(?:\.ok)?\s*\(\s*true\s*,[^\n]*\b{re.escape(v)}\b", after_clean)
+            for v, _ in stored
+        ):
+            continue
         if not cleaned or not re.search(
             r"\b(?:expect|assert|should|verify|fail|throw|reject|done|t\.Error|t\.Fatal)\b",
             cleaned,
         ):
             line_offset = body_str[: m.start()].count("\n")
+            end_offset = body_str[: m.end()].count("\n")
             base_ln = block.body_lines[0][0] if block.body_lines else block.start_line
             findings.append(
                 Finding(
@@ -987,9 +1048,68 @@ def _check_brace_swallowed_exception(block: TestBlock, rel_path: str) -> list[Fi
                     severity="P0",
                     text=f"catch block in '{block.name}' swallows exception without assertion",
                     message=f"Test '{block.name}' catches and ignores an error inside the test body.",
+                    end_line=base_ln + end_offset,
                 )
             )
     return findings
+
+
+def _load_tsconfig_paths(start_dir: Path | None) -> list[tuple[str, list[str]]]:
+    """Load `(pattern, targets)` from the nearest `tsconfig.json` / `jsconfig.json`."""
+    if start_dir is None:
+        return []
+    try:
+        cur = start_dir.resolve()
+    except OSError:
+        return []
+    out: list[tuple[str, list[str]]] = []
+    for d in (cur, *cur.parents):
+        for cfg_name in ("tsconfig.json", "tsconfig.base.json", "jsconfig.json"):
+            cfg_file = d / cfg_name
+            if not cfg_file.is_file():
+                continue
+            try:
+                raw = cfg_file.read_text(encoding="utf-8", errors="ignore")
+                cleaned = re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", raw)
+                cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+                data = json.loads(cleaned)
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            co = data.get("compilerOptions")
+            if not isinstance(co, dict):
+                continue
+            base_url = co.get("baseUrl") if isinstance(co.get("baseUrl"), str) else "."
+            paths = co.get("paths")
+            if not isinstance(paths, dict):
+                continue
+            for pat, targets in paths.items():
+                if isinstance(pat, str) and isinstance(targets, list):
+                    norm_targets = [
+                        os.path.normpath(str(Path(base_url) / t)).replace("\\", "/")
+                        for t in targets
+                        if isinstance(t, str)
+                    ]
+                    if norm_targets:
+                        out.append((pat, norm_targets))
+        if (d / ".git").exists():
+            break
+    return out
+
+
+def _resolve_ts_alias(spec: str, ts_paths: list[tuple[str, list[str]]]) -> list[str]:
+    resolved: list[str] = []
+    for pat, targets in ts_paths:
+        if pat.endswith("/*") and spec.startswith(pat[:-1]):
+            rest = spec[len(pat) - 1 :]
+            for t in targets:
+                mapped = t[:-1] + rest if t.endswith("/*") else t.replace("*", rest)
+                resolved.append(_module_key(mapped.lstrip("./")))
+        elif pat == spec:
+            for t in targets:
+                resolved.append(_module_key(t.lstrip("./")))
+    return resolved
 
 
 def _check_self_mocked_sut(
@@ -1009,11 +1129,42 @@ def _check_self_mocked_sut(
             rf"""\b(?:vi|jest)\.mock\(\s*["']([^"']*?/{re.escape(subject_stem)}|\.?/{re.escape(subject_stem)})(?:\.[jt]sx?)?["']\s*(?:,|\))""",
             re.IGNORECASE,
         )
+        search_dir = path.parent if path.exists() else Path.cwd()
+        ts_paths = _load_tsconfig_paths(search_dir)
+        exact, suffix = _test_import_targets(rel_path, lines, ts_paths=ts_paths)
+        subjects = {k for k in exact | suffix if k.rsplit("/", 1)[-1].lower() == subject_stem}
+        test_dir = Path(rel_path).parent
+        home = {_module_key(str(test_dir / subject_stem))}
+        if test_dir.name in ("__tests__", "__test__", "tests", "test", "spec"):
+            home.add(_module_key(str(test_dir.parent / subject_stem)))
+
+        def mocks_subject(spec: str) -> bool:
+            """The mocked specifier is the module under test: the one the test imports under its own
+            name or, if it imports none, the file beside it. A package (`@scope/pkg`) never is."""
+            if spec.startswith("."):
+                key = _module_key(os.path.normpath(str(test_dir / spec)))
+                if not subjects:
+                    return key in home or key.rsplit("/", 1)[-1].lower() == subject_stem
+                return any(key == t or key.endswith("/" + t) for t in subjects)
+            if spec[:2] in ("@/", "~/", "#/"):
+                key = _module_key(spec[2:])
+                if not subjects:
+                    return key.rsplit("/", 1)[-1].lower() == subject_stem
+                return any(key == t or t.endswith("/" + key) or key.endswith("/" + t) for t in subjects)
+            for mapped in _resolve_ts_alias(spec, ts_paths):
+                if not subjects:
+                    if mapped in home or mapped.rsplit("/", 1)[-1].lower() == subject_stem:
+                        return True
+                elif any(mapped == t or t.endswith("/" + mapped) or mapped.endswith("/" + t) for t in subjects):
+                    return True
+            return False
+
         for idx, raw in enumerate(lines, start=1):
             s = raw.strip()
             if s.startswith(("//", "/*", "*")):
                 continue
-            if mock_mod_re.search(s):
+            m_mock = mock_mod_re.search(s)
+            if m_mock and mocks_subject(m_mock.group(1)):
                 # Allow partial mocks that call importActual / requireActual in the surrounding 6 lines
                 window = "\n".join(lines[max(0, idx - 1) : min(len(lines), idx + 6)])
                 if "importActual" not in window and "requireActual" not in window:
@@ -1065,6 +1216,7 @@ def _check_self_mocked_sut(
                                 severity="P0",
                                 text=dec,
                                 message=f"Test '{block.name}' patches the function under test ('{patched_target}') and calls the mock.",
+                                end_line=block.end_line,
                             )
                         )
 
@@ -1122,6 +1274,7 @@ def _check_self_mocked_sut(
                             severity="P0",
                             text=f"Test '{block.name}' asserts directly on mock '{mv}()' return value",
                             message=f"Test '{block.name}' configures mock '{mv}' and asserts directly on '{mv}()' without invoking real code.",
+                            end_line=block.end_line,
                         )
                     )
             for sf in sorted(spied_funcs):
@@ -1137,6 +1290,7 @@ def _check_self_mocked_sut(
                                 severity="P0",
                                 text=f"spyOn({obj_name}, '{method_name}') mocks the method under test",
                                 message=f"Test '{block.name}' mocks '{sf}' and then tests '{sf}()' directly.",
+                                end_line=block.end_line,
                             )
                         )
 
@@ -1195,6 +1349,7 @@ def scan_test_file(
                     severity="P0",
                     text=f"Test '{block.name}' has an empty body with zero assertions",
                     message=f"Test '{block.name}' contains no assertions or exception expectations.",
+                    end_line=block.end_line,
                 )
             )
             continue
@@ -1215,6 +1370,7 @@ def scan_test_file(
                     severity="P0",
                     text=f"Test '{block.name}' executes code with zero assertions",
                     message=f"Test '{block.name}' executes code without any assertion or exception verification.",
+                    end_line=block.end_line,
                 )
             )
         elif len(assertion_lines) == 1:
@@ -1305,31 +1461,41 @@ def _parse_diff_into_hunks(diff_text: str) -> list[DiffFileHunk]:
     current_hunk: DiffFileHunk | None = None
     old_ln = 0
     new_ln = 0
+    old_left = 0
+    new_left = 0
+
+    from prufgate.diff_scope import _unquote_git_path
 
     for raw_line in diff_text.splitlines():
         if raw_line.startswith("diff --git "):
             current_hunk = None
             is_new = False
             is_del = False
-        elif raw_line.startswith("--- "):
+            old_left = 0
+            new_left = 0
+        elif (current_hunk is None or old_left == 0) and raw_line.startswith("--- "):
+            current_hunk = None
             part = raw_line[4:].strip()
-            if part == "/dev/null":
+            if part == "/dev/null" or part.startswith("/dev/null\t"):
                 is_new = True
                 old_file = "/dev/null"
             else:
-                old_file = re.sub(r"^a/", "", part)
-        elif raw_line.startswith("+++ "):
+                old_file = _unquote_git_path(raw_line[4:], "a/") or re.sub(r"^a/", "", part)
+        elif (current_hunk is None or new_left == 0) and raw_line.startswith("+++ "):
+            current_hunk = None
             part = raw_line[4:].strip()
-            if part == "/dev/null":
+            if part == "/dev/null" or part.startswith("/dev/null\t"):
                 is_del = True
                 current_file = old_file
             else:
-                current_file = re.sub(r"^b/", "", part)
+                current_file = _unquote_git_path(raw_line[4:], "b/") or re.sub(r"^b/", "", part)
         elif raw_line.startswith("@@ "):
-            m = re.search(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw_line)
+            m = re.search(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", raw_line)
             if m and current_file:
                 old_ln = int(m.group(1))
-                new_ln = int(m.group(2))
+                old_left = int(m.group(2)) if m.group(2) is not None else 1
+                new_ln = int(m.group(3))
+                new_left = int(m.group(4)) if m.group(4) is not None else 1
                 current_hunk = DiffFileHunk(
                     file_path=current_file,
                     old_path=old_file or current_file,
@@ -1340,19 +1506,27 @@ def _parse_diff_into_hunks(diff_text: str) -> list[DiffFileHunk]:
                 )
                 hunks.append(current_hunk)
         elif current_hunk is not None:
-            if raw_line.startswith("+") and not raw_line.startswith("+++"):
+            if raw_line.startswith("+") and (new_left > 0 or not raw_line.startswith("+++")):
                 current_hunk.added_lines.append((new_ln, raw_line[1:]))
                 current_hunk.ordered.append(("+", raw_line[1:]))
                 new_ln += 1
-            elif raw_line.startswith("-") and not raw_line.startswith("---"):
+                if new_left > 0:
+                    new_left -= 1
+            elif raw_line.startswith("-") and (old_left > 0 or not raw_line.startswith("---")):
                 current_hunk.removed_lines.append((old_ln, raw_line[1:]))
                 current_hunk.ordered.append(("-", raw_line[1:]))
                 old_ln += 1
+                if old_left > 0:
+                    old_left -= 1
             elif raw_line.startswith(" "):
                 current_hunk.context_lines.append((new_ln, raw_line[1:]))
                 current_hunk.ordered.append((" ", raw_line[1:]))
                 old_ln += 1
                 new_ln += 1
+                if old_left > 0:
+                    old_left -= 1
+                if new_left > 0:
+                    new_left -= 1
 
     return hunks
 
@@ -1387,33 +1561,102 @@ WEAK_ASSERTION_RE = re.compile(
     r"|\.toBeGreaterThanOrEqual\(\s*200\s*\)"
 )
 
+_WORD_RE = re.compile(r"[A-Za-z_]\w{3,}")
+# Assertion and test vocabulary, never the subject of an assertion.
+_ASSERTION_WORDS = frozenset({
+    "expect", "assert", "assertEqual", "assertEquals", "toBe", "toEqual", "toStrictEqual", "toContain",
+    "toHaveLength", "toMatch", "toMatchObject", "toThrow", "toHaveBeenCalled", "toHaveBeenCalledWith",
+    "toBeDefined", "toBeTruthy", "toBeFalsy", "toBeNull", "toBeUndefined", "require", "Equal", "Fatal",
+    "Fatalf", "Error", "Errorf", "self", "true", "false", "True", "False", "None", "null", "undefined",
+    "await", "resolves", "rejects", "this", "return", "const", "length",
+})
+# `t.Fatal(err)` after the call that produced `err`: a setup guard, not a check of the behaviour.
+_ERR_GUARD_RE = re.compile(
+    r"\b(?:t|b)\.Fatalf?\s*\(\s*(?:\"[^\"]*\"\s*,\s*)?err\s*\)|\b(?:require|assert)\.NoError\s*\(\s*t\s*,\s*err\s*\)"
+)
+_ERR_ASSIGN_RE = re.compile(r"\berr\s*:?=(?!=)")
+
+
+def _counted_assertions(lines: list[tuple[int, str]], retired: set[str] | None) -> list[tuple[int, str]]:
+    """The assertion lines of one side of a hunk that count for `diff-assertion-weakening`.
+
+    `retired` is given for the removed side only. There, an error guard (`t.Fatal(err)`) removed
+    with the call producing `err` does not count, nor does an assertion that names something
+    production code loses in the same diff (a retired function, field or value): the setup or
+    the feature went, not the check."""
+    produces_err = retired is not None and any(_ERR_ASSIGN_RE.search(t) for _, t in lines)
+    out: list[tuple[int, str]] = []
+    for i, (ln, raw) in enumerate(lines):
+        s = raw.strip()
+        if s.startswith(("#", "//", "/*", "*")) or not DIFF_ASSERTION_LINE_RE.search(raw):
+            continue
+        if produces_err and _ERR_GUARD_RE.search(raw) and not DIFF_ASSERTION_LINE_RE.search(_ERR_GUARD_RE.sub("", raw)):
+            continue
+        if retired:
+            # The whole statement: an assertion spread over lines until its parentheses close.
+            stmt, depth, j = raw, raw.count("(") - raw.count(")"), i + 1
+            while depth > 0 and j < len(lines) and j < i + 6:
+                stmt += "\n" + lines[j][1]
+                depth += lines[j][1].count("(") - lines[j][1].count(")")
+                j += 1
+            if retired.intersection(_WORD_RE.findall(stmt)):
+                continue
+        out.append((ln, s))
+    return out
+
+
 TEST_FUNCTION_HEADER_RE = re.compile(
     r"\b(?:it|test)\s*\(|^\s*(?:async\s+)?def\s+test\w*\s*\(|\bfunc\s+Test\w*\s*\(|#\[(?:\w+::)*test\]|@Test\b"
+)
+
+
+_TEST_TITLE_RE = re.compile(
+    r"""\b(?:describe|it|test|context|t\.Run)(?:\.\w+)*\s*\(\s*(?:"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`[^`]*`)"""
+)
+# A string literal, its quotes paired left to right (so the text between two literals is never one).
+_QUOTED_RE = re.compile(r""""((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|`([^`$\n]*)`""")
+
+
+_MOCK_SETUP_RE = re.compile(
+    r"\.mock(?:Resolved|Rejected|Return)Value(?:Once)?\s*\(|\.mockImplementation(?:Once)?\s*\(|\b(?:vi|jest)\.(?:fn|stubGlobal|stubEnv)\s*\("
+    r"|\breturn_value\s*=|\bside_effect\s*=|\.Returns?\s*\("
 )
 
 
 def _extract_test_literals_from_lines(lines: list[tuple[int, str]]) -> dict[str, int]:
     """Extract non-trivial string and float literals passed into calls or assertions in test lines."""
     literals: dict[str, int] = {}
-    str_re = re.compile(r"""["']([^"'\\\n]{5,64})["']""")
     float_re = re.compile(r"\b(\d+\.\d{2,6})\b")
+    in_import = False
 
     for ln, raw in lines:
         s = raw.strip()
+        # A Go `import ( ... )` block lists package paths, not test input.
+        if in_import:
+            in_import = not s.startswith(")")
+            continue
+        if re.match(r"^import\s*\($", s):
+            in_import = True
+            continue
         if not s or s.startswith(("#", "//", "/*", "*")):
             continue
         # Skip test descriptions in `it("description", ...)` or `describe("description", ...)`
-        cleaned = re.sub(
-            r"""\b(?:describe|it|test|context)\s*\(\s*["'][^"']*["']""",
-            "",
-            s,
-        )
+        cleaned = _TEST_TITLE_RE.sub("", s)
         # Skip import / require / from statements
         if re.match(r"^(?:import\b|from\b|const\s+\w+\s*=\s*require\(|package\b|use\b)", cleaned):
             continue
+        # What a stub returns is the faked dependency's vocabulary (an API's status values), which
+        # production code legitimately compares against; it is not input to the code under test.
+        if _MOCK_SETUP_RE.search(cleaned):
+            continue
 
-        for m in str_re.finditer(cleaned):
-            val = m.group(1).strip()
+        for m in _QUOTED_RE.finditer(cleaned):
+            val = next((g for g in m.groups() if g is not None), None)
+            if val is None or "\\" in val:
+                continue
+            val = val.strip()
+            if not 5 <= len(val) <= 64:
+                continue
             low = val.lower()
             if low in GENERIC_TEST_STRINGS:
                 continue
@@ -1428,6 +1671,135 @@ def _extract_test_literals_from_lines(lines: list[tuple[int, str]]) -> dict[str,
                 literals.setdefault(fval, ln)
 
     return literals
+
+
+_LANG_FAMILY = {".py": "py", ".go": "go", ".rs": "rs", ".rb": "rb", ".php": "php", ".cs": "cs", ".java": "jvm", ".kt": "jvm"}
+_TEST_IMPORT_JS_RE = re.compile(r"""(?:\bfrom\s+|\brequire\s*\(\s*|\bimport\s*\(\s*|^\s*import\s+)["']([^"']+)["']""")
+
+
+@lru_cache(maxsize=4096)
+def _family(path: str) -> str:
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    _, dot, ext = name.rpartition(".")
+    sfx = ("." + ext.lower()) if dot else ""
+    return "js" if sfx in _JS_TEST_SUFFIXES else _LANG_FAMILY.get(sfx, sfx)
+
+
+@lru_cache(maxsize=4096)
+def _module_key(path: str) -> str:
+    """A source path without its extension, a package `index` / `__init__` read as its directory."""
+    key = _SOURCE_SUFFIX_RE.sub("", path.replace("\\", "/"))
+    return re.sub(r"/(?:index|__init__)$", "", key)
+
+
+@lru_cache(maxsize=4096)
+def _path_stem_lower(path: str) -> str:
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    stem, dot, _ = name.rpartition(".")
+    return (stem if dot else name).lower()
+
+
+def _test_import_targets(
+    test_path: str,
+    lines: list[str],
+    ts_paths: list[tuple[str, list[str]]] | None = None,
+) -> tuple[set[str], set[str]]:
+    """First-party modules a test imports: (exact repo paths, path suffixes), both extensionless.
+    Relative imports resolve to a repo path; `@/`, `~/` and `#/` aliases, `tsconfig.json` `paths`
+    aliases, and Python module paths are matched as a suffix of the production file's path.
+    Package imports are never a subject."""
+    exact: set[str] = set()
+    suffix: set[str] = set()
+    base = Path(test_path).parent
+    fam = _family(test_path)
+    for raw in lines:
+        if fam == "js":
+            for m in _TEST_IMPORT_JS_RE.finditer(raw):
+                spec = m.group(1)
+                if spec.startswith("."):
+                    exact.add(_module_key(os.path.normpath(str(base / spec))))
+                elif spec[:2] in ("@/", "~/", "#/"):
+                    suffix.add(_module_key(spec[2:]))
+                elif ts_paths:
+                    for mapped in _resolve_ts_alias(spec, ts_paths):
+                        suffix.add(mapped)
+        elif fam == "py" and (m := _PY_IMPORT_RE.match(raw)):
+            mod = m.group(1) if m.group(1) is not None else m.group(3)
+            dots = len(mod) - len(mod.lstrip("."))
+            parts = [p for p in mod.lstrip(".").split(".") if p]
+            names = [n.strip(" ()").split()[0] for n in (m.group(2) or "").split(",") if n.strip(" ()")]
+            if dots:
+                root = base.joinpath(*[".."] * (dots - 1))
+                into = exact
+            else:
+                root = Path()
+                into = suffix
+            for extra in [[]] + [[n] for n in names if n != "*"]:
+                if parts or extra:
+                    into.add(os.path.normpath(str(root.joinpath(*parts, *extra))).replace("\\", "/"))
+    return exact, suffix
+
+
+def _paired(test_path: str, targets: tuple[set[str], set[str]], prod_path: str) -> bool:
+    """The test exercises this production file: it imports it, it is named after it in the same
+    language (`widget.test.ts` / `widget.ts`), or (Go) it sits in the same package directory."""
+    fam = _family(prod_path)
+    if fam == _family(test_path) and _infer_subject_stem_str(test_path) == _path_stem_lower(prod_path):
+        return True
+    if fam == "go" and _family(test_path) == "go":
+        return test_path.replace("\\", "/").rpartition("/")[0] == prod_path.replace("\\", "/").rpartition("/")[0]
+    key = _module_key(prod_path)
+    exact, suffix = targets
+    return key in exact or any(key == t or key.endswith("/" + t) for t in suffix)
+
+
+_CMP_OP = r"(?:===?|!==?)"
+@lru_cache(maxsize=4096)
+def _compared_literal_re(lit: str) -> re.Pattern[str]:
+    """`lit`, quoted (or bare when a float), as one side of an equality comparison, `in (...)`, or a case / match-arm label."""
+    e = re.escape(lit)
+    if re.fullmatch(r"\d+\.\d+", lit):
+        return re.compile(rf"""(?:{_CMP_OP}|\bcase)\s*{e}\b|\b{e}\s*(?:{_CMP_OP}|=>)""")
+    return re.compile(
+        rf"""(?:{_CMP_OP}|\bcase|\bin\s*\([^()\n]*)\s*(["'`]){e}\1|(["'`]){e}\2\s*(?:{_CMP_OP}|=>)"""
+    )
+
+
+_CODE_SUFFIXES = frozenset({
+    ".py", ".go", ".rs", ".rb", ".php", ".cs", ".java", ".kt", ".swift", ".scala",
+    ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
+})
+
+
+def _unchanged_production_text(
+    root: Path,
+    changed: set[str],
+    cfg: PrufGateConfig | None = None,
+    limit: int = 512 * 1024,
+    max_total: int = 8 * 1024 * 1024,
+) -> str:
+    """The production source files the diff does not touch, joined (for a literal lookup)."""
+    parts: list[str] = []
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(dirpath).relative_to(root)
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not (not rel_dir.parts and d in ROOT_ONLY_SKIP_DIRS)]
+        for name in filenames:
+            rel = (rel_dir / name).as_posix()
+            if Path(name).suffix.lower() not in _CODE_SUFFIXES or rel in changed or is_test_file(rel):
+                continue
+            if cfg is not None and cfg.is_excluded(rel):
+                continue
+            try:
+                sz = (root / rel).stat().st_size
+                if sz <= limit:
+                    parts.append((root / rel).read_text(encoding="utf-8", errors="ignore"))
+                    total += sz
+                    if total >= max_total:
+                        return "\n".join(parts)
+            except OSError:
+                continue
+    return "\n".join(parts)
 
 
 # Test cases a diff adds or removes, by name. A test that moves to another file
@@ -1668,50 +2040,74 @@ def _side(h: DiffFileHunk, side: str) -> list[tuple[str, str]]:
 
 
 _PY_IMPORT_RE = re.compile(r"^\s*(?:from\s+(\.*[\w.]*)\s+import\s+([\w\s,()*]+)|import\s+([\w.]+))")
-_JS_IMPORT_RE = re.compile(r"""(?:\bfrom\s+|\brequire\s*\(\s*|\bimport\s*\(\s*|^\s*import\s+)["'](\.{1,2}/[^"']+)["']""")
+# Relative imports and the `@/`, `~/`, `#/` path aliases a bundler maps to the source root.
+_JS_IMPORT_RE = re.compile(r"""(?:\bfrom\s+|\brequire\s*\(\s*|\bimport\s*\(\s*|^\s*import\s+)["'](\.{1,2}/[^"']+|[@~#]/[^"']+)["']""")
 _SOURCE_SUFFIX_RE = re.compile(r"\.(?:py|go|[cm]?[jt]sx?)$")
-_DEFINED_RE = re.compile(r"(?:\b(?:def|class|function\*?|const|let|var|type)|\bfunc(?:\s*\([^)]*\))?)\s+([A-Za-z_]\w*)|^([A-Za-z_]\w*)\s*(?::[^=\n]*)?=(?!=)")
+# Top-level definitions only: a local `const x` or `err :=` inside a function is not a feature's name.
+_DEFINED_RE = re.compile(
+    r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:(?:def|class|function\*?|const|let|var|type|interface|enum)|func(?:\s*\([^)]*\))?)\s+([A-Za-z_]\w*)"
+    r"|^([A-Za-z_]\w*)\s*(?::[^=\n]*)?=(?!=)"
+)
+# Names too common to say a feature moved when another file defines them too.
+_PLUMBING_NAMES = frozenset({"main", "init", "setup", "teardown", "handler", "default", "config", "options", "logger", "router"})
 _PY_EXTS = (".py", "/__init__.py")
 _JS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", "/index.ts", "/index.tsx", "/index.js", "/index.jsx")
 
 
 def _defined(lines: list[str]) -> set[str]:
-    return {a or b for raw in lines for a, b in _DEFINED_RE.findall(raw)}
+    return {n for raw in lines for a, b in _DEFINED_RE.findall(raw) if (n := a or b).lower() not in _PLUMBING_NAMES}
 
 
 def _retired_with(
     test_path: str,
     lines: list[str],
     gone: dict[str, list[str]],
-    added: list[str],
+    added: list[tuple[str, str]],
     live: set[str],
     repo_root: Path | None,
+    lost_defs: dict[str, set[str]] | None = None,
 ) -> str | None:
     """The deleted production file that the deleted test `test_path` retires with, or None.
 
-    Retired only when every first-party module the test imports is deleted in the diff (Go: every
-    non-test file of its package), and none of the names those modules defined and the test uses
-    is defined again in an added line elsewhere (a feature moved, not retired). `gone` maps each
-    deleted production file to its removed lines; `added` holds the added production lines and
-    `live` the production files the diff keeps. A package `__init__` counts as deleted only when
-    nothing is left in its directory; a test helper import never blocks. Without `repo_root` only
-    the diff is seen (the built-in self-check); every caller that scans a repository passes it."""
+    Retired when the test's subject is deleted in the diff, and none of the names it defined and
+    the test uses is defined again in an added line of the same language (a feature moved, not
+    retired). The subject is, in order: the module the test is named after (`apply.test.ts` /
+    `apply`, Go `quota_test.go` / `quota.go`); else its relative imports; else every first-party
+    module it imports (Go: every non-test file of its package). A module the diff keeps counts as
+    deleted for the test when every name the test imports from it is a definition the diff
+    removes (`lost_defs`). `gone` maps each deleted production file to its removed lines; `added`
+    holds (path, line) for added production lines and `live` the production files the diff keeps.
+    A package `__init__` counts as deleted only when nothing is left in its directory. Without
+    `repo_root` only the diff is seen (the built-in self-check); every caller that scans a
+    repository passes it."""
     sfx = Path(test_path).suffix.lower()
     base = Path(test_path).parent
     py, js = sfx == ".py", sfx in _JS_TEST_SUFFIXES
+    stem = _infer_subject_stem(Path(test_path))
+    lost_defs = lost_defs or {}
+    fam = _family(test_path)
+    added_here = [t for p, t in added if _family(p) == fam]
 
     def on_disk(rel: str) -> bool:
         return repo_root is not None and (repo_root / rel).is_file()
 
-    def is_live(cand: str, exts: tuple[str, ...]) -> bool:
-        """A non-test production file for `cand` is still there (on disk or kept by the diff)."""
+    def live_file(cand: str, exts: tuple[str, ...]) -> str | None:
+        """The non-test production file for `cand` still there (on disk or kept by the diff)."""
         if cand.startswith(".."):
-            return False
+            return None
         for prefix in ("", "src/"):
             for ext in exts:
                 rel = prefix + cand + ext
                 if not is_test_file(rel) and (rel in live or on_disk(rel)):
-                    return True
+                    return rel
+        return None
+
+    def is_live(cand: str, exts: tuple[str, ...]) -> bool:
+        if cand.startswith(".."):
+            return False
+        if live_file(cand, exts):
+            return True
+        for prefix in ("", "src/"):
             d = repo_root / (prefix + cand) if repo_root is not None else None
             if d is not None and d.is_dir() and any(f.suffix in {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"} and not is_test_file(str(f)) for f in d.iterdir()):
                 return True
@@ -1719,9 +2115,9 @@ def _retired_with(
 
     def gone_file(cand: str, exts: tuple[str, ...]) -> str | None:
         for g in sorted(gone):
-            stem = _SOURCE_SUFFIX_RE.sub("", g)
-            init = stem.endswith(("/__init__", "/index"))
-            pkg = stem.rsplit("/", 1)[0] if init else stem
+            gstem = _SOURCE_SUFFIX_RE.sub("", g)
+            init = gstem.endswith(("/__init__", "/index"))
+            pkg = gstem.rsplit("/", 1)[0] if init else gstem
             if pkg == cand or (not cand.startswith("..") and pkg.endswith("/" + cand)):
                 # A package `__init__` / `index` retires the package only if nothing is left in it.
                 if init and is_live(cand, exts):
@@ -1731,19 +2127,42 @@ def _retired_with(
 
     found: list[str] = []
     if sfx == ".go":
+        paired = [g for g in sorted(gone) if Path(g).parent == base and Path(g).stem.lower() == stem]
         pkg = [g for g in sorted(gone) if g.endswith(".go") and Path(g).parent == base]
-        if not pkg:
+        if paired:
+            found = paired
+        elif not pkg:
             return None
-        if any(p.endswith(".go") and not p.endswith("_test.go") and Path(p).parent == base for p in live):
-            return None
-        d = repo_root / base if repo_root is not None else None
-        if d is not None and d.is_dir() and any(f.suffix == ".go" and not f.name.endswith("_test.go") for f in d.iterdir()):
-            return None
-        found = pkg
+        else:
+            if any(p.endswith(".go") and not p.endswith("_test.go") and Path(p).parent == base for p in live):
+                return None
+            d = repo_root / base if repo_root is not None else None
+            if d is not None and d.is_dir() and any(f.suffix == ".go" and not f.name.endswith("_test.go") for f in d.iterdir()):
+                return None
+            found = pkg
     else:
-        present = False
-        for raw in lines:
-            refs: list[list[str]] = []  # per import: candidates tried in order (most specific first)
+        # Per import: (gone file or None, live?, named after the test?, relative?)
+        seen: list[tuple[str | None, bool, bool, bool]] = []
+        exts = _PY_EXTS if py else _JS_EXTS
+        joined_lines: list[str] = []
+        if js:
+            buf = ""
+            for raw in lines:
+                if buf:
+                    buf += " " + raw.strip()
+                    if "}" in raw:
+                        joined_lines.append(buf)
+                        buf = ""
+                elif re.match(r"^\s*import\b", raw) and "{" in raw and "}" not in raw:
+                    buf = raw.strip()
+                else:
+                    joined_lines.append(raw)
+            if buf:
+                joined_lines.append(buf)
+        else:
+            joined_lines = lines
+        for raw in joined_lines:
+            refs: list[tuple[list[str], bool, list[str]]] = []  # candidates (most specific first), relative, names
             if py and (m := _PY_IMPORT_RE.match(raw)):
                 mod = m.group(1) if m.group(1) is not None else m.group(3)
                 dots = len(mod) - len(mod.lstrip("."))
@@ -1753,27 +2172,54 @@ def _retired_with(
                 top = os.path.normpath(str(root.joinpath(*parts))) if parts else None
                 for n in names or [None]:
                     chain = [os.path.normpath(str(root.joinpath(*parts, n)))] if n and n != "*" else []
-                    refs.append(chain + ([top] if top else []))
+                    refs.append((chain + ([top] if top else []), bool(dots), [n] if n and n != "*" else []))
             elif js:
+                imported = re.search(r"\{([^}]*)\}", raw)
+                names = [
+                    re.sub(r"^type\s+", "", n.split(" as ")[0].strip())
+                    for n in (imported.group(1).split(",") if imported else [])
+                ]
+                m_def = re.match(r"^\s*import\s+(?!type\b)([A-Za-z_$][\w$]*)\s*(?:,|\s+from\b)", raw)
+                if m_def:
+                    names.append(m_def.group(1))
                 for m in _JS_IMPORT_RE.finditer(raw):
-                    refs.append([_SOURCE_SUFFIX_RE.sub("", os.path.normpath(str(base / m.group(1))))])
-            exts = _PY_EXTS if py else _JS_EXTS
-            for chain in refs:
+                    spec = m.group(1)
+                    rel = spec.startswith(".")
+                    cand = os.path.normpath(str(base / spec)) if rel else spec[2:]
+                    refs.append(([_SOURCE_SUFFIX_RE.sub("", cand)], rel, [n for n in names if n]))
+            for chain, rel, names in refs:
+                # A build tool's config (`next.config`) is loaded by many tests and is never their subject.
+                if any(re.search(r"(?:^|/)[\w-]+\.config$", c) for c in chain):
+                    continue
+                if any(is_test_file(c + ext) for c in chain for ext in exts):
+                    continue
+                subject = any(Path(c).name.lower() == stem for c in chain)
                 for cand in chain:
                     g = gone_file(cand, exts)
                     if g:
-                        found.append(g)
+                        seen.append((g, False, subject, rel))
+                        break
+                    kept = live_file(cand, exts)
+                    if kept and names and all(n in lost_defs.get(kept, set()) for n in names):
+                        seen.append((kept, False, subject, rel))
                         break
                     if is_live(cand, exts):
-                        present = True
+                        seen.append((None, True, subject, rel))
                         break
-        if present:
+        subject = [x for x in seen if x[2]] or [x for x in seen if x[3]] or seen
+        if any(is_kept for _, is_kept, _, _ in subject):
             return None
+        found = [g for g, _, _, _ in subject if g]
+        if not seen and not live_file(str(base / stem), exts) and not live_file(stem, exts):
+            # A test that imports nothing first-party and reads a file the diff deletes
+            # (`readFileSync(".../rules.json")`) retires with that file.
+            quoted = {next((g for g in m.groups() if g is not None), None) for raw in lines for m in _QUOTED_RE.finditer(raw)} - {None}
+            found = [g for g in sorted(gone) if any(len(q) >= 6 and (g == q or g.endswith("/" + q.lstrip("./"))) for q in quoted)]
     if not found:
         return None
     # The names the deleted modules defined and the test uses, defined again elsewhere: moved.
     used = set(re.findall(r"[A-Za-z_]\w*", "\n".join(lines)))
-    if _defined([t for g in found for t in gone[g]]) & used & _defined(added):
+    if _defined([t for g in found for t in gone.get(g, [])]) & used & _defined(added_here):
         return None
     return found[0]
 
@@ -1816,8 +2262,9 @@ def _removed_test_findings(
     first_hunk: dict[str, int] = {}
     # Production files the diff deletes, and the removed lines of each deleted test file.
     gone: dict[str, list[str]] = {}
-    prod_added: list[str] = []
+    prod_added: list[tuple[str, str]] = []
     live: set[str] = set()
+    removed_live: dict[str, list[str]] = {}
     for h in hunks:
         if is_test_file(h.file_path):
             continue
@@ -1825,7 +2272,19 @@ def _removed_test_findings(
             gone.setdefault(h.file_path, []).extend(t for k, t in h.ordered if k == "-")
         else:
             live.add(h.file_path)
-            prod_added.extend(t for _, t in h.added_lines)
+            prod_added.extend((h.file_path, t) for _, t in h.added_lines)
+            removed_live.setdefault(h.file_path, []).extend(t for _, t in h.removed_lines)
+    # Definitions a kept production file loses: removed, defined in no added line, and no longer in the file on disk.
+    added_defs = _defined([t for _, t in prod_added])
+    lost_defs: dict[str, set[str]] = {}
+    for p, r in removed_live.items():
+        still_in_p: set[str] = set()
+        if repo_root is not None:
+            try:
+                still_in_p = _defined((Path(repo_root) / p).read_text(encoding="utf-8", errors="ignore").splitlines())
+            except OSError:
+                pass
+        lost_defs[p] = _defined(r) - added_defs - still_in_p
     deleted_text: dict[str, list[str]] = {}
     hidden = {old: new for old, new in (renames or {}).items() if _collected(old) and not _collected(new) and not cfg.is_excluded(old)}
     for old, new in hidden.items():
@@ -1897,7 +2356,7 @@ def _removed_test_findings(
             continue
         # A retired feature: the production module the test imports is deleted too. Not a hidden
         # failure, so nothing is reported (its tests still count as explained, not as a drop).
-        if gone and _retired_with(path, deleted_text.get(path, []), gone, prod_added, live, repo_root):
+        if (gone or any(lost_defs.values())) and _retired_with(path, deleted_text.get(path, []), gone, prod_added, live, repo_root, lost_defs):
             continue
         what = f"its tests ({', '.join(lost[:3])}{', ...' if len(lost) > 3 else ''}) are not added back anywhere" if lost else "no test file of the same name is added"
         how = f" (renamed to '{hidden[path]}', which the test runner does not collect)" if path in hidden else ""
@@ -1941,6 +2400,39 @@ def _removed_test_findings(
     return findings
 
 
+def _strip_line_comment(line: str) -> str:
+    s = line.lstrip()
+    if s.startswith(("#", "//", "/*", "*")):
+        return ""
+    return re.sub(r"(?://|#).*$", "", line)
+
+
+_FLOAT_TOK_RE = re.compile(r"\b(\d+\.\d{2,6})\b")
+_BT_TOK_RE = re.compile(r"`([^`\n]{2,80})`")
+_DQ_TOK_RE = re.compile(r'"([^"\n]{2,80})"')
+_SQ_TOK_RE = re.compile(r"'([^'\n]{2,80})'")
+
+
+def _extract_code_tokens(text: str) -> set[str]:
+    """Extract all quoted string literals and float literals from text."""
+    tokens: set[str] = set()
+    for line in text.splitlines():
+        if not line:
+            continue
+        for m in _QUOTED_RE.finditer(line):
+            val = next((g for g in m.groups() if g is not None), None)
+            if val is not None:
+                tokens.add(val)
+                if "/" in val:
+                    tail = val.rsplit("/", 1)[-1].split(":", 1)[0].strip()
+                    if len(tail) >= 4:
+                        tokens.add(tail)
+        for rx in (_BT_TOK_RE, _DQ_TOK_RE, _SQ_TOK_RE, _FLOAT_TOK_RE):
+            for m in rx.finditer(line):
+                tokens.add(m.group(1))
+    return tokens
+
+
 def scan_diff_for_reward_hacking(
     diff_text: str,
     repo_root: Path | str | None = None,
@@ -1954,7 +2446,42 @@ def scan_diff_for_reward_hacking(
         return []
 
     findings: list[Finding] = []
-    test_literals: dict[str, tuple[str, int]] = {}  # literal -> (test_file, line)
+    root_dir = Path(repo_root) if repo_root is not None and Path(repo_root).is_dir() else None
+    # Literals per test file, and the lines each test file's imports are read from.
+    test_literals: dict[str, dict[str, int]] = {}
+    preexisting_test_literals: dict[str, set[str]] = {}
+    test_text: dict[str, list[str]] = {}
+
+    def read_lines(rel: str) -> list[str] | None:
+        if root_dir is None:
+            return None
+        try:
+            return (root_dir / rel).read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            return None
+
+    # Names production code loses in this diff: in a removed line, in no added line and in no changed
+    # production file left on disk. An assertion about one of them retires with the feature. Only
+    # code keeps a name alive: a migration that drops a table or a doc that mentions it does not.
+    removed_words: set[str] = set()
+    live_words: set[str] = set()
+
+    def is_code(rel: str) -> bool:
+        return not is_test_file(rel) and Path(rel).suffix.lower() not in NON_CODE_SUFFIXES | {".sql"}
+
+    for h in hunks:
+        if not is_code(h.file_path):
+            continue
+        removed_words.update(w for _, t in h.removed_lines for w in _WORD_RE.findall(_strip_line_comment(t)))
+        live_words.update(w for _, t in h.added_lines for w in _WORD_RE.findall(_strip_line_comment(t)))
+    for rel in {h.file_path for h in hunks if not h.is_deleted_file and is_code(h.file_path)}:
+        live_words.update(w for t in read_lines(rel) or [] for w in _WORD_RE.findall(_strip_line_comment(t)))
+    retired_words = removed_words - live_words - _ASSERTION_WORDS
+
+    test_added_lns: dict[str, set[int]] = {}
+    for h in hunks:
+        if not h.is_deleted_file and is_test_file(h.file_path):
+            test_added_lns.setdefault(h.file_path, set()).update(ln for ln, _ in h.added_lines)
 
     # First pass: inspect test hunks for assertion weakening and collect test literals
     for hunk in hunks:
@@ -1962,21 +2489,31 @@ def scan_diff_for_reward_hacking(
             continue
         if is_test_file(hunk.file_path):
             # Collect literals from added & context lines in test hunks
+            pool = test_literals.setdefault(hunk.file_path, {})
             for lit, ln in _extract_test_literals_from_lines(hunk.added_lines + hunk.context_lines).items():
-                test_literals.setdefault(lit, (hunk.file_path, ln))
+                pool.setdefault(lit, ln)
+            if not hunk.is_new_file:
+                preexisting_test_literals.setdefault(hunk.file_path, set()).update(
+                    _extract_test_literals_from_lines(hunk.context_lines + hunk.removed_lines)
+                )
+            if hunk.file_path not in test_text:
+                disk_lines = read_lines(hunk.file_path) or []
+                test_text[hunk.file_path] = list(disk_lines)
+                if not hunk.is_new_file and disk_lines:
+                    added_set = test_added_lns.get(hunk.file_path, set())
+                    unchanged_lines = [(idx, t) for idx, t in enumerate(disk_lines, start=1) if idx not in added_set]
+                    preexisting_test_literals.setdefault(hunk.file_path, set()).update(
+                        _extract_test_literals_from_lines(unchanged_lines)
+                    )
+            test_text[hunk.file_path] += [t for k, t in hunk.ordered if k != "-"]
 
             # Check diff-assertion-weakening on existing test files
             if not hunk.is_new_file:
-                removed_asserts = [
-                    (ln, r.strip())
-                    for ln, r in hunk.removed_lines
-                    if not r.strip().startswith(("#", "//", "/*", "*")) and DIFF_ASSERTION_LINE_RE.search(r)
-                ]
-                added_asserts = [
-                    (ln, r.strip())
-                    for ln, r in hunk.added_lines
-                    if not r.strip().startswith(("#", "//", "/*", "*")) and DIFF_ASSERTION_LINE_RE.search(r)
-                ]
+                hunk_added_words = {
+                    w for _, t in hunk.added_lines for w in _WORD_RE.findall(_strip_line_comment(t))
+                }
+                removed_asserts = _counted_assertions(hunk.removed_lines, retired_words - hunk_added_words)
+                added_asserts = _counted_assertions(hunk.added_lines, None)
                 removed_headers = [
                     r for _, r in hunk.removed_lines if TEST_FUNCTION_HEADER_RE.search(r)
                 ]
@@ -2031,6 +2568,7 @@ def scan_diff_for_reward_hacking(
     if repo_root is not None:
         root_path = Path(repo_root)
         if root_path.is_dir():
+            new_test_files = {h.file_path for h in hunks if h.is_new_file and is_test_file(h.file_path)}
             prod_stems = {
                 Path(h.file_path).stem.lower()
                 for h in hunks
@@ -2041,31 +2579,102 @@ def scan_diff_for_reward_hacking(
                     tdir = root_path / test_dir_name
                     if not tdir.is_dir():
                         continue
-                    for candidate in tdir.rglob("*"):
-                        if not candidate.is_file() or not is_test_file(candidate):
-                            continue
-                        if _infer_subject_stem(candidate) in prod_stems:
-                            try:
-                                c_lines = list(
-                                    enumerate(
-                                        candidate.read_text(encoding="utf-8", errors="ignore").splitlines(),
-                                        start=1,
+                    for dirpath, dirnames, filenames in os.walk(tdir):
+                        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+                        for fname in filenames:
+                            candidate = Path(dirpath) / fname
+                            if not is_test_file(candidate):
+                                continue
+                            if _infer_subject_stem(candidate) in prod_stems:
+                                try:
+                                    c_lines = list(
+                                        enumerate(
+                                            candidate.read_text(encoding="utf-8", errors="ignore").splitlines(),
+                                            start=1,
+                                        )
                                     )
-                                )
-                                rel_c = str(candidate.relative_to(root_path)).replace("\\", "/")
-                                for lit, ln in _extract_test_literals_from_lines(c_lines).items():
-                                    test_literals.setdefault(lit, (rel_c, ln))
-                            except OSError:
-                                pass
+                                    rel_c = str(candidate.relative_to(root_path)).replace("\\", "/")
+                                    pool = test_literals.setdefault(rel_c, {})
+                                    extracted = _extract_test_literals_from_lines(c_lines)
+                                    for lit, ln in extracted.items():
+                                        pool.setdefault(lit, ln)
+                                    if rel_c not in new_test_files:
+                                        added_set = test_added_lns.get(rel_c, set())
+                                        if not added_set:
+                                            preexisting_test_literals.setdefault(rel_c, set()).update(extracted)
+                                        else:
+                                            unchanged_c = [(idx, t) for idx, t in c_lines if idx not in added_set]
+                                            preexisting_test_literals.setdefault(rel_c, set()).update(
+                                                _extract_test_literals_from_lines(unchanged_c)
+                                            )
+                                    test_text.setdefault(rel_c, [t for _, t in c_lines])
+                                except OSError:
+                                    pass
 
-    # Second pass: EvilGenie detector — scan added production lines for conditional branches matching test literals
+    # Second pass: EvilGenie detector — an added production branch that compares against a
+    # literal only a test paired with that file knows.
     if test_literals:
-        for hunk in hunks:
-            if hunk.is_deleted_file or is_test_file(hunk.file_path) or cfg.is_excluded(hunk.file_path):
+        ts_paths = _load_tsconfig_paths(root_dir)
+        targets = {t: _test_import_targets(t, lines, ts_paths=ts_paths) for t, lines in test_text.items()}
+        prod_hunks = [h for h in hunks if not h.is_deleted_file and not is_test_file(h.file_path)]
+        prod_text: dict[str, list[str] | None] = {}
+        for h in prod_hunks:
+            if h.file_path not in prod_text:
+                prod_text[h.file_path] = read_lines(h.file_path)
+        # A literal is the code's own vocabulary when production already has it apart from the
+        # lines this diff adds: at the base (a removed line), in a line of a changed file the diff
+        # does not add (a union, an enum, a constant, another branch), in a file the diff does not
+        # touch, or (for a literal newly introduced in this diff's tests) across two or more
+        # production files. One only the paired test and the new branch know is special-casing.
+        added_by_file: dict[str, list[str]] = {}
+        kept: list[str] = []
+        for h in hunks:
+            if is_test_file(h.file_path):
+                continue
+            kept += [t for _, t in h.removed_lines]
+            if not h.is_deleted_file:
+                added_by_file.setdefault(h.file_path, []).extend(t for _, t in h.added_lines)
+        for rel in added_by_file:
+            new_lns = {ln for h in prod_hunks if h.file_path == rel for ln, _ in h.added_lines}
+            on_disk = prod_text.get(rel)
+            if on_disk is not None:
+                kept += [t for n, t in enumerate(on_disk, start=1) if n not in new_lns]
+            else:
+                kept += [t for h in prod_hunks if h.file_path == rel for _, t in h.context_lines]
+        kept_tokens = _extract_code_tokens("\n".join(kept))
+        added_tokens_by_file = {rel: _extract_code_tokens("\n".join(lines)) for rel, lines in added_by_file.items()}
+        untouched_tokens: list[set[str]] = []
+
+        def known(lit: str, t_file: str = "") -> bool:
+            if lit in kept_tokens:
+                return True
+            if lit not in preexisting_test_literals.get(t_file, ()):
+                matching_files = [rel for rel, toks in added_tokens_by_file.items() if lit in toks]
+                if len(matching_files) >= 2 and (
+                    sum(1 for r in matching_files for raw in added_by_file.get(r, ()) if lit in raw) >= 3
+                    or any(Path(r).suffix.lower() in NON_CODE_SUFFIXES for r in matching_files)
+                ):
+                    return True
+            if root_dir is None:
+                return False
+            if not untouched_tokens:
+                raw_untouched = _unchanged_production_text(
+                    root_dir, set(added_by_file) | {h.file_path for h in hunks}, cfg=cfg
+                )
+                untouched_tokens.append(_extract_code_tokens(raw_untouched))
+            return lit in untouched_tokens[0]
+
+        for hunk in prod_hunks:
+            if cfg.is_excluded(hunk.file_path):
                 continue
             if Path(hunk.file_path).suffix.lower() in NON_CODE_SUFFIXES:
                 continue
             if cfg.is_exempt(hunk.file_path, "test-input-special-casing"):
+                continue
+            pools = [
+                (t, pool) for t, pool in test_literals.items() if pool and _paired(t, targets.get(t, (set(), set())), hunk.file_path)
+            ]
+            if not pools:
                 continue
 
             hunk_lines = dict(hunk.added_lines + hunk.context_lines)
@@ -2073,44 +2682,40 @@ def scan_diff_for_reward_hacking(
                 s = raw.strip()
                 if not s or s.startswith(("#", "//", "/*", "*")):
                     continue
-                # Must look like a conditional branch (if, elif, case, match arm =>, ternary ?)
-                is_branch = bool(
-                    re.search(
-                        r"^\s*(?:if|elif|else\s+if|case)\b|=>|\?.*:|==|===",
-                        s,
-                    )
-                )
-                if not is_branch:
+                if not re.search(r"\bcase\b|\bin\b|==|!=|=>", s):
                     continue
 
-                for lit, (t_file, t_ln) in test_literals.items():
-                    # Dunder names (`__main__`, `__init__`) are language plumbing, not test input.
-                    if lit.startswith("__") and lit.endswith("__"):
-                        continue
-                    escaped = re.escape(lit)
-                    # Check if the production branch compares against this literal or matches it in a case/pattern
-                    branch_match = re.search(
-                        rf"""(?:==|===|!=|!==|\bin\b|\bcase\b|=>)\s*["']?{escaped}["']?|["']{escaped}["']\s*(?:==|===|=>|:)""",
-                        s,
-                    )
-                    if branch_match and not inline_ignore.suppressed(
-                        inline_ignore.context([hunk_lines.get(ln - 1, ""), raw], 2), "test-input-special-casing", engine="test-integrity", path=hunk.file_path, line=ln,
-                        severity="P0", message=f"Production branch special-cases test literal '{lit}'",
-                    ):
-                        findings.append(
-                            Finding(
-                                path=hunk.file_path,
-                                line=ln,
-                                rule="test-input-special-casing",
-                                severity="P0",
-                                text=s,
-                                message=(
-                                    f"Production branch in '{hunk.file_path}:{ln}' special-cases test literal "
-                                    f"'{lit}' (from '{t_file}:{t_ln}') — potential EvilGenie reward-hacking."
-                                ),
-                            )
-                        )
+                hit = None
+                for t_file, pool in pools:
+                    for lit, t_ln in pool.items():
+                        # Dunder names (`__main__`, `__init__`) are language plumbing, not test input.
+                        if lit not in s or (lit.startswith("__") and lit.endswith("__")):
+                            continue
+                        if _compared_literal_re(lit).search(s) and not known(lit, t_file):
+                            hit = (lit, t_file, t_ln)
+                            break
+                    if hit:
                         break
+                if hit is None:
+                    continue
+                lit, t_file, t_ln = hit
+                if not inline_ignore.suppressed(
+                    inline_ignore.context([hunk_lines.get(ln - 1, ""), raw], 2), "test-input-special-casing", engine="test-integrity", path=hunk.file_path, line=ln,
+                    severity="P0", message=f"Production branch special-cases test literal '{lit}'",
+                ):
+                    findings.append(
+                        Finding(
+                            path=hunk.file_path,
+                            line=ln,
+                            rule="test-input-special-casing",
+                            severity="P0",
+                            text=s,
+                            message=(
+                                f"Production branch in '{hunk.file_path}:{ln}' special-cases test literal "
+                                f"'{lit}' (from '{t_file}:{t_ln}') — potential EvilGenie reward-hacking."
+                            ),
+                        )
+                    )
 
     findings.extend(_removed_test_findings(hunks, cfg, renames, Path(repo_root) if repo_root is not None else None))
     return findings
@@ -3010,6 +3615,7 @@ FIXTURE_TEST_FILES = frozenset({
     "tests/test_detector.py",
     "tests/test_diff_guard.py",
     "tests/test_engine13_audit.py",
+    "tests/test_field_precision.py",
     "tests/test_public_repo_hygiene.py",
     "tests/test_report_hygiene.py",
 })

@@ -1,0 +1,38 @@
+-- label.yaml --
+category: clean
+description: "A Go test's import block is not test input; a new case calling that package is not special-casing."
+must_fire: []
+must_not_fire: [test-input-special-casing]
+-- base/lines/lines.go --
+package lines
+
+import "strings"
+
+func Kind(l string) int {
+	return 0
+}
+-- head/lines/lines.go --
+package lines
+
+import "strings"
+
+func Kind(l string) int {
+	switch {
+	case strings.HasPrefix(l, "ok "):
+		return 1
+	}
+	return 0
+}
+-- head/lines/lines_test.go --
+package lines
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestKind(t *testing.T) {
+	if Kind(strings.ToLower("OK done")) != 1 {
+		t.Fatal("want 1")
+	}
+}

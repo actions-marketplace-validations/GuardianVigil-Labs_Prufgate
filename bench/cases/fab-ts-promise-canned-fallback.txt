@@ -1,0 +1,13 @@
+-- label.yaml --
+category: fabrication
+description: "A promise chain answers a failed charge with a canned success."
+must_fire: [canned-error-fallback]
+must_not_fire: []
+-- base/src/pay.ts --
+export async function pay(order: string) {
+  return gateway.charge(order);
+}
+-- head/src/pay.ts --
+export async function pay(order: string) {
+  return gateway.charge(order).catch(() => ({ ok: true, status: "success" }));
+}

@@ -4,6 +4,31 @@ All notable changes to PrufGate. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [1.2.0]
+
+### Changed
+- **A changed scan judges only what the change touched.** `prufgate check --changed`, `prufgate.sh fast` and the GitHub Action report a finding only when it is on a line the change added or modified (a finding on a block's first line covers the block; a BOLA finding covers its handler). Rules about the diff itself (deleted tests, weakened assertions, skips, suppressions, configuration changes) are unchanged. BOLA reports only the changed route, action and migration files; ast-grep scans only the changed files, zizmor only the changed workflows, and gitleaks only the branch's commits and uncommitted edits. A full scan still reports everything.
+- zizmor findings take their severity from zizmor's severity and confidence (only High blocks; Low and Informational are P3), and their line from the primary location, no longer one line too early. ast-grep lines were one too early as well.
+
+### Added
+- Engine 5 follows a project's guard wrapper one hop: a call at the top of the handler to a function that calls a recognised guard and refuses the request counts as auth. `auth_guards` still names guards it cannot follow.
+- `undocumented-env-var-drift` reads `vars` from `wrangler.toml`, `wrangler.json(c)` and `.dev.vars*`, and accepts a fallback on the variable an env read is assigned to, within three lines.
+- `prufgate bola --changed` limits the static checks to changed files.
+### Fixed
+- `test-input-special-casing` reads only literals from the tests paired with the production file (by import or name, same language), whole quoted tokens only (no Go import blocks, no keys inside JSON blobs), compared with `==`, `===`, `!=`, `in`, `case` or a match arm. A literal production already uses apart from the added lines (at the base, elsewhere in the file, in an untouched file, or in two or more changed files) is vocabulary, not special-casing. Newly caught: a new `case` for a test-only value in an existing `switch`.
+- `diff-test-file-deleted` and `diff-assertion-weakening` recognise a test retired with its feature: tsconfig and jsconfig `paths` aliases are resolved, a test is retired when every first-party symbol it imports is gone (shared live helpers don't keep it alive), Go pairs `x_test.go` with `x.go`, and removed assertions on code that left production, or a removed `t.Fatal(err)` setup guard together with its call, are not weakening.
+- `self-mocked-unit-under-test` compares the resolved module, not the file name: mocking a package (`@scope/name`) is never mocking the subject.
+- `caught-and-ignored-test-exception`: an error stored in a variable that is asserted later is handled. `zero-assertion-test` counts a `throw` inside a JavaScript or TypeScript test as an assertion.
+- `unhandled-empty-catch` (JavaScript, TypeScript): a catch returning the function's "no value" answer (`null`, `false`, `undefined`, `{}`) is not empty, nor is a catch whose comment gives a reason, a best-effort release in a `close` / `cleanup` function, a retry loop, a `return` in the try with the failure path below, or a read into a variable that already holds its default. `// ignore` and `// TODO` still fire. Only a catch opened on the reported line is read, so a later one is no longer reported on the wrong line.
+- `canned-error-fallback`: an object returned from a catch is canned when it claims success (`ok: true`, `status: "ok"`) or holds only literals and no word of the failure; `{ success: false, error }` and `{ state: "unavailable", reason }` are not. A Go `c.JSON(200, gin.H{...})` that carries `"error"` is not. Newly caught: `promise.catch(() => ({ ok: true }))`.
+- `disconnected-form-submit` fires only in a submit handler that does nothing but `preventDefault()`, log or alert, read to the handler's closing brace; keyboard, drag and focus handlers are not forms.
+- `documentation-address` accepts a `placeholder` up to three lines above (a multi-line ternary) and "for example" / "e.g." text.
+- `stub-click-handler` and `simulated-return-value` ignore code quoted inside a string literal (a help text or a list of examples).
+- `test-skip-smuggling` accepts a skip guarded, on the skip expression or its enclosing `if`, by a check of a capability the test needs: `exec.LookPath`, `net.Listen`, `runtime.GOOS`, `shutil.which`, `process.env`, `process.platform` and the like (excluding `CI`).
+- `suppression-comment-smuggling` ignores a directive quoted in a string literal. A line-scoped directive that names its rule (`eslint-disable-next-line no-console`) in a test file is a P2 warning; a bare or file-wide one still blocks.
+- `unsafe-type-cast-cascade`: a single `as unknown as T` is a P2 warning; `any`, or double casts within five lines of each other, still block. `any` inside a string is not a cast.
+- `pr-sql-injection-vector` fires only when `${...}` is inside a template literal that is the query's first argument, not in the bind parameters or a plain string, and now also when that template literal starts on the next line or spans several. `pr-shell-command-injection-risk` and the SQL rule ignore a call quoted inside a string literal.
+
 ## [1.1.0]
 
 ### Changed

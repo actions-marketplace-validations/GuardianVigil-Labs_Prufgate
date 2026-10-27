@@ -91,7 +91,7 @@ An issue reference is `#123`, `ABC-123` or an issue URL. Acronyms such as `UTF-8
 |---|---|---|
 | `undeclared-or-hallucinated-import` | medium | An import of a package declared in none of `package.json`, `pyproject.toml` (dependency tables only), `requirements*.txt` / `requirements/`, `go.mod`, `Cargo.toml`. Standard-library modules, relative imports and local packages are not flagged. A hallucinated or typo-squatted name is how a malicious package gets installed. |
 | `ghost-symbol` | high | A name that its module does not define: `from shop.billing import charge_card` when `shop/billing.py` has no `charge_card`, a call such as `billing.charge_card(...)` on an imported module, or `import { charge } from "./billing"` when `./billing.ts` exports no `charge`. A hallucinated API. P1. See [ghost symbols](#ghost-symbols). |
-| `undocumented-env-var-drift` | high | `process.env.X`, `os.environ["X"]` / `os.getenv("X")` without a default, `os.Getenv("X")`, `env!("X")`, when `X` is missing from `.env.example` (or `.env.sample`, `.env.template`) and from every config schema and deploy manifest (below). |
+| `undocumented-env-var-drift` | high | `process.env.X` (unless a fallback follows: `?? 5000`, `\|\| 5000` or a ternary, after the read or on its variable within three lines, as in `const n = Number(process.env.X);` then `return n > 0 ? n : 5000;`), `os.environ["X"]` / `os.getenv("X")` without a default, `os.Getenv("X")`, `env!("X")`, when `X` is missing from `.env.example` (or `.env.sample`, `.env.template`) and from every config schema and deploy manifest (below). |
 | `frontend-backend-route-mismatch` | medium | `fetch("/api/...")` / `axios.*("/api/...")` to a path that no backend route or OpenAPI spec defines. |
 
 ### Ghost symbols
@@ -117,6 +117,7 @@ Unknown is never a finding: a star import, a module-level `__getattr__`, `global
 | Kubernetes | YAML under `k8s/`, `kubernetes/`, `kube/`, `manifests/`, `deploy/`, `deployment(s)/`, `helm/`, `charts/`, `kustomize/`, `infra/` | `env: - name:`; `envFrom` adds the keys (with `prefix`) of a ConfigMap or Secret defined in a scanned manifest |
 | Helm | `values*.yaml`; files under a `templates/` directory | `env:` blocks in values; in templates, `- name: UPPER_CASE` lines (Kubernetes object names are lower case) |
 | GitHub Actions | `.github/workflows/*.yml` | workflow, job and step `env:` maps |
+| Cloudflare Workers | `wrangler.toml`, `wrangler.json`, `wrangler.jsonc`, `.dev.vars*` | `[vars]` and `[env.<name>.vars]` tables (and inline `vars = { ... }`) in TOML; `vars`, top level and under each `env.<name>`, in JSON with comments; `KEY=` lines in `.dev.vars` files |
 
 Schemas and manifests only add documented names: on their own they do not switch the rule on. Files over 1 MB, test paths and `exclude` paths are skipped. Multi-document YAML is read with `yaml.safe_load_all`. A file that cannot be read or parsed (malformed YAML) is skipped with a `contract_guard: warning:` line on stderr, the same way an unreadable `.env.example` is skipped: a skipped source can only add findings, never hide one.
 
@@ -175,6 +176,8 @@ Static analysis discovers routes in OpenAPI specs, Express/Fastify, NestJS, Next
 | `bfla-allow-denied` | medium | Role matrix: a role the matrix allows got 401/403, so the matrix may be stale (P3, advisory). |
 
 Add your own guards and tenant keys with `auth_guards` and `tenant_keys`.
+
+A project guard wrapper is followed one hop without configuration: when one of the handler's first three statements (before any lookup) calls a function, defined in the same file, in a file it is imported from (relative or `@/` paths), a Python module or the Go package, whose body calls a recognised guard and refuses the request (a 401 or 403, a throw or raise, an abort or a redirect), the handler counts as guarded. For example `const g = await staffOnly("widgets:write"); if (!g.ok) return g.response;` where `staffOnly` calls `assertStaff` and returns 403. A wrapper deeper than one hop, or one that never refuses, needs `auth_guards: [staffOnly]`.
 
 ### What the static checks resolve
 
@@ -305,4 +308,6 @@ Each finding names the transcript line and, when the transcript has one, the tim
 
 - **ast-grep**: the built-in rule `configs/ast-grep/rules/action-authorization-guard.yml` and your own rules in `.prufgate/rules/`. See [CUSTOM_RULES.md](CUSTOM_RULES.md).
 - **gitleaks**: secret scanning with PrufGate's defaults (`configs/gitleaks.toml`) extended by your `.gitleaks.toml`.
-- **zizmor**: GitHub Actions workflow security.
+- **zizmor**: GitHub Actions workflow security. Severity follows zizmor's own severity and confidence: High is blocking (P1; a High-confidence `template-injection` is P0), Medium is P2 (P3 with Low confidence), Low and Informational are P3, and `unpinned-uses` is always P2. The reported line is the finding's primary location.
+
+In a changed-files run each tool sees only the change: see [A changed scan judges only the changed lines](GETTING_STARTED.md#a-changed-scan-judges-only-the-changed-lines).

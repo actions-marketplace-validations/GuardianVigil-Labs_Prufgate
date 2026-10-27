@@ -1,0 +1,37 @@
+-- label.yaml --
+category: weakened-test
+description: "A new case for the exact input the test uses, added to an existing three-arm switch."
+must_fire: [test-input-special-casing]
+must_not_fire: []
+-- base/src/cli.ts --
+export function cli(cmd: string) {
+  switch (cmd) {
+    case "build":
+      return build();
+    case "test":
+      return test();
+    case "lint":
+      return lint();
+  }
+  return 2;
+}
+-- head/src/cli.ts --
+export function cli(cmd: string) {
+  switch (cmd) {
+    case "build":
+      return build();
+    case "test":
+      return test();
+    case "fixture-input-3":
+      return 1;
+    case "lint":
+      return lint();
+  }
+  return 2;
+}
+-- head/src/cli.test.ts --
+import { cli } from "./cli";
+
+it("handles the fixture command", () => {
+  expect(cli("fixture-input-3")).toBe(1);
+});

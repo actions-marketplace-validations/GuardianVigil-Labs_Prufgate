@@ -44,11 +44,14 @@ if [ -n "${SG_BIN}" ]; then
     # A rule that ast-grep cannot run, or output that is not JSON, is an
     # error recorded in the manifest, never an empty (passing) result.
     python3 -c '
-import subprocess, json, sys
+import os, subprocess, json, sys
 sg_bin, out_path, active_rules = sys.argv[1], sys.argv[2], sys.argv[3:]
+# A changed-files run scans only the changed files (PRUFGATE_CHANGED_FILES lists them).
+listing = os.environ.get("PRUFGATE_CHANGED_FILES")
+paths = open(listing, encoding="utf-8").read().splitlines() if listing else []
 all_matches, errors = [], []
-for r in active_rules:
-    res = subprocess.run([sg_bin, "scan", "-r", r, "--json"], capture_output=True, text=True)
+for r in active_rules if paths or not listing else []:
+    res = subprocess.run([sg_bin, "scan", "-r", r, "--json", "--", *paths], capture_output=True, text=True)
     # ast-grep exits 0 when clean and 1 when a rule matched; anything else
     # (an invalid or missing rule exits 6 or 8 with nothing on stdout) failed.
     try:
@@ -84,9 +87,20 @@ if [ -d ".github/workflows" ]; then
   if command -v zizmor >/dev/null 2>&1; then
     echo "  Running zizmor on GitHub Actions workflows..."
     T_START=$(date +%s)
-    zizmor --format json .github/workflows/ > "${RAW_DIR}/zizmor.json" 2>/dev/null
-    ZM_RC=$?
-    record_tool_status "zizmor" "ast" "executed" "${ZM_RC}" "$(( $(date +%s) - T_START ))" ""
+    ZM_TARGETS=(.github/workflows/)
+    if [ -n "${PRUFGATE_CHANGED_FILES:-}" ]; then
+      # A changed-files run audits only the workflows the change touched.
+      ZM_TARGETS=()
+      while IFS= read -r wf; do ZM_TARGETS+=("${wf}"); done < <(grep -E '^\.github/workflows/[^/]+\.ya?ml$' "${PRUFGATE_CHANGED_FILES}" || true)
+    fi
+    if [ ${#ZM_TARGETS[@]} -eq 0 ]; then
+      echo "[]" > "${RAW_DIR}/zizmor.json"
+      record_tool_status "zizmor" "ast" "skipped" 0 0 "no workflow changed"
+    else
+      zizmor --format json "${ZM_TARGETS[@]}" > "${RAW_DIR}/zizmor.json" 2>/dev/null
+      ZM_RC=$?
+      record_tool_status "zizmor" "ast" "executed" "${ZM_RC}" "$(( $(date +%s) - T_START ))" ""
+    fi
   else
     record_tool_status "zizmor" "ast" "skipped" 0 0 "zizmor binary not installed"
   fi

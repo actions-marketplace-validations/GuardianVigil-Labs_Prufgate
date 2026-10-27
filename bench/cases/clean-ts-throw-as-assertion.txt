@@ -1,0 +1,22 @@
+-- label.yaml --
+category: clean
+description: "A test checks a condition by throwing, which fails the test."
+must_fire: []
+must_not_fire: [zero-assertion-test]
+-- base/src/schema.ts --
+export async function columns() {
+  return new Set(["name"]);
+}
+-- head/src/schema.ts --
+export async function columns() {
+  return new Set(["id", "name"]);
+}
+-- head/src/schema.test.ts --
+import { columns } from "./schema";
+
+it("has an id column", async () => {
+  const cols = await columns();
+  for (const c of ["id", "name"]) {
+    if (!cols.has(c)) throw new Error(`missing ${c}`);
+  }
+});

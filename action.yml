@@ -25,7 +25,7 @@ inputs:
   image:
     description: 'Container image to run when the runner has no python3 (container mode). The default is the signed release image of this version.'
     required: false
-    default: 'ghcr.io/guardianvigil-labs/prufgate:1.1.0'
+    default: 'ghcr.io/guardianvigil-labs/prufgate:1.2.0'
   base_ref:
     description: 'Git ref that changed files are compared with in fast mode. Defaults to the pull request base branch (origin/<base>). Check out with fetch-depth: 0 so that ref exists.'
     required: false

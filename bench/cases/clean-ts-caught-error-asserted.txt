@@ -1,0 +1,33 @@
+-- label.yaml --
+category: clean
+description: "A test keeps the caught error and asserts on it after the try."
+must_fire: []
+must_not_fire: [caught-and-ignored-test-exception]
+-- base/src/parse.ts --
+export class ParseError extends Error {}
+
+export function parse(s: string) {
+  return JSON.parse(s);
+}
+-- head/src/parse.ts --
+export class ParseError extends Error {}
+
+export function parse(s: string) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    throw new ParseError(s);
+  }
+}
+-- head/src/parse.test.ts --
+import { parse, ParseError } from "./parse";
+
+it("rejects bad input", () => {
+  let err;
+  try {
+    parse("x");
+  } catch (e) {
+    err = e;
+  }
+  expect(err).toBeInstanceOf(ParseError);
+});

@@ -3,7 +3,7 @@
   "name": "io.github.GuardianVigil-Labs/prufgate",
   "title": "PrufGate",
   "description": "Read-only tools that check whether code, and the tests that claim it works, are real.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "repository": {
     "url": "https://github.com/GuardianVigil-Labs/Prufgate",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "pypi",
       "identifier": "prufgate",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "packageArguments": [{ "type": "positional", "value": "mcp" }]

@@ -37,7 +37,7 @@ jobs:
 | `target_url` | none | Base URL for live BOLA probing of a service the job starts. Pass the tokens as `PRUFGATE_TEST_PROBE_TOKEN_A` / `_B` in `env`. |
 | `fail_on_blocker` | `true` | Fail the step on a FAILED or ERROR verdict. |
 | `sarif_upload` | `true` | Upload `reports/prufgate.sarif` to code scanning (skipped when no report was written). |
-| `image` | `ghcr.io/guardianvigil-labs/prufgate:1.1.0` | Only used when the runner has no `python3`: the signed release image of this version, or an image you built. |
+| `image` | `ghcr.io/guardianvigil-labs/prufgate:1.2.0` | Only used when the runner has no `python3`: the signed release image of this version, or an image you built. |
 
 Outputs: `verdict` (`PASSED` or `FAILED`), `sarif_path`, `markdown_path`.
 
@@ -109,7 +109,7 @@ This repository is a [pre-commit](https://pre-commit.com) hook repository (pre-c
 ```yaml
 repos:
   - repo: https://github.com/GuardianVigil-Labs/Prufgate
-    rev: v1.1.0
+    rev: v1.2.0
     hooks:
       - id: prufgate
       - id: prufgate-full

@@ -1,0 +1,39 @@
+-- label.yaml --
+category: clean
+description: "A new switch case for a value production code already declares in a union type."
+must_fire: []
+must_not_fire: [test-input-special-casing]
+-- base/src/types.ts --
+export type Cmd = "build" | "lint" | "deploy";
+-- base/src/cli.ts --
+import type { Cmd } from "./types";
+
+export function cli(cmd: Cmd) {
+  switch (cmd) {
+    case "build":
+      return build();
+    case "lint":
+      return lint();
+  }
+  return 2;
+}
+-- head/src/cli.ts --
+import type { Cmd } from "./types";
+
+export function cli(cmd: Cmd) {
+  switch (cmd) {
+    case "build":
+      return build();
+    case "deploy":
+      return deploy();
+    case "lint":
+      return lint();
+  }
+  return 2;
+}
+-- head/src/cli.test.ts --
+import { cli } from "./cli";
+
+it("deploys", () => {
+  expect(cli("deploy")).toBe(0);
+});

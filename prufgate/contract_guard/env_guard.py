@@ -101,12 +101,43 @@ def load_documented_env_vars(workspace: Path, config: PrufGateConfig | None = No
 
 
 def _line_has_inline_fallback(line: str, match_end: int) -> bool:
-    """Return True if a JS/TS env read is immediately followed by `|| 'default'` or `?? 'default'`."""
+    """Return True if a JS/TS env read is followed by `|| 'default'` or `?? 'default'`, also
+    outside the call that reads it (`Number(process.env.X) || 5000`), or by a ternary."""
     tail = line[match_end:].lstrip()
+    while tail.startswith(")"):
+        tail = tail[1:].lstrip()
+    if tail.startswith("?") and not tail.startswith(("?.", "??")):
+        m_colon = re.search(r":\s*([^;,\n]+)", tail[1:])
+        if m_colon and not re.match(r"^(?:undefined|null)\b", m_colon.group(1).strip()):
+            return True
+        return False
     if tail.startswith(("||", "??")):
         after_op = tail[2:].lstrip()
         # Fallback must be a non-empty literal or expression
-        if after_op and not after_op.startswith(("undefined", "null", ";")):
+        if after_op and not re.match(r"^(?:undefined|null)\b", after_op) and not after_op.startswith(";"):
+            return True
+    return False
+
+
+_ASSIGNED_RE = re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=")
+
+
+def _nearby_fallback(lines: list[str], ln: int) -> bool:
+    """A JS/TS env read assigned to a variable that one of the next three lines falls back
+    from: `const n = Number(process.env.X);` then `return n > 0 ? n : 5000;` (or `n ?? 5000`)."""
+    m = _ASSIGNED_RE.match(lines[ln - 1])
+    if not m:
+        return False
+    var = re.escape(m.group(1))
+    fb_re = re.compile(
+        rf"(?<![\w$.!]){var}\b(?:[^?:;\n]*?\?(?![.?])\s*[^?:;\s][^?:;]*:\s*(?!undefined\b|null\b)\S"
+        rf"|\s*(?:\?\?|\|\|)\s*(?!undefined\b|null\b|;)\S)"
+    )
+    for nxt in lines[ln : ln + 3]:
+        s = nxt.strip()
+        if re.match(r"^(?:if|while)\s*\(", s) and "?" not in s:
+            continue
+        if fb_re.search(s) and "throw" not in s:
             return True
     return False
 
@@ -145,7 +176,7 @@ def scan_file_env_drift(
                 var_name = m.group(1)
                 if var_name in doc_vars:
                     continue
-                if kind in ("js-dot", "js-bracket") and _line_has_inline_fallback(s, m.end()):
+                if kind in ("js-dot", "js-bracket") and (_line_has_inline_fallback(s, m.end()) or _nearby_fallback(lines, ln)):
                     continue
                 message = (
                     f"Environment variable '{var_name}' in '{rel_path}:{ln}' is not documented in "

@@ -2,7 +2,7 @@
   "name": "prufgate",
   "displayName": "PrufGate",
   "description": "Shows PrufGate findings (faked results, hollow tests, weakened checks) inline. Runs the prufgate CLI you install.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "GuardianVigil",
   "license": "Apache-2.0",
   "repository": {
@@ -72,7 +72,9 @@
     "build": "tsc -p .",
     "typecheck": "tsc -p . --noEmit",
     "test": "tsc -p . && node --test out/test/",
-    "package": "tsc -p . && node -e \"require('fs').copyFileSync('../../LICENSE', 'LICENSE')\" && vsce package --no-dependencies"
+    "package": "vsce package --no-dependencies",
+    "vscode:prepublish": "tsc -p . && node -e \"require('fs').copyFileSync('../../LICENSE', 'LICENSE')\"",
+    "publish": "vsce publish --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "22.20.5",

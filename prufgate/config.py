@@ -172,7 +172,12 @@ EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 def _git(args: list[str], cwd: Path | str | None) -> str:
     try:
         res = subprocess.run(
-            ["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+            ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except OSError as e:
         raise GitDiffError(f"cannot run git: {e}") from e

@@ -1,0 +1,21 @@
+-- label.yaml --
+category: clean
+description: "A parser answers bad input with its documented null, and a close() releases on a best-effort basis."
+must_fire: []
+must_not_fire: [unhandled-empty-catch]
+-- base/src/link.ts --
+export const VERSION = 1;
+-- head/src/link.ts --
+export const VERSION = 1;
+
+export function toUrl(s: string): URL | null {
+  try {
+    return new URL(s);
+  } catch {
+    return null;
+  }
+}
+
+export const pool = {
+  close: async (conn: { end(): Promise<void> }) => { try { await conn.end(); } catch {} },
+};

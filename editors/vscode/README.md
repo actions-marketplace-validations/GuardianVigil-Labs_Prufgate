@@ -13,16 +13,17 @@ Shows [PrufGate](https://github.com/GuardianVigil-Labs/Prufgate) findings inline
 The extension runs the `prufgate` command you install; it does not bundle it.
 
 1. Install the CLI: `pipx install prufgate`
-2. Build the extension (Node.js 22 or later), from this folder:
+2. Install the extension from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=GuardianVigil.prufgate): search **PrufGate** in VS Code's **Extensions** view, or run `code --install-extension GuardianVigil.prufgate`.
 
-   ```sh
-   npm ci
-   npm run package
-   ```
+To build it from source instead (Node.js 22 or later), from this folder:
 
-3. Install the file it makes: `code --install-extension prufgate-<version>.vsix`, or in VS Code **Extensions** > **Views and More Actions...** > **Install from VSIX...**
+```sh
+npm ci
+npm run package
+code --install-extension prufgate-<version>.vsix
+```
 
-A Marketplace release is coming later.
+Maintainers publish a release with `npm run publish` (it builds the extension first).
 
 ## Use
 

@@ -38,6 +38,7 @@ if str(_THIS_DIR.parent.parent) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR.parent.parent))
 
 from prufgate import inline_ignore  # noqa: E402
+from prufgate.anti_fabrication import literals  # noqa: E402
 from prufgate.anti_fabrication.packs import cti  # noqa: E402
 from prufgate.config import (  # noqa: E402
     DEFAULT_PACKS,
@@ -200,16 +201,20 @@ V2_EXEMPT: dict[tuple[str, str], str] = {}
 
 
 class Finding:
-    def __init__(self, path: str, line: int, rule: str, text: str):
+    def __init__(self, path: str, line: int, rule: str, text: str, end_line: int = 0):
         self.path, self.line, self.rule, self.text = path, line, rule, text.strip()[:110]
+        self.end_line = end_line
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "file": self.path,
             "line": self.line,
             "rule": self.rule,
             "snippet": self.text,
         }
+        if self.end_line > self.line:
+            d["end_line"] = self.end_line
+        return d
 
     def __str__(self) -> str:
         return f"{self.path}:{self.line}\n    [{self.rule}] {self.text}"
@@ -429,6 +434,30 @@ ABSTRACT_CONTEXT_RE = re.compile(
 )
 
 
+# A documentation address shown to a person as an example, not used as an address.
+EXAMPLE_TEXT_RE = re.compile(r"placeholder|\bfor\s+example\b|\be\.g\.|\bsuch\s+as\b", re.IGNORECASE)
+
+
+def _code_before_comment(line: str) -> str:
+    spans = literals.string_spans(line)
+    for idx in range(len(line)):
+        if literals.in_string(spans, idx):
+            continue
+        if line[idx] == "#" or line[idx : idx + 2] == "//":
+            return line[:idx]
+    return line
+
+
+def _documented_example(lines: list[str], i: int) -> bool:
+    """The address on lines[i] is an input placeholder (the attribute may open a few
+    lines above, as in a multi-line ternary) or follows "for example" / "e.g."."""
+    cur = _code_before_comment(lines[i])
+    if EXAMPLE_TEXT_RE.search(cur):
+        return True
+    prev = "\n".join(_code_before_comment(ln) for ln in lines[max(0, i - 3) : i])
+    return bool(re.search(r"\bplaceholder\s*[:=]", prev, re.IGNORECASE))
+
+
 def v2_findings(rel: str, suffix: str, lines: list[str]) -> list[Finding]:
     """The core rules. Comments are skipped; exemptions are applied by the caller."""
     out: list[Finding] = []
@@ -441,7 +470,7 @@ def v2_findings(rel: str, suffix: str, lines: list[str]) -> list[Finding]:
         stripped = line.strip()
         if stripped.startswith(("//", "#", "*", "/*")):
             continue
-        if DOC_ADDRESS.search(line) and "placeholder" not in line.lower():
+        if DOC_ADDRESS.search(line) and not _documented_example(lines, i):
             out.append(Finding(rel, i + 1, "documentation-address", line))
         if ALWAYS_CURRENT.search(line):
             out.append(Finding(rel, i + 1, "always-current-fake", line))
@@ -568,6 +597,23 @@ MULTI_LANG_CANNED_OK_RE = re.compile(
 )
 
 
+def _canned_ok(window: str) -> bool:
+    """A canned success in a handler. A Go `c.JSON(200, gin.H{...})` that carries the
+    error in its body (`"error": err.Error()`) reports the failure, it does not hide it."""
+    for m in MULTI_LANG_CANNED_OK_RE.finditer(window):
+        rest = window[m.start() :]
+        if m.group(0).lstrip().startswith("c.JSON"):
+            err_m = re.search(r"""["']error["']\s*:\s*([^,\n}]+)""", rest)
+            if (
+                err_m
+                and not re.match(r"""^(?:nil|false|""|'')\b""", err_m.group(1).strip())
+                and not SUCCESS_CLAIM_RE.search(rest)
+            ):
+                continue
+        return True
+    return False
+
+
 # `except:`, `except Exception:`, `except BaseException as e:` or a tuple naming either
 # (`except (ValueError, Exception):`): a handler that catches everything.
 PY_BROAD_EXCEPT_RE = re.compile(
@@ -605,48 +651,274 @@ def _only_pass(lines: list[str], i: int, end: int) -> bool:
 TRAILING_COMMENT_RE = re.compile(r"\s*(?://(?![^\"'`]*[\"'`]\s*[,;)}\]]).*|/\*.*?\*/)\s*$")
 
 
-def check_empty_catch(window: str) -> str | None:
-    """"empty" for a catch that swallows the error with nothing, "canned" for one
-    that answers it with a literal success; None otherwise. Comments, trailing
-    ones included, are ignored."""
-    m = re.search(r"\bcatch\s*(?:\([^)]*\))?\s*\{", window)
-    if not m:
-        return None
-    brace_start = window.find("{", m.start())
-    depth = 0
-    body = None
-    for idx in range(brace_start, len(window)):
-        if window[idx] == "{":
+CATCH_OPEN_RE = re.compile(r"\bcatch\s*(?:\([^)]*\))?\s*\{")
+# A success claimed outright: `ok: true`, `status: "ok"`.
+SUCCESS_CLAIM_RE = re.compile(
+    r"""['"]?\b(?:ok|success|succeeded|valid|verified|approved|authori[sz]ed|allowed|passed|saved|sent|delivered|completed?|charged|refunded|synced|processed|paid)\b['"]?\s*:\s*true\b"""
+    r"""|['"]?\bstatus['"]?\s*:\s*['"](?:ok|success|succeeded|healthy|complete|completed|done|active|synced|paid|charged|refunded|processed)['"]""",
+    re.IGNORECASE,
+)
+# A failure said as a failure: `success: false`, an `error` / `reason` field with a non-empty value, `state: "unavailable"`.
+FAILURE_MARK_RE = re.compile(
+    r"""['"]?\b(?:error|errors|err|reason|detail|details|failure|message|problem)\b['"]?\s*(?:,(?!\s*$)|$|:\s*(?!(?:null|undefined|false|0|""|''|\[\s*\]|\{\s*\})\b)\S)"""
+    r"""|['"]?\b(?!(?:failed|failure|errors?|err|is_?error|has_?error|invalid|expired|rejected|denied|refused|blocked|disabled|offline|stale|cancell?ed)\b)[A-Za-z_$][\w$]*['"]?\s*:\s*false\b"""
+    r"""|:\s*['"](?:unavailable|failed|failure|error|unknown|denied|refused|rejected)['"]""",
+    re.IGNORECASE,
+)
+LITERAL_VALUE_RE = re.compile(
+    r"""(?:true|false|null|undefined|-?\d[\d_.]*|"[^"]*"|'[^']*'|`[^`$]*`|\[\s*\]|\{\s*\})"""
+)
+# A comment that is a placeholder, not a reason.
+NON_REASON_RE = re.compile(
+    r"\b(?:todo|fixme|xxx|hack|for\s+now|later|temporar\w*|swallow\w*|ignore\w*|suppress\w*|noop|no-op|do\s+nothing|silent\w*)\b",
+    re.IGNORECASE,
+)
+# A function whose job is to let go of something: a failure there has nowhere to go.
+JS_CLEANUP_NAME_RE = re.compile(
+    r"(?<![.\w])(?:close|cleanup|cleanUp|dispose|teardown|tearDown|shutdown|destroy|release|abort|stop|unmount|finali[sz]e)\w*\s*[:=(]"
+)
+JS_CLEANUP_CALL_RE = re.compile(
+    r"\.(?:close|end|destroy|dispose|kill|release|disconnect|abort|terminate|unlink|unref|cancel|stop|quit)\s*\("
+)
+JS_LOOP_RE = re.compile(r"\b(?:for|while)\s*\(|\bdo\s*\{")
+JS_WAIT_RE = re.compile(r"\b(?:sleep|wait\w*|setTimeout|delay|backoff|retry|retries|attempts?)\b", re.IGNORECASE)
+
+
+def _props(inner: str) -> list[str]:
+    """Top-level comma-separated parts of an object literal's body."""
+    parts, depth, cur, quote = [], 0, "", ""
+    for c in inner:
+        if quote:
+            quote = "" if c == quote else quote
+        elif c in "\"'`":
+            quote = c
+        elif c in "([{":
             depth += 1
-        elif window[idx] == "}":
+        elif c in ")]}":
             depth -= 1
-            if depth == 0:
-                body = window[brace_start + 1 : idx].strip()
-                break
-    if body is None:
-        return None
-    lines = [
-        TRAILING_COMMENT_RE.sub("", line.strip())
-        for line in body.splitlines()
-        if line.strip() and not line.strip().startswith(("//", "/*", "*"))
-    ]
-    lines = [line for line in lines if line]
-    if not lines:
+        elif c == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+            continue
+        cur += c
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
+def _is_literal_expr(val: str, depth: int = 0) -> bool:
+    val = val.strip()
+    if not val or depth > 3:
+        return False
+    if LITERAL_VALUE_RE.fullmatch(val):
+        return True
+    if val.startswith("[") and val.endswith("]"):
+        items = _props(val[1:-1])
+        return all(_is_literal_expr(x, depth + 1) for x in items)
+    if val.startswith("{") and val.endswith("}"):
+        props = _props(val[1:-1])
+        return bool(props) and all(
+            ":" in p and _is_literal_expr(p.split(":", 1)[1], depth + 1) for p in props
+        )
+    return False
+
+
+def canned_object(inner: str) -> bool:
+    """The body of an object literal answered on a failure path is a canned success:
+    it claims success, or holds nothing but literals and no word of the failure."""
+    if SUCCESS_CLAIM_RE.search(inner):
+        return True
+    if FAILURE_MARK_RE.search(inner):
+        return False
+    props = _props(inner)
+    return bool(props) and all(
+        ":" in p and _is_literal_expr(p.split(":", 1)[1]) for p in props
+    )
+
+
+def _classify_catch_body(body: str) -> str | None:
+    comments = []
+    code_lines = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith(("//", "/*", "*")):
+            comments.append(line)
+            continue
+        m = TRAILING_COMMENT_RE.search(line)
+        if m and m.group(0).strip():
+            comments.append(m.group(0))
+            line = line[: m.start()].strip()
+        elif line.startswith("/*") or "/*" in line:
+            comments.append(line)
+            line = re.sub(r"/\*.*?\*/", "", line).strip()
+        if line:
+            code_lines.append(line)
+    if not code_lines:
+        # A comment that gives a reason documents a deliberate choice; "// ignore" does not.
+        text = re.sub(r"[/*]+", " ", " ".join(comments))
+        if len(re.findall(r"[A-Za-z]{2,}", text)) >= 3 and not NON_REASON_RE.search(text):
+            return None
         return "empty"
-    code = " ".join(lines)
-    if re.match(r"^return\s*(?:true|false|null|undefined|\"\"|\[\]|\{\s*\});?$", code):
+    code = " ".join(code_lines)
+    # `return null` / `false` / `{}` is the function's documented "no value" answer.
+    if re.match(r"^return\s*true;?$", code):
         return "empty"
-    if re.match(r"^return\s*\{[^}]*\};?$", code) and not re.search(
-        r"\b(?:console\.|log\.|logger\.|trackError|reportError|throw\b)", code
-    ):
-        return "canned"
+    m_ret = re.match(r"^return\s*(\{.*\})\s*;?$", code)
+    if m_ret:
+        obj = m_ret.group(1)
+        if len(obj) > 2 and _match_brace(_masked(obj), 0, 1) == len(obj) - 1 and canned_object(obj[1:-1]):
+            return "canned"
     return None
 
 
-FORM_PREVENT_DEFAULT = re.compile(r"""(?:\be|event)\.preventDefault\(\)""")
-ACTIVE_SUBMIT_SIGNAL = re.compile(
-    r"""\b(?:fetch|axios|dispatch|submit|mutate|execute|send|post|request|router\.push|navigate|set[A-Z]\w*|actions?\.)\b"""
+def _match_brace(s: str, i: int, step: int) -> int | None:
+    """Index of the brace matching s[i], scanning forward (step 1) or back (step -1)."""
+    depth = 0
+    opener, closer = ("{", "}") if step == 1 else ("}", "{")
+    while 0 <= i < len(s):
+        if s[i] == opener:
+            depth += 1
+        elif s[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += step
+    return None
+
+
+def _masked(line: str) -> str:
+    """`line` with the inside of each string literal and comment blanked, same length."""
+    spans = literals.string_spans(line)
+    out = list(line)
+    for a, b in spans:
+        for k in range(a + 1, b - 1):
+            out[k] = " "
+    i, n = 0, len(out)
+    while i < n - 1:
+        if any(a <= i < b for a, b in spans):
+            i += 1
+            continue
+        if out[i] == "/" and out[i + 1] == "/":
+            for k in range(i + 2, n):
+                out[k] = " "
+            break
+        if out[i] == "/" and out[i + 1] == "*":
+            end = line.find("*/", i + 2)
+            stop = end + 2 if end != -1 else n
+            for k in range(i, stop):
+                out[k] = " "
+            i = stop
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _strip_js_comments(text: str) -> str:
+    text = re.sub(r"/\*[\s\S]*?\*/", " ", text)
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def _swallow_is_deliberate(masked: str, try_open: int, try_close: int, catch_close: int) -> bool:
+    """An empty catch that is not hiding a failure: a best-effort release, a retry
+    loop that tries again, a `return` in the try with the failure path below it, or
+    a read into a variable that already holds its default."""
+    line_start = masked.rfind("\n", 0, masked.rfind("\n", 0, try_open)) + 1
+    prefix = _strip_js_comments(masked[line_start:try_open])
+    try_body = _strip_js_comments(masked[try_open + 1 : try_close]).strip()
+    after = _strip_js_comments(masked[catch_close + 1 :]).lstrip()
+    stmts = [s.strip() for s in re.split(r"[;\n]+", try_body) if s.strip()]
+    if JS_CLEANUP_NAME_RE.search(prefix) or (JS_CLEANUP_CALL_RE.search(try_body) and len(stmts) <= 1):
+        return True
+    before = "\n".join(_strip_js_comments(masked[:try_open]).split("\n")[-4:])
+    if JS_LOOP_RE.search(before) and JS_WAIT_RE.search(before + _strip_js_comments(masked[catch_close : catch_close + 200])):
+        return True
+    last = stmts[-1] if stmts else ""
+    if re.match(r"^(?:return\b|break$|continue$)", last) and after and not after.startswith("}"):
+        return True
+    assign = re.fullmatch(r"([A-Za-z_$][\w$]*)\s*=[^=][^;]*;?", try_body)
+    if assign and len(stmts) == 1 and re.search(
+        rf"\b(?:let|var)\s+{re.escape(assign.group(1))}\b[^;\n]*=", _strip_js_comments(masked[:try_open])
+    ):
+        return True
+    return False
+
+
+def check_empty_catch(lines: list[str], i: int) -> str | None:
+    """"empty" for a catch opened on lines[i] that swallows the error with nothing,
+    "canned" for one that answers it with a literal success; None otherwise.
+    Comments are ignored, unless a comment is all the catch holds and gives a reason."""
+    start = max(0, i - 12)
+    raw = "\n".join(lines[start : i + 12])
+    masked = "\n".join(_masked(line) for line in lines[start : i + 12])
+    off = sum(len(line) + 1 for line in lines[start:i])
+    line_end = off + len(lines[i])
+    for m in CATCH_OPEN_RE.finditer(masked, off):
+        if m.start() >= line_end:
+            break
+        open_ = m.end() - 1
+        close = _match_brace(masked, open_, 1)
+        if close is None:
+            continue
+        kind = _classify_catch_body(raw[open_ + 1 : close])
+        if kind == "empty":
+            try_close = masked.rfind("}", 0, m.start())
+            try_open = _match_brace(masked, try_close, -1) if try_close >= 0 else None
+            if try_open is not None and re.search(r"\btry\s*$", masked[:try_open]):
+                if _swallow_is_deliberate(masked, try_open, try_close, close):
+                    continue
+        if kind:
+            return kind
+    return None
+
+
+# `promise.catch(() => ({ ok: true }))`: the same canned success, written as a promise handler.
+PROMISE_CANNED_RE = re.compile(
+    r"\.catch\(\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*\(\s*\{([^{}]*)\}\s*\)\s*\)"
 )
+
+FORM_PREVENT_DEFAULT = re.compile(r"""(?:\be|event|evt|ev)\.preventDefault\(\)""")
+# The handler is a form submit: `onSubmit`, `addEventListener("submit"`, `@submit`, `handleSubmit`.
+SUBMIT_CONTEXT_RE = re.compile(r"""[Ss]ubmit\b|[Ss]ubmit\w*\s*[=:(]|\(\s*["']submit["']|<form\b""")
+# What a disconnected handler may still do: stop the event, log, alert, or read FormData Locally.
+INERT_CALL_RE = re.compile(
+    r"""(?:\b\w+\.)?(?:preventDefault|stopPropagation|stopImmediatePropagation)\s*\(\s*\)"""
+    r"""|\bconsole\.\w+\s*\((?:[^()]|\([^()]*\))*\)"""
+    r"""|\b(?:window\.)?alert\s*\((?:[^()]|\([^()]*\))*\)"""
+    r"""|\bnew\s+(?:FormData|URLSearchParams)\s*\((?:[^()]|\([^()]*\))*\)"""
+    r"""|\bObject\.fromEntries\s*\((?:[^()]|\([^()]*\))*\)"""
+)
+_LOCAL_DECL_RE = re.compile(r"\b(?:const|let|var)\s+(?:[A-Za-z_$][\w$]*|\{[^}]*\}|\[[^\]]*\])\s*=(?![=>])")
+# Anything else the handler does: a call, or a write to something outside it.
+HANDLER_EFFECT_RE = re.compile(
+    r"""(?<![\w$.])(?!(?:if|for|while|switch|return|catch|function|typeof|await|new)\b)[A-Za-z_$][\w$.]*\s*\("""
+    r"""|[\w$\]]\.[\w$]+\s*(?:=(?![=>])|\+=|-=)|\b[A-Za-z_$][\w$]*\s*(?:=(?![=>])|\+\+|--)"""
+)
+
+
+def disconnected_submit(lines: list[str], i: int, col: int) -> int:
+    """Return the 1-based closing line of the submit handler whose `preventDefault()` is at
+    lines[i][col] if the handler does nothing else, or 0 if it has a real effect."""
+    context = "\n".join(_masked(line) for line in lines[max(0, i - 3) : i]) + _masked(lines[i])[:col]
+    if not SUBMIT_CONTEXT_RE.search(context):
+        return 0
+    body, depth = [], 0
+    for k in range(i, min(len(lines), i + 40)):
+        text = _masked(lines[k])[col if k == i else 0 :]
+        text = re.sub(r"//.*$|/\*.*?\*/", "", text)
+        for pos, c in enumerate(text):
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth < 0:
+                    body.append(text[:pos])
+                    rest = INERT_CALL_RE.sub("", "\n".join(body))
+                    rest = _LOCAL_DECL_RE.sub("", rest)
+                    return (k + 1) if not HANDLER_EFFECT_RE.search(rest) else 0
+        body.append(text)
+    return 0
 
 
 def generic_fake_findings(rel: str, suffix: str, lines: list[str]) -> list[Finding]:
@@ -659,15 +931,17 @@ def generic_fake_findings(rel: str, suffix: str, lines: list[str]) -> list[Findi
         stripped = line.strip()
         if stripped.startswith(("//", "#", "*", "/*")):
             continue
-        if web_ui_enabled and is_web_ui and STUB_CLICK_HANDLER.search(line):
+        if web_ui_enabled and is_web_ui and literals.search_code(STUB_CLICK_HANDLER, line):
             out.append(Finding(rel, i + 1, "stub-click-handler", line))
         if core_enabled and SYNTHETIC_DELAY.search(line):
             window = "\n".join(lines[i : i + 7])
             if SYNTHETIC_MOCK_RETURN.search(window):
-                out.append(Finding(rel, i + 1, "synthetic-delay-mock", line))
+                out.append(Finding(rel, i + 1, "synthetic-delay-mock", line, end_line=min(len(lines), i + 7)))
         if core_enabled and is_web_ui and "catch" in line:
-            window = "\n".join(lines[i : min(len(lines), i + 10)])
-            kind = check_empty_catch(window)
+            kind = check_empty_catch(lines, i)
+            promise = literals.search_code(PROMISE_CANNED_RE, line)
+            if not kind and promise and canned_object(promise.group(1)):
+                kind = "canned"
             if kind:
                 rule = "canned-error-fallback" if kind == "canned" else "unhandled-empty-catch"
                 out.append(Finding(rel, i + 1, rule, line))
@@ -686,15 +960,16 @@ def generic_fake_findings(rel: str, suffix: str, lines: list[str]) -> list[Findi
                         end = k
                         break
             window = "\n".join(lines[i:end])
-            if MULTI_LANG_CANNED_OK_RE.search(window):
-                out.append(Finding(rel, i + 1, "canned-error-fallback", line))
+            if _canned_ok(window):
+                out.append(Finding(rel, i + 1, "canned-error-fallback", line, end_line=end))
             # `except Exception: pass` in a close()/cleanup helper is a best-effort release, not a fake.
             elif suffix == ".py" and PY_BROAD_EXCEPT_RE.match(line) and _only_pass(lines, i, end) and not _in_cleanup_def(lines, i):
-                out.append(Finding(rel, i + 1, "unhandled-empty-catch", line))
-        if web_ui_enabled and is_web_ui and FORM_PREVENT_DEFAULT.search(line):
-            window = "\n".join(lines[i : i + 12])
-            if not ACTIVE_SUBMIT_SIGNAL.search(window):
-                out.append(Finding(rel, i + 1, "disconnected-form-submit", line))
+                out.append(Finding(rel, i + 1, "unhandled-empty-catch", line, end_line=end))
+        prevent = web_ui_enabled and is_web_ui and FORM_PREVENT_DEFAULT.search(line)
+        if prevent:
+            sub_end = disconnected_submit(lines, i, prevent.start())
+            if sub_end:
+                out.append(Finding(rel, i + 1, "disconnected-form-submit", line, end_line=sub_end))
     return out
 
 
@@ -772,7 +1047,7 @@ def raw_findings(rel: str, suffix: str, text: str) -> list[Finding]:
         if FAKE_NAME.search(line) and ("return" in line or "=" in line):
             findings.append(Finding(rel, i + 1, "fake-named-data", line))
 
-        if LITERAL_RETURN.search(line) and is_simulated_value(lines, i):
+        if literals.search_code(LITERAL_RETURN, line) and is_simulated_value(lines, i):
             findings.append(Finding(rel, i + 1, "simulated-return-value", line))
 
         if FRESH_EVENT_TIMESTAMP.search(line):
@@ -1490,8 +1765,8 @@ def main() -> int:
         if violations:
             for v in violations:
                 findings.append(Finding(".prufgate/config.yaml", 1, "debt-ceiling-breached", v))
-        else:
-            # Filter out findings covered by non-breached numeric ceilings
+        elif not changed_arg:
+            # Filter out findings covered by non-breached numeric ceilings (full scan only)
             findings = [
                 f
                 for f in findings

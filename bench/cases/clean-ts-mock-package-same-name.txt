@@ -1,0 +1,26 @@
+-- label.yaml --
+category: clean
+description: "A test mocks an npm package that shares its subject's name, not the subject."
+must_fire: []
+must_not_fire: [self-mocked-unit-under-test]
+-- base/src/payments.ts --
+import { client } from "@acme/payments";
+
+export async function charge(cents: number) {
+  return client.charge(cents);
+}
+-- head/src/payments.ts --
+import { client } from "@acme/payments";
+
+export async function charge(cents: number) {
+  if (cents <= 0) return false;
+  return client.charge(cents);
+}
+-- head/src/payments.test.ts --
+import { charge } from "./payments";
+
+vi.mock("@acme/payments", () => ({ client: { charge: vi.fn(async () => true) } }));
+
+it("refuses a zero charge", async () => {
+  expect(await charge(0)).toBe(false);
+});

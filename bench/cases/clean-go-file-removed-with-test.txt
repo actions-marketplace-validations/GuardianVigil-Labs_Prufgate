@@ -1,0 +1,27 @@
+-- label.yaml --
+category: clean
+description: "A retired Go file removed with its own test; the rest of the package stays."
+must_fire: []
+must_not_fire: [diff-test-file-deleted, diff-test-count-drop]
+-- base/limits/quota.go --
+package limits
+
+func Quota(n int) int { return n * 10 }
+-- base/limits/quota_test.go --
+package limits
+
+import "testing"
+
+func TestQuota(t *testing.T) {
+	if Quota(2) != 20 {
+		t.Fatal("quota")
+	}
+}
+-- base/limits/burst.go --
+package limits
+
+func Burst(n int) int { return n }
+-- head/limits/burst.go --
+package limits
+
+func Burst(n int) int { return n }

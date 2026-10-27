@@ -44,19 +44,19 @@ Labels state what *should* happen. When the engines disagree with a label, the m
 
 ## Current results
 
-Measured on this commit's corpus (103 cases), `prufgate bench`:
+Measured on this commit's corpus (122 cases), `prufgate bench`:
 
 ```text
-103 cases; precision 1.000, recall 1.000 (TP 66, FP 0, FN 0)
+122 cases; precision 1.000, recall 1.000 (TP 70, FP 0, FN 0)
 
   always-current-fake-timestamp              TP   1  FP   0  FN   0  P 1.000  R 1.000
   always-true-equality                       TP   1  FP   0  FN   0  P 1.000  R 1.000
-  canned-error-fallback                      TP   5  FP   0  FN   0  P 1.000  R 1.000
+  canned-error-fallback                      TP   6  FP   0  FN   0  P 1.000  R 1.000
   caught-and-ignored-test-exception          TP   1  FP   0  FN   0  P 1.000  R 1.000
   coverage-threshold-lowering                TP   1  FP   0  FN   0  P 1.000  R 1.000
   diff-assertion-weakening                   TP   2  FP   0  FN   0  P 1.000  R 1.000
   diff-test-count-drop                       TP   3  FP   0  FN   0  P 1.000  R 1.000
-  diff-test-file-deleted                     TP   7  FP   0  FN   0  P 1.000  R 1.000
+  diff-test-file-deleted                     TP   8  FP   0  FN   0  P 1.000  R 1.000
   disconnected-form-submit                   TP   2  FP   0  FN   0  P 1.000  R 1.000
   documentation-ip-or-domain                 TP   1  FP   0  FN   0  P 1.000  R 1.000
   frontend-backend-route-mismatch            TP   1  FP   0  FN   0  P 1.000  R 1.000
@@ -75,7 +75,7 @@ Measured on this commit's corpus (103 cases), `prufgate bench`:
   tautological-assertion                     TP   2  FP   0  FN   0  P 1.000  R 1.000
   test-config-weakening                      TP   1  FP   0  FN   0  P 1.000  R 1.000
   test-fake-exit                             TP   3  FP   0  FN   0  P 1.000  R 1.000
-  test-input-special-casing                  TP   1  FP   0  FN   0  P 1.000  R 1.000
+  test-input-special-casing                  TP   3  FP   0  FN   0  P 1.000  R 1.000
   test-runner-monkeypatch                    TP   1  FP   0  FN   0  P 1.000  R 1.000
   test-script-neutered                       TP   1  FP   0  FN   0  P 1.000  R 1.000
   test-skip-smuggling                        TP   3  FP   0  FN   0  P 1.000  R 1.000
@@ -86,7 +86,7 @@ Measured on this commit's corpus (103 cases), `prufgate bench`:
   zero-assertion-test                        TP   4  FP   0  FN   0  P 1.000  R 1.000
 ```
 
-Corpus by category: 39 clean, 16 fabrication, 10 deleted test, 8 hollow test, 6 configuration weakening, 4 harness edit, 4 suppression, 4 contract, 3 BOLA, 3 fake exit, 3 skipped test, 3 weakened test. By language (cases touching at least one such file): Python 49, TypeScript/TSX 28, Go 14, JavaScript 1, plus configuration files (JSON, TOML, INI).
+Corpus by category: 54 clean, 17 fabrication, 11 deleted test, 8 hollow test, 6 configuration weakening, 4 harness edit, 4 suppression, 4 contract, 3 BOLA, 3 fake exit, 3 skipped test, 5 weakened test. By language (cases touching at least one such file): Python 49, TypeScript/TSX 43, Go 18, JavaScript 1, plus configuration files (JSON, TOML, INI).
 
 No misses on this corpus. That says the corpus is small and written by the people who wrote the engines, not that PrufGate catches everything; send the cases it gets wrong.
 

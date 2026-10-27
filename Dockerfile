@@ -56,7 +56,7 @@ FROM python:3.14-slim-bookworm@sha256:945c2676dc2b18e0c1f16879244122c57c0ffede60
 # tests/test_workflows.py keeps the version equal to prufgate.__version__.
 LABEL org.opencontainers.image.title="PrufGate" \
       org.opencontainers.image.description="Checks whether code, and the tests that claim it works, are real" \
-      org.opencontainers.image.version="1.1.0" \
+      org.opencontainers.image.version="1.2.0" \
       org.opencontainers.image.source="https://github.com/GuardianVigil-Labs/Prufgate" \
       org.opencontainers.image.url="https://github.com/GuardianVigil-Labs/Prufgate" \
       org.opencontainers.image.documentation="https://github.com/GuardianVigil-Labs/Prufgate/tree/main/docs" \

@@ -1,0 +1,27 @@
+-- label.yaml --
+category: clean
+description: "An assertion on a value the production code no longer has, removed with it."
+must_fire: []
+must_not_fire: [diff-assertion-weakening]
+-- base/src/kind.ts --
+export function kindOf(x: string) {
+  if (x === "old") return "legacy_kind";
+  return "plain";
+}
+-- base/src/kind.test.ts --
+import { kindOf } from "./kind";
+
+it("names kinds", () => {
+  expect(kindOf("new")).toBe("plain");
+  expect(kindOf("old")).toBe("legacy_kind");
+});
+-- head/src/kind.ts --
+export function kindOf(x: string) {
+  return "plain";
+}
+-- head/src/kind.test.ts --
+import { kindOf } from "./kind";
+
+it("names kinds", () => {
+  expect(kindOf("new")).toBe("plain");
+});

@@ -1,7 +1,7 @@
 {
   "name": "prufgate",
   "displayName": "PrufGate",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Fail-closed hooks that stop skipped git hooks, force pushes and edits to tests, CI and gate config, send Claude back once to fix P0/P1 findings before it stops, and a /prufgate:prufgate-check skill. Needs the prufgate CLI (pipx install prufgate).",
   "author": {
     "name": "GuardianVigil",

@@ -1,0 +1,21 @@
+-- label.yaml --
+category: clean
+description: "A retired module removed with its test, which imported it through a path alias next to a shared helper that stays."
+must_fire: []
+must_not_fire: [diff-test-file-deleted, diff-test-count-drop]
+-- base/src/coupons/apply.ts --
+export function apply(code: string, total: number) {
+  return code === "SPRING" ? total * 0.9 : total;
+}
+-- base/src/coupons/apply.test.ts --
+import { apply } from "@/coupons/apply";
+import { db } from "@/lib/db";
+
+it("applies the spring coupon", () => {
+  expect(apply("SPRING", 100)).toBe(90);
+  expect(db).toBeDefined();
+});
+-- base/src/lib/db.ts --
+export const db = {};
+-- head/src/lib/db.ts --
+export const db = {};

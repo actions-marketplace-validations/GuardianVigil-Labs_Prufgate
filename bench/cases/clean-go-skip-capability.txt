@@ -1,0 +1,29 @@
+-- label.yaml --
+category: clean
+description: "A test skipped when a tool it needs is not installed."
+must_fire: []
+must_not_fire: [test-skip-smuggling]
+-- base/sign/sign.go --
+package sign
+
+func Sign(b []byte) []byte { return b }
+-- head/sign/sign.go --
+package sign
+
+func Sign(b []byte) []byte { return b }
+-- head/sign/sign_test.go --
+package sign
+
+import (
+	"os/exec"
+	"testing"
+)
+
+func TestSignWithOpenssl(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not installed")
+	}
+	if len(Sign([]byte("x"))) != 1 {
+		t.Fatal("length")
+	}
+}

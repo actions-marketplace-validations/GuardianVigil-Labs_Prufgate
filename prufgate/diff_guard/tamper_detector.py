@@ -68,6 +68,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR.parent.parent) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR.parent.parent))
 
+from prufgate.anti_fabrication import literals  # noqa: E402
 from prufgate.anti_reward_hacking.test_integrity import (  # noqa: E402
     GitDiffError,
     _diff_base,
@@ -201,6 +202,91 @@ TEST_SETUP_RE = fake_exit.TEST_SETUP_RE
 _is_test_harness = fake_exit.is_test_harness
 
 
+# A skip guarded by a check of the environment or a capability the test needs
+# (a tool on PATH, a free port, the platform), on the skip expression or an enclosing `if`.
+SKIP_ENV_GUARD_RE = re.compile(
+    r"\b(?:testing\.Short\s*\(\)"
+    r"|os\.(?:Getenv|LookupEnv)\s*\("
+    r"|exec\.LookPath\s*\("
+    r"|net\.Listen\w*\s*\("
+    r"|runtime\.GOOS\s*(?:==|!=)"
+    r"|sys\.platform\s*(?:==|!=|\.\s*startswith\s*\(|\bin\b|\bnot\s+in\b)"
+    r"|os\.(?:environ\b|getenv\s*\()"
+    r"|shutil\.which\s*\("
+    r"|importlib\.util\.find_spec\s*\("
+    r"|platform\.(?:system|machine|release)\s*\(\)\s*(?:==|!=|\bin\b|\bnot\s+in\b)"
+    r"|process\.env\b"
+    r"|process\.platform\s*(?:===?|!==?))"
+)
+_CI_ENV_CHECK_RE = re.compile(r"""(?:\.\s*CI\b|\[\s*["']CI["']\s*\]|\(\s*["']CI["']\s*[,)])""")
+_UNCONDITIONAL_SKIP_RE = re.compile(
+    r"@pytest\.mark\.(?:skip|xfail)\b(?!if)"
+    r"|@unittest\.skip\b(?!If|Unless)"
+    r"|\b(?:xit|xdescribe|xtest|xcontext|xspecify)\b"
+    r"|\[(?:Fact|Theory)\s*\([^\]]*\bSkip\s*="
+    r"|\[Ignore\b"
+    r"|#\[ignore(?:\s*\([^)]*\))?\]"
+    r"|@(?:Disabled|Ignore)\b"
+)
+_CONDITIONAL_SKIP_RE = re.compile(
+    r"@pytest\.mark\.skipif\b"
+    r"|@unittest\.skip(?:If|Unless)\b"
+    r"|\b(?:it|test|describe|context|suite|specify)\.(?:skipIf|runIf|skip)\s*\("
+)
+
+
+def _mask_line_strings_and_comments(line: str) -> str:
+    masked = line
+    for a, b in reversed(literals.string_spans(line)):
+        masked = masked[: a + 1] + " " * max(0, b - a - 2) + masked[b - 1 :]
+    masked = re.sub(r"/\*.*?\*/", " ", masked)
+    return re.sub(r"(?://|#).*$", "", masked)
+
+
+def _has_valid_env_guard(raw_text: str) -> bool:
+    if _CI_ENV_CHECK_RE.search(raw_text):
+        return False
+    return bool(SKIP_ENV_GUARD_RE.search(_mask_line_strings_and_comments(raw_text)))
+
+
+def _is_env_guarded_skip(s: str, ln: int, view: dict[int, str]) -> bool:
+    if _UNCONDITIONAL_SKIP_RE.search(s):
+        return False
+    s_code = _mask_line_strings_and_comments(s)
+    # 1. Same-line guard: `if (...) { ...skip(...) }` or conditional skip `skipif(guard)` / `test.skip(guard, ...)`
+    if re.search(r"\bif\b", s_code) and _has_valid_env_guard(s):
+        return True
+    m_cond = _CONDITIONAL_SKIP_RE.search(s)
+    if m_cond:
+        tail = s[m_cond.start() :]
+        if _has_valid_env_guard(tail):
+            return True
+        if s_code.rstrip().endswith("("):
+            next_lines = " ".join(view.get(k, "") for k in (ln + 1, ln + 2))
+            if _has_valid_env_guard(next_lines):
+                return True
+    # 2. Enclosing `if` on the immediately preceding line (or 2 lines up for Go `val, err := ...; if err != nil`)
+    prev1 = view.get(ln - 1, "")
+    prev1_code = _mask_line_strings_and_comments(prev1)
+    if re.search(r"\bif\b", prev1_code):
+        if _has_valid_env_guard(prev1):
+            return True
+        if re.search(r"\b(?:err\s*!=\s*nil|!\s*ok)\b|==\s*\"\"|==\s*''", prev1_code):
+            prev2 = view.get(ln - 2, "")
+            if _has_valid_env_guard(prev2):
+                return True
+    return False
+
+# A suppression scoped to one line and naming its rule (`eslint-disable-next-line no-console`,
+# a noqa or type-ignore with its codes, `//nolint:errcheck`): in a test file a
+# warning, not a blocker. A bare or file-wide one stays blocking everywhere.
+NAMED_LINE_SUPPRESSION_RE = re.compile(
+    r"(?:(?://|/\*)\s*)?eslint-disable-(?:next-)?line\s+[@\w]"
+    r"|#\s*noqa\s*:\s*[A-Z]+\d"
+    r"|#\s*type:\s*ignore\[\w"
+    r"|//\s*nolint:\w"
+)
+
 # 2. Suppression comment smuggling patterns
 SUPPRESSION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("ts-ignore", re.compile(r"//\s*@ts-ignore\b|/\*\s*@ts-ignore\b")),
@@ -222,6 +308,8 @@ TS_UNSAFE_CAST_RE = re.compile(
     r"|:\s*any\b"
     r"|<any>(?=[A-Za-z_$(])"
 )
+TS_DOUBLE_CAST_RE = re.compile(r"\bas\s+unknown\s+as\b")
+TS_SUFFIXES = (".ts", ".tsx", ".mts", ".cts")
 PY_UNSAFE_CAST_RE = re.compile(
     r"\b(?:typing\.)?cast\(\s*Any\s*,"
 )
@@ -703,31 +791,41 @@ def parse_unified_diff(diff_text: str) -> list[DiffHunk]:
     current_hunk: DiffHunk | None = None
     old_ln = 0
     new_ln = 0
+    old_left = 0
+    new_left = 0
+
+    from prufgate.diff_scope import _unquote_git_path
 
     for raw_line in diff_text.splitlines():
         if raw_line.startswith("diff --git "):
             current_hunk = None
             is_new = False
             is_del = False
-        elif raw_line.startswith("--- "):
+            old_left = 0
+            new_left = 0
+        elif (current_hunk is None or old_left == 0) and raw_line.startswith("--- "):
+            current_hunk = None
             part = raw_line[4:].strip()
-            if part == "/dev/null":
+            if part == "/dev/null" or part.startswith("/dev/null\t"):
                 is_new = True
                 old_file = "/dev/null"
             else:
-                old_file = re.sub(r"^a/", "", part)
-        elif raw_line.startswith("+++ "):
+                old_file = _unquote_git_path(raw_line[4:], "a/") or re.sub(r"^a/", "", part)
+        elif (current_hunk is None or new_left == 0) and raw_line.startswith("+++ "):
+            current_hunk = None
             part = raw_line[4:].strip()
-            if part == "/dev/null":
+            if part == "/dev/null" or part.startswith("/dev/null\t"):
                 is_del = True
                 current_file = old_file
             else:
-                current_file = re.sub(r"^b/", "", part)
+                current_file = _unquote_git_path(raw_line[4:], "b/") or re.sub(r"^b/", "", part)
         elif raw_line.startswith("@@ "):
-            m = re.search(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw_line)
+            m = re.search(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", raw_line)
             if m and current_file:
                 old_ln = int(m.group(1))
-                new_ln = int(m.group(2))
+                old_left = int(m.group(2)) if m.group(2) is not None else 1
+                new_ln = int(m.group(3))
+                new_left = int(m.group(4)) if m.group(4) is not None else 1
                 current_hunk = DiffHunk(
                     file_path=current_file,
                     old_path=old_file or current_file,
@@ -740,16 +838,24 @@ def parse_unified_diff(diff_text: str) -> list[DiffHunk]:
                 hunks.append(current_hunk)
         elif current_hunk is not None:
             current_hunk.raw_lines.append(raw_line)
-            if raw_line.startswith("+") and not raw_line.startswith("+++"):
+            if raw_line.startswith("+") and (new_left > 0 or not raw_line.startswith("+++")):
                 current_hunk.added_lines.append((new_ln, raw_line[1:]))
                 new_ln += 1
-            elif raw_line.startswith("-") and not raw_line.startswith("---"):
+                if new_left > 0:
+                    new_left -= 1
+            elif raw_line.startswith("-") and (old_left > 0 or not raw_line.startswith("---")):
                 current_hunk.removed_lines.append((old_ln, raw_line[1:]))
                 old_ln += 1
+                if old_left > 0:
+                    old_left -= 1
             elif raw_line.startswith(" "):
                 current_hunk.context_lines.append((new_ln, raw_line[1:]))
                 old_ln += 1
                 new_ln += 1
+                if old_left > 0:
+                    old_left -= 1
+                if new_left > 0:
+                    new_left -= 1
 
     return hunks
 
@@ -873,6 +979,8 @@ def scan_diff_for_tampering(
                     )
                 )
 
+        view = dict(hunk.context_lines + hunk.added_lines)
+        casts = [n for n, t in hunk.added_lines if TS_DOUBLE_CAST_RE.search(t)] if sfx in TS_SUFFIXES else []
         for idx, (ln, raw) in enumerate(hunk.added_lines):
             s = raw.strip()
             if not s:
@@ -925,10 +1033,8 @@ def scan_diff_for_tampering(
                         )
                     )
             elif SKIP_SMUGGLING_RE.search(s):
-                # Allow if accompanied by an issue reference (#123, JIRA-123) or if t.Skip is inside testing.Short()
-                is_env_guard = bool(
-                    re.search(r"\b(?:testing\.Short\(\)|os\.Getenv\b|sys\.platform\b|os\.environ\.get\b)", prev_raw + " " + s)
-                )
+                # Allow if accompanied by an issue reference (#123, JIRA-123) or guarded by an env/capability check
+                is_env_guard = _is_env_guarded_skip(s, ln, view)
                 if not has_issue and not is_env_guard and not cfg.is_exempt(rel_path, "test-skip-smuggling"):
                     findings.append(
                         Finding(
@@ -945,32 +1051,52 @@ def scan_diff_for_tampering(
                     )
 
             # 2. Suppression Comment Smuggling
+            str_spans = literals.string_spans(s)
+            sup_candidates: list[tuple[str, str]] = []
             for sup_kind, sup_re in SUPPRESSION_PATTERNS:
-                if sup_re.search(s):
-                    if not _has_suppression_justification(sup_kind, s, prev_raw):
-                        if not cfg.is_exempt(rel_path, "suppression-comment-smuggling"):
-                            findings.append(
-                                Finding(
-                                    path=rel_path,
-                                    line=ln,
-                                    rule="suppression-comment-smuggling",
-                                    severity="P1",
-                                    text=s,
-                                    message=(
-                                        f"Suppression directive (`{sup_kind}`) added in '{rel_path}:{ln}' without an inline "
-                                        f"justification (`-- reason`) or issue reference (`#123`)."
-                                    ),
-                                )
-                            )
-                    break
+                # A directive quoted in a string (a help text, a list of examples) is not one.
+                for m_sup in sup_re.finditer(s):
+                    if any(a <= m_sup.start() < b for a, b in str_spans):
+                        continue
+                    tail = s[m_sup.start() :]
+                    if not _has_suppression_justification(sup_kind, tail, prev_raw):
+                        sev = "P2" if is_test and NAMED_LINE_SUPPRESSION_RE.match(tail.lstrip()) else "P1"
+                        sup_candidates.append((sev, sup_kind))
+            if sup_candidates and not cfg.is_exempt(rel_path, "suppression-comment-smuggling"):
+                sup_candidates.sort(key=lambda item: 0 if item[0] == "P1" else 1)
+                best_sev, best_kind = sup_candidates[0]
+                findings.append(
+                    Finding(
+                        path=rel_path,
+                        line=ln,
+                        rule="suppression-comment-smuggling",
+                        severity=best_sev,
+                        text=s,
+                        message=(
+                            f"Suppression directive (`{best_kind}`) added in '{rel_path}:{ln}' without an inline "
+                            f"justification (`-- reason`) or issue reference (`#123`)."
+                        ),
+                    )
+                )
 
             # 3. Unsafe Type Cast Cascade (in production non-test files)
             if not is_test and not s.startswith(("#", "//", "/*", "*")):
                 # Strip inline comment before checking code syntax
-                code_part = re.sub(r"(?://|#).*$", "", s)
+                masked = s
+                for a, b in reversed(literals.string_spans(s)):
+                    masked = masked[: a + 1] + " " * (b - a - 2) + masked[b - 1 :]
+                code_part = re.sub(r"(?://|#).*$", "", masked)
                 unsafe_hit = False
-                if sfx in (".ts", ".tsx", ".mts", ".cts") and TS_UNSAFE_CAST_RE.search(code_part):
+                cast_severity = "P1"
+                if sfx in TS_SUFFIXES and TS_UNSAFE_CAST_RE.search(code_part):
                     unsafe_hit = True
+                    # One `as unknown as T` on its own is usually a typed boundary (a parsed
+                    # or validated value): a warning. `any`, or a run of double casts, blocks.
+                    only_double = not re.search(r"\bany\b", code_part)
+                    if only_double and len(TS_DOUBLE_CAST_RE.findall(code_part)) == 1 and not any(
+                        n != ln and abs(n - ln) <= 5 for n in casts
+                    ):
+                        cast_severity = "P2"
                 elif sfx == ".py" and PY_UNSAFE_CAST_RE.search(code_part):
                     unsafe_hit = True
                 elif sfx == ".rs" and RS_UNSAFE_BLOCK_RE.search(code_part):
@@ -986,7 +1112,7 @@ def scan_diff_for_tampering(
                             path=rel_path,
                             line=ln,
                             rule="unsafe-type-cast-cascade",
-                            severity="P1",
+                            severity=cast_severity,
                             text=s,
                             message=f"Unsafe type cast or `unsafe` block added in production file '{rel_path}:{ln}'.",
                         )

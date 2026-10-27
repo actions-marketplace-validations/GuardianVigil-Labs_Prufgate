@@ -1,0 +1,20 @@
+-- label.yaml --
+category: weakened-test
+description: "Production code gains a branch for the id a test that imports it through a path alias uses."
+must_fire: [test-input-special-casing]
+must_not_fire: []
+-- base/src/lib/widget.ts --
+export function find(id: string) {
+  return db.get(id);
+}
+-- head/src/lib/widget.ts --
+export function find(id: string) {
+  if (id === "magic-id-99") return CACHED;
+  return db.get(id);
+}
+-- head/src/lib/__tests__/lookup.test.ts --
+import { find } from "@/lib/widget";
+
+it("finds the cached widget", () => {
+  expect(find("magic-id-99")).toBe(CACHED);
+});

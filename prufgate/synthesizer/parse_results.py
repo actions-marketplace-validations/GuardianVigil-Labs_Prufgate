@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from prufgate import PROJECT_URL, __version__, inline_ignore  # noqa: E402
+from prufgate import PROJECT_URL, __version__, diff_scope, inline_ignore  # noqa: E402
 from prufgate.config import (  # noqa: E402
     ConfigError,
     GitDiffError,
@@ -55,6 +55,8 @@ class Finding:
         line: int = 1,
         details: str = "",
         origin: str = "",
+        spans: Optional[List[tuple]] = None,
+        anchored: bool = False,
     ):
         self.tool = tool
         self.origin = origin or tool  # "ai-review" for an AI review comment
@@ -64,6 +66,10 @@ class Finding:
         self.file_path = file_path
         self.line = line
         self.details = details.strip()
+        # Line ranges the finding covers, for the changed-lines scope (diff_scope).
+        self.spans = spans or [(line, line)]
+        # Already limited to the change by the runner (gitleaks over the PR's commits).
+        self.anchored = anchored
 
     @property
     def confidence(self) -> str:
@@ -116,6 +122,8 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
             af_data = json.loads(af_file.read_text(encoding="utf-8"))
             if isinstance(af_data, list):
                 for item in af_data:
+                    ln = int(item.get("line", 1))
+                    end_ln = int(item.get("end_line") or ln)
                     findings.append(
                         Finding(
                             tool="anti-fabrication",
@@ -123,8 +131,9 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                             severity="P0",
                             message=f"Zero-fabrication invariant breached: {item.get('rule')}",
                             file_path=item.get("file", "unknown"),
-                            line=int(item.get("line", 1)),
+                            line=ln,
                             details=item.get("snippet", "")[:200],
+                            spans=[(ln, max(ln, end_ln))],
                         )
                     )
         except (json.JSONDecodeError, OSError):
@@ -141,6 +150,8 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                     sev = item.get("severity", "P0")
                     if sev not in ("P0", "P1", "P2", "P3"):
                         sev = "P0"
+                    ln = int(item.get("line", 1))
+                    end_ln = int(item.get("end_line") or ln)
                     findings.append(
                         Finding(
                             tool="test-integrity",
@@ -148,8 +159,9 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                             severity=sev,
                             message=item.get("message") or f"Test integrity invariant breached: {rule_name}",
                             file_path=item.get("file", "unknown"),
-                            line=int(item.get("line", 1)),
+                            line=ln,
                             details=item.get("snippet", "")[:200],
+                            spans=[(ln, max(ln, end_ln))],
                         )
                     )
         except (json.JSONDecodeError, OSError):
@@ -192,6 +204,8 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                     sev = item.get("severity", "P1")
                     if sev not in ("P0", "P1", "P2", "P3"):
                         sev = "P1"
+                    ln = int(item.get("line", 1))
+                    end_ln = int(item.get("end_line") or ln)
                     findings.append(
                         Finding(
                             tool="contract-guard",
@@ -199,8 +213,9 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                             severity=sev,
                             message=item.get("message") or f"Contract or dependency drift detected: {rule_name}",
                             file_path=item.get("file", "unknown"),
-                            line=int(item.get("line", 1)),
+                            line=ln,
                             details=item.get("snippet", "")[:200],
+                            spans=[(ln, max(ln, end_ln))],
                         )
                     )
         except (json.JSONDecodeError, OSError):
@@ -213,6 +228,7 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
             bola_data = json.loads(bola_file.read_text(encoding="utf-8"))
             if isinstance(bola_data, list):
                 for item in bola_data:
+                    b_line = int(item.get("line", 1))
                     findings.append(
                         Finding(
                             tool="bola-matrix",
@@ -220,8 +236,10 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                             severity=item.get("severity", "P0"),
                             message=item.get("message", "Cross-tenant authorization boundary broken"),
                             file_path=item.get("target", "target"),
-                            line=int(item.get("line", 1)),
+                            line=b_line,
                             details=f"{item.get('details', '')} {item.get('curl_poc', '')}"[:300],
+                            # The whole handler: removing its guard is a change to the route.
+                            spans=[(b_line, max(b_line, int(item.get("end_line") or b_line)))],
                         )
                     )
         except (json.JSONDecodeError, OSError):
@@ -250,25 +268,28 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
             pass
 
     # 7. Optional Accelerator: Gitleaks (gitleaks.json)
-    gl_file = raw_dir / "gitleaks.json"
-    if gl_file.exists() and gl_file.stat().st_size > 0:
-        try:
-            data = json.loads(gl_file.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                for item in data:
-                    findings.append(
-                        Finding(
-                            tool="gitleaks",
-                            rule_id=item.get("RuleID", "secret-detected"),
-                            severity="P0",
-                            message=f"Secret detected: {item.get('Description', 'Hardcoded secret')}",
-                            file_path=item.get("File", "unknown"),
-                            line=item.get("StartLine", 1),
-                            details=f"Match: {item.get('Match', '')[:80]}",
+    # gitleaks_worktree.json: uncommitted edits in a changed-files run.
+    for gl_file in (raw_dir / "gitleaks.json", raw_dir / "gitleaks_worktree.json"):
+        if gl_file.exists() and gl_file.stat().st_size > 0:
+            try:
+                data = json.loads(gl_file.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    for item in data:
+                        findings.append(
+                            Finding(
+                                tool="gitleaks",
+                                rule_id=item.get("RuleID", "secret-detected"),
+                                severity="P0",
+                                message=f"Secret detected: {item.get('Description', 'Hardcoded secret')}",
+                                file_path=item.get("File", "unknown"),
+                                line=item.get("StartLine", 1),
+                                details=f"Match: {item.get('Match', '')[:80]}",
+                                # Found in a commit of the scanned range: the change added it.
+                                anchored=bool(item.get("Commit")),
+                            )
                         )
-                    )
-        except (json.JSONDecodeError, OSError):
-            pass
+            except (json.JSONDecodeError, OSError):
+                pass
 
     # 8. Optional Accelerator: ast-grep (ast_grep.json)
     ast_file = raw_dir / "ast_grep.json"
@@ -276,6 +297,10 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
         try:
             data = json.loads(ast_file.read_text(encoding="utf-8"))
             for item in data:
+                # ast-grep lines are 0-based.
+                rng = item.get("range", {})
+                start = int(rng.get("start", {}).get("line", 0)) + 1
+                end = int(rng.get("end", {}).get("line", start - 1)) + 1
                 findings.append(
                     Finding(
                         tool="ast-grep",
@@ -283,7 +308,8 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                         severity="P1",
                         message=item.get("message", item.get("text", "AST violation")),
                         file_path=item.get("file", "unknown"),
-                        line=item.get("range", {}).get("start", {}).get("line", 1),
+                        line=start,
+                        spans=[(start, max(start, end))],
                     )
                 )
         except (json.JSONDecodeError, OSError):
@@ -296,37 +322,7 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
             data = json.loads(zizmor_file.read_text(encoding="utf-8"))
             if isinstance(data, list):
                 for item in data:
-                    determ = item.get("determinations", {})
-                    raw_sev = (determ.get("severity") or item.get("severity") or "Medium").upper()
-                    rule_id = item.get("ident", item.get("rule", "ci-security"))
-                    sev = "P2"
-                    if rule_id == "template-injection" or raw_sev == "CRITICAL":
-                        sev = "P0"
-                    elif rule_id == "unpinned-uses":
-                        sev = "P2"
-                    elif raw_sev == "HIGH":
-                        sev = "P1"
-                    elif raw_sev in ("LOW", "INFORMATIONAL"):
-                        sev = "P3"
-
-                    msg = item.get("desc", item.get("message", "CI workflow issue"))
-                    file_path = ".github/workflows"
-                    line = 1
-                    locs = item.get("locations", [])
-                    if locs:
-                        file_path = locs[0].get("symbolic", {}).get("key", {}).get("Local", {}).get("verbatim_path", file_path)
-                        line = locs[0].get("concrete", {}).get("location", {}).get("start_point", {}).get("row", 1)
-
-                    findings.append(
-                        Finding(
-                            tool="zizmor",
-                            rule_id=rule_id,
-                            severity=sev,
-                            message=msg,
-                            file_path=file_path,
-                            line=line,
-                        )
-                    )
+                    findings.append(zizmor_finding(item))
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -366,7 +362,77 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
     return deduplicate_findings(findings)
 
 
+def zizmor_severity(rule_id: str, severity: str, conf: str) -> str:
+    """P0-P3 from zizmor's own severity and confidence. Only a High-severity finding
+    blocks (P0 for a confident template injection); Medium is advisory, and a
+    Low-confidence Medium, Low or Informational one is a note. `unpinned-uses` is
+    hygiene, never blocking."""
+    severity, conf = severity.upper(), conf.upper()
+    if rule_id == "unpinned-uses":
+        return "P2"
+    if severity == "HIGH":
+        return "P0" if rule_id == "template-injection" and conf == "HIGH" else "P1"
+    if severity == "MEDIUM":
+        return "P3" if conf == "LOW" else "P2"
+    if severity in ("LOW", "INFORMATIONAL"):
+        return "P3"
+    return "P2"
+
+
+def zizmor_finding(item: Dict[str, Any]) -> Finding:
+    """One zizmor JSON result. Its line is the primary location's (zizmor rows are
+    0-based); every location in that file counts for the changed-lines scope."""
+    determ = item.get("determinations") or {}
+    rule_id = item.get("ident", item.get("rule", "ci-security"))
+    sev = zizmor_severity(
+        rule_id, str(determ.get("severity") or item.get("severity") or "Medium"), str(determ.get("confidence") or "Medium")
+    )
+    file_path, line, spans = ".github/workflows", 1, []
+    locs = [loc for loc in item.get("locations") or [] if isinstance(loc, dict)]
+    primary = next((loc for loc in locs if (loc.get("symbolic") or {}).get("kind") == "Primary"), locs[0] if locs else None)
+
+    def path_of(loc: Dict[str, Any]) -> str:
+        local = ((loc.get("symbolic") or {}).get("key") or {}).get("Local") or {}
+        return str(local.get("given_path") or local.get("verbatim_path") or ".github/workflows")
+
+    def rows(loc: Dict[str, Any]) -> tuple:
+        where = (loc.get("concrete") or {}).get("location") or {}
+        start = int((where.get("start_point") or {}).get("row", 0)) + 1
+        end = int((where.get("end_point") or {}).get("row", start - 1)) + 1
+        return start, max(start, end)
+
+    if primary is not None:
+        file_path = path_of(primary)
+        line = rows(primary)[0]
+        spans = [rows(loc) for loc in locs if path_of(loc) == file_path]
+    return Finding(
+        tool="zizmor",
+        rule_id=rule_id,
+        severity=sev,
+        message=item.get("desc", item.get("message", "CI workflow issue")),
+        file_path=file_path,
+        line=line,
+        spans=spans,
+    )
+
+
+def scope_to_change(findings: List[Finding], ranges: Optional[diff_scope.Ranges], workspace_dir: Path) -> List[Finding]:
+    """In a changed-files run (the runner wrote the changed lines), only findings on
+    lines the change touched; a full run (no file) keeps everything."""
+    if ranges is None:
+        return findings
+    kept = [
+        f for f in findings
+        if f.anchored or diff_scope.in_scope(ranges, f.tool, f.rule_id, f.file_path, f.spans, workspace_dir)
+    ]
+    if len(kept) < len(findings):
+        print(f"prufgate: {len(findings) - len(kept)} finding(s) on lines this change did not touch were not reported "
+              "(changed-files scan; a full scan reports them).", file=sys.stderr)
+    return kept
+
+
 SUPPRESSIONS_FILE = "suppressions.jsonl"
+CHANGED_LINES_FILE = "changed_lines.json"
 # The engines that report a rule under a prefixed ID (see the parsers above).
 _RULE_PREFIX = {"anti-fabrication": "anti-fabrication-"}
 
@@ -422,6 +488,10 @@ def deduplicate_findings(findings: List[Finding]) -> List[Finding]:
                 existing.file_path = f.file_path
             if SEVERITY_RANK.get(f.severity, 9) < SEVERITY_RANK.get(existing.severity, 9):
                 existing.severity = f.severity
+            existing.anchored = existing.anchored or f.anchored or (f.tool in diff_scope.DIFF_ANCHORED_TOOLS)
+            existing.spans = list(
+                dict.fromkeys((existing.spans or [(existing.line, existing.line)]) + (f.spans or [(f.line, f.line)]))
+            )
             if f.tool != existing.tool and f.tool not in existing.details:
                 suffix = f"Also detected by: {f.tool}"
                 existing.details = f"{existing.details} | {suffix}".strip(" |")
@@ -533,6 +603,7 @@ ENGINE_OUTPUTS = {
     "bola-matrix": "bola_matrix.json",
     "pr-reviewer": "pr_review.json",
     "gitleaks": "gitleaks.json",
+    "gitleaks-worktree": "gitleaks_worktree.json",
     "ast-grep": "ast_grep.json",
     "zizmor": "zizmor.json",
 }
@@ -1011,6 +1082,12 @@ def main() -> None:
 
     findings = parse_raw_results(raw_dir)
     try:
+        ranges = diff_scope.load(raw_dir / CHANGED_LINES_FILE)
+    except (OSError, ValueError, TypeError) as e:
+        print(f"prufgate: cannot read {CHANGED_LINES_FILE}: {e}", file=sys.stderr)
+        sys.exit(2)
+    findings = scope_to_change(findings, ranges, workspace_dir)
+    try:
         head_baseline = read_baseline(workspace_dir) if base_ref else None
         base_baseline = read_baseline(workspace_dir, base_ref) if base_ref else None
         if head_baseline != base_baseline:
@@ -1048,6 +1125,8 @@ def main() -> None:
         errors["config"] = config_error
 
     suppressed = load_suppressions(raw_dir)
+    if ranges is not None:
+        suppressed = [(f, r) for f, r in suppressed if diff_scope.in_scope(ranges, f.tool, f.rule_id, f.file_path, f.spans, workspace_dir)]
 
     # Only the configuration in effect (at the base ref) turns it on: it can dismiss
     # findings, so no environment variable or flag a change could set may.

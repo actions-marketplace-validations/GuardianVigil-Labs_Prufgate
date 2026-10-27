@@ -46,7 +46,7 @@ try:
 except ImportError:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
 
-from prufgate import __version__, inline_ignore  # noqa: E402
+from prufgate import __version__, diff_scope, inline_ignore  # noqa: E402
 from prufgate.anti_reward_hacking.test_integrity import (  # noqa: E402
     _strip_comments_and_strings_Preserve_len as _mask,
 )
@@ -67,6 +67,7 @@ class BolaFinding:
         line: int = 1,
         curl_poc: str = "",
         details: str = "",
+        end_line: int | None = None,
     ):
         self.rule_id = rule_id
         self.severity = severity
@@ -75,6 +76,9 @@ class BolaFinding:
         self.line = line
         self.curl_poc = curl_poc
         self.details = details
+        # Last line of the handler or table: a changed-files scan keeps the finding
+        # when the change touched any line of it.
+        self.end_line = max(line, end_line or line)
 
     @property
     def rule(self) -> str:
@@ -93,6 +97,7 @@ class BolaFinding:
             "target": self.endpoint_or_file,
             "file": self.endpoint_or_file,
             "line": self.line,
+            "end_line": self.end_line,
             "curl_poc": self.curl_poc,
             "details": self.details,
         }
@@ -108,6 +113,7 @@ class DiscoveredRoute:
     framework: str = "generic"
     file_path: str = ""
     line: int = 1
+    end_line: int = 0
     has_dynamic_param: bool = False
     param_names: list[str] = field(default_factory=list)
     handler_snippet: str = ""
@@ -702,13 +708,16 @@ def discover_all_routes(workspace: Path | None) -> list[DiscoveredRoute]:
                     handler_ref = m_go.group(3) or ""
                     norm_path, params = _normalize_route_template(raw_route)
                     snippet = _extract_handler_window(lines, idx)
+                    end_ln = idx + max(0, len(snippet.splitlines()) - 1)
                     # If handler is a named function in the same file, append its body to snippet
                     if handler_ref:
                         fn_short = handler_ref.split(".")[-1]
                         m_fn_def = re.search(rf"\bfunc\s+(?:\([^)]+\)\s*)?{re.escape(fn_short)}\s*\(", content)
                         if m_fn_def:
                             fn_ln = content[: m_fn_def.start()].count("\n") + 1
-                            snippet = snippet + "\n" + _extract_handler_window(lines, fn_ln)
+                            fn_win = _extract_handler_window(lines, fn_ln)
+                            snippet = snippet + "\n" + fn_win
+                            end_ln = max(end_ln, fn_ln + max(0, len(fn_win.splitlines()) - 1))
                     routes.append(
                         DiscoveredRoute(
                             path=norm_path,
@@ -717,6 +726,7 @@ def discover_all_routes(workspace: Path | None) -> list[DiscoveredRoute]:
                             framework="go",
                             file_path=rel_file,
                             line=idx,
+                            end_line=end_ln,
                             has_dynamic_param=bool(params),
                             param_names=params,
                             handler_snippet=snippet,
@@ -1123,11 +1133,16 @@ _SPRING_CONFIG_RE = re.compile(r"@(?:Configuration|EnableWebSecurity|SpringBootA
 
 
 def _resolve_js_import(src: Path, spec: str, workspace: Path) -> Path | None:
-    base = src.parent / spec
-    cands = [base] + [Path(f"{base}{ext}") for ext in (".ts", ".js", ".mjs", ".cjs", ".tsx")]
-    cands += [base / "index.ts", base / "index.js"]
-    if base.suffix in (".js", ".mjs"):
-        cands.append(base.with_suffix(".ts"))
+    if spec.startswith(("@/", "~/")):  # the usual tsconfig alias for the source root
+        bases = [workspace / "src" / spec[2:], workspace / spec[2:]]
+    else:
+        bases = [src.parent / spec]
+    cands: list[Path] = []
+    for base in bases:
+        cands += [base] + [Path(f"{base}{ext}") for ext in (".ts", ".js", ".mjs", ".cjs", ".tsx")]
+        cands += [base / "index.ts", base / "index.js"]
+        if base.suffix in (".js", ".mjs"):
+            cands.append(base.with_suffix(".ts"))
     root = workspace.resolve()
     for c in cands:
         try:
@@ -1136,6 +1151,113 @@ def _resolve_js_import(src: Path, spec: str, workspace: Path) -> Path | None:
         except OSError:
             continue
     return None
+
+
+_BODY_CALL_RE = re.compile(
+    r"^\s*(?:(?:const|let|var)\s+)?(?:[\w$\[\]{},\s]+?(?::=|=)\s*)?(?:await\s+)?(?:this\.)?([A-Za-z_$][\w$]*)\s*\("
+)
+_NOT_A_GUARD_CALL = {"if", "for", "while", "switch", "return", "catch", "function", "print", "console"}
+# The wrapper refuses the request: an error status, a throw, or an abort/redirect.
+_REFUSES_RE = re.compile(
+    r"\b(?:401|403)\b|Unauthori[sz]ed|Forbidden|\bthrow\b|\braise\b|\babort\w*\s*\(|\bhttp\.Error\b|\bredirect\s*\(|\bnotFound\s*\("
+)
+_JS_IMPORT_NAMES_RE = re.compile(r"""import\s*(?:type\s+)?\{([^}]*)\}\s*from\s*["']([^"']+)["']""")
+_PY_IMPORT_NAMES_RE = re.compile(r"^\s*from\s+([\w.]+)\s+import\s+\(?([^)\n]+)", re.MULTILINE)
+
+
+def _definition_body(text: str, name: str) -> str:
+    """The body of function `name` defined in `text` (at most 40 lines), or ""."""
+    n = re.escape(name)
+    m = re.search(
+        rf"^[ \t]*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*{n}\s*[(<]"
+        rf"|(?:const|let|var)\s+{n}\s*(?::[^=\n]+)?=\s*(?:async\s*)?(?:function\b|\(|[\w$]+\s*=>)"
+        rf"|(?:async\s+)?def\s+{n}\s*\(|func\s+(?:\([^)]*\)\s*)?{n}\s*\()",
+        text,
+        re.MULTILINE,
+    )
+    if not m:
+        return ""
+    lines = text.splitlines()
+    start = text.count("\n", 0, m.start())
+    masked = tuple(_mask(text).splitlines())
+    end_ln = min(start + 40, diff_scope.block_end(masked, start + 1))
+    if end_ln <= start + 1 and "{" not in masked[start] and not masked[start].rstrip().endswith(":"):
+        while (
+            end_ln < min(len(lines), start + 6)
+            and lines[end_ln - 1].strip()
+            and not lines[end_ln - 1].rstrip().endswith(";")
+        ):
+            end_ln += 1
+    return "\n".join(lines[start:end_ln])
+
+
+def _wrapper_body(name: str, file_content: str, file_path: str, workspace: Path) -> str:
+    """The definition of `name`: in the route's file, a file it imports `name` from, or (Go) its package."""
+    body = _definition_body(file_content, name)
+    if body:
+        return body
+    src = workspace / file_path
+    for m in _JS_IMPORT_NAMES_RE.finditer(file_content):
+        names = {part.split(" as ")[-1].strip() for part in m.group(1).split(",")}
+        if name in names:
+            original = next((part.split(" as ")[0].strip() for part in m.group(1).split(",")
+                             if part.split(" as ")[-1].strip() == name), name)
+            target = _resolve_js_import(src, m.group(2), workspace) if m.group(2).startswith((".", "@/", "~/")) else None
+            if target is not None:
+                with contextlib.suppress(OSError):
+                    return _definition_body(target.read_text(encoding="utf-8", errors="ignore"), original)
+            return ""
+    for m in _PY_IMPORT_NAMES_RE.finditer(file_content):
+        if name in {part.split(" as ")[-1].strip() for part in m.group(2).split(",")}:
+            mod = m.group(1)
+            rel = mod.lstrip(".").replace(".", "/")
+            base = src.parent if mod.startswith(".") else workspace
+            for cand in (base / f"{rel}.py", base / rel / "__init__.py"):
+                if cand.is_file() and cand.resolve().is_relative_to(workspace.resolve()):
+                    with contextlib.suppress(OSError):
+                        return _definition_body(cand.read_text(encoding="utf-8", errors="ignore"), name)
+            return ""
+    if file_path.endswith(".go"):
+        for sib in sorted(src.parent.glob("*.go")):
+            if sib != src and not sib.name.endswith("_test.go"):
+                with contextlib.suppress(OSError):
+                    body = _definition_body(sib.read_text(encoding="utf-8", errors="ignore"), name)
+                    if body:
+                        return body
+    return ""
+
+
+_ASYNC_DEF_RE = re.compile(r"^\s*(?:export\s+)?(?:default\s+)?async\b|=\s*async\b")
+
+
+def _wrapper_guard(snippet: str, file_content: str, file_path: str, workspace: Path, auth_re: re.Pattern[str]) -> bool:
+    """A project guard wrapper, followed one hop: the handler's first statements (before any
+    object lookup, at most three) call a function whose definition calls a known guard and
+    refuses the request (an error status, a throw, an abort or a redirect)."""
+    lines = _mask(snippet, keep_strings=True).splitlines()
+    body_at = next((i + 1 for i, ln in enumerate(lines) if ln.rstrip().endswith(("{", ":"))), None)
+    if body_at is None:
+        return False
+    checked = 0
+    for ln in lines[body_at:]:
+        if not ln.strip():
+            continue
+        if checked == 3 or DB_OBJECT_LOOKUP_RE.search(ln):
+            break
+        checked += 1
+        m = _BODY_CALL_RE.match(ln)
+        if not m or m.group(1) in _NOT_A_GUARD_CALL:
+            continue
+        body = _wrapper_body(m.group(1), file_content, file_path, workspace)
+        if not body:
+            continue
+        if _ASYNC_DEF_RE.search(body.splitlines()[0]) and not re.search(r"\b(?:await|return)\b", ln):
+            continue
+        # The guard must be called inside the wrapper, not be the wrapper's own name.
+        inner = "\n".join(body.splitlines()[1:]) or re.sub(rf"\b{re.escape(m.group(1))}\b", "_", body, count=1)
+        if _code_matches(auth_re, inner) and _code_matches(_REFUSES_RE, body):
+            return True
+    return False
 
 
 def _under_prefix(path: str, prefix: str) -> bool:
@@ -1402,7 +1524,9 @@ def _server_action_findings(workspace: Path, cfg: PrufGateConfig, auth_re: re.Pa
                 if lines[j].lstrip().startswith("export "):
                     end_idx = j
                     break
-            if auth_re.search("\n".join(lines[i:end_idx])):
+            if auth_re.search("\n".join(lines[i:end_idx])) or _wrapper_guard(
+                "\n".join(lines[i:end_idx]), text, rel_path, workspace, auth_re
+            ):
                 continue
             name = m.group(1) or m.group(2)
             findings.append(
@@ -1412,6 +1536,7 @@ def _server_action_findings(workspace: Path, cfg: PrufGateConfig, auth_re: re.Pa
                     message=f"Server Action '{name}' has no authorization guard (e.g. auth(), requireAuth(), verifySession())",
                     endpoint_or_file=rel_path,
                     line=i + 1,
+                    end_line=end_idx,
                     curl_poc=f"# Invoke the Server Action directly without a valid session cookie\n# Path: {rel_path}:{i + 1}",
                     details="Next.js Server Actions are publicly reachable HTTP endpoints. Without a session guard they can be invoked unauthenticated.",
                 )
@@ -1584,8 +1709,19 @@ def _controller_routes(workspace: Path) -> list[DiscoveredRoute]:
 def run_static_matrix_audit(
     workspace: Path,
     config: PrufGateConfig | None = None,
+    changed_files: set[str] | None = None,
 ) -> list[BolaFinding]:
-    """Scan workspace for unguarded server actions, unscoped multi-tenant tables, and unscoped BOLA route handlers."""
+    """Scan workspace for unguarded server actions, unscoped multi-tenant tables, and unscoped BOLA route handlers.
+
+    With `changed_files` (workspace-relative paths of a changed-files scan), only findings in
+    those files are returned: application-wide auth is still read from the whole workspace."""
+    findings = _static_matrix_audit(workspace, config)
+    if changed_files is None:
+        return findings
+    return [f for f in findings if f.endpoint_or_file in changed_files]
+
+
+def _static_matrix_audit(workspace: Path, config: PrufGateConfig | None) -> list[BolaFinding]:
     if config is not None:
         cfg = config
     else:
@@ -1630,6 +1766,7 @@ def run_static_matrix_audit(
                             message=f"Multi-tenant table '{table_name}' declared without tenant_id or org_id foreign key",
                             endpoint_or_file=rel_path,
                             line=line_no,
+                            end_line=text[: match.end()].count("\n") + 1,
                             details="Tables storing customer data without tenant_id require complex join constraints for RLS, increasing BOLA leakage risk.",
                         )
                     )
@@ -1662,6 +1799,7 @@ def run_static_matrix_audit(
         decorated = _preceding_decorators(route.file_content, route.line) + "\n" + route.handler_snippet
         has_auth = bool(
             auth_re.search(decorated) or FILE_LEVEL_AUTH_RE.search(route.file_content) or _inherits_auth(route, auth_ctx)
+            or _wrapper_guard(route.handler_snippet, route.file_content, route.file_path, workspace, auth_re)
         )
         if route.prechecked_scope is not None:
             has_tenant_scope = route.prechecked_scope
@@ -1699,6 +1837,7 @@ def run_static_matrix_audit(
                     message=message,
                     endpoint_or_file=route.file_path,
                     line=route.line,
+                    end_line=max(route.end_line, route.line + max(0, len(route.handler_snippet.splitlines()) - 1)),
                     curl_poc=(
                         f"curl -X {'GET' if route.methods[0] == 'ALL' else route.methods[0]} "
                         f'-H "Authorization: Bearer $PRUFGATE_TOKEN_A" "$TARGET_URL{route.path}"'
