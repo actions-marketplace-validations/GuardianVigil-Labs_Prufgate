@@ -691,7 +691,11 @@ class PrufGateConfig:
                 # the working directory and read the branch's file.
                 cfg = cls.load(tmp, Path(tmp) / explicit if explicit else None)
             except ConfigError as e:
-                raise BaseConfigInvalid(str(e).replace(tmp + os.sep, "")) from e
+                msg = str(e).replace(tmp + os.sep, "")
+                # Name the file as the repository does (`/`), also on Windows.
+                for rel in DEFAULT_CONFIG_FILES:
+                    msg = msg.replace(str(Path(rel)), rel)
+                raise BaseConfigInvalid(msg) from e
         # Name the repository file in reports, not the deleted temporary copy.
         if cfg.source_path is not None:
             cfg.source_path = root / Path(cfg.source_path).relative_to(tmp)

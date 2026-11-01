@@ -139,6 +139,7 @@ class Synthesizer(unittest.TestCase):
             self.assertFalse((Path(tmp) / "reports" / "prufgate-review.md").is_symlink())
 
 
+@unittest.skipIf(sys.platform == "win32", "the shell gate (prufgate.sh, runners/) needs a POSIX shell: on Windows use prufgate check, WSL or the container")
 class Gate(unittest.TestCase):
     def setUp(self):
         self._tmp = repo_with_committed_change()
@@ -408,6 +409,7 @@ class Hooks(unittest.TestCase):
             self.assertEqual(set(cfg.packs), {"core", "web-ui", "ai-safety"})
 
     @unittest.skipUnless(shutil.which("sh"), "needs sh")
+    @unittest.skipIf(sys.platform == "win32", "links a POSIX python3; test_shell_guard covers Windows' python")
     def test_hook_falls_back_to_the_module_without_prufgate_on_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             git(Path(tmp), "init", "-q")

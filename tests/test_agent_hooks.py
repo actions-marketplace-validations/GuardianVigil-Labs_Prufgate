@@ -7,6 +7,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -202,8 +203,9 @@ class ReviewBypasses(unittest.TestCase):
 class Stop(unittest.TestCase):
     def stop_payload(self, agent, again=False):
         if agent == "cursor":
-            return {"status": "completed", "loop_count": 1 if again else 0, "workspace_roots": ["/tmp"]}
-        return {"hook_event_name": "Stop", "cwd": "/tmp", "stop_hook_active": again}
+            return {"status": "completed", "loop_count": 1 if again else 0, "workspace_roots": [tempfile.gettempdir()]}
+        # A folder that exists on every system (`/tmp` does not on Windows: the adapter would fall back to the cwd).
+        return {"hook_event_name": "Stop", "cwd": tempfile.gettempdir(), "stop_hook_active": again}
 
     def test_findings_send_the_agent_back_once(self):
         findings = (2, "PrufGate Agent Guardrail blocked completion (1 blocker finding(s)):\n  - [P0] src/a.py:3")
@@ -212,7 +214,7 @@ class Stop(unittest.TestCase):
                 result = run(agent, "stop", self.stop_payload(agent))
                 self.assertTrue(is_block(agent, "stop", result))
                 self.assertIn("src/a.py:3", result[1] + result[2])
-                check.assert_called_once_with("/tmp")
+                check.assert_called_once_with(tempfile.gettempdir())
                 self.assertFalse(is_block(agent, "stop", run(agent, "stop", self.stop_payload(agent, again=True))))
 
     def test_clean_check_lets_the_agent_stop(self):
@@ -263,7 +265,8 @@ class Cli(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
 
     def test_installed_command_end_to_end(self):
-        env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(ROOT)}
+        # This interpreter's folder first: on Windows it holds `python` and no `python3`.
+        env = {"PATH": os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"]), "PYTHONPATH": str(ROOT)}
         cmd = guard_command("hook cursor shell", "blocked")
         with tempfile.TemporaryDirectory() as tmp:
             env["HOME"] = tmp

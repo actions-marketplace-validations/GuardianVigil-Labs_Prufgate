@@ -52,6 +52,7 @@ class ContractGuardBaseRef(unittest.TestCase):
         rules = {(f["engine"], f["rule"], f["file"]) for f in json.loads(proc.stdout)}
         self.assertIn(("contract-guard", RULE, "src/app.ts"), rules)
 
+    @unittest.skipIf(sys.platform == "win32", "the shell gate (prufgate.sh, runners/) needs a POSIX shell: on Windows use prufgate check, WSL or the container")
     def test_gate_passes_base_to_contract_guard(self) -> None:
         proc = run_gate(self.ws, "fast", env={"WORKSPACE": str(self.ws), "PRUFGATE_BASE_REF": "main"})
         raw = json.loads((self.ws / "reports" / "raw" / "contract_guard.json").read_text(encoding="utf-8"))

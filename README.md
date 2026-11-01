@@ -64,17 +64,17 @@ The hooks that `prufgate init --hooks` writes call `prufgate` on `PATH`, so for 
 Or run the signed container image, which adds the full gate with ast-grep, gitleaks and zizmor:
 
 ```bash
-docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.2.0          # the fast gate on this repository
-docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.2.0 prufgate check .
+docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.3.0          # the fast gate on this repository
+docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.3.0 prufgate check .
 ```
 
-Or add the GitHub Action to a pull-request workflow, pinned to the commit SHA of the `v1.2.0` tag ([full example](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/docs/CI_INTEGRATION.md)):
+Or add the GitHub Action to a pull-request workflow, pinned to the commit SHA of the `v1.3.0` tag ([full example](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/docs/CI_INTEGRATION.md)):
 
 ```yaml
 - uses: actions/checkout@<commit-sha>
   with: { fetch-depth: 0, persist-credentials: false }
 - run: python3 -m pip install "PyYAML>=6.0"
-- uses: GuardianVigil-Labs/Prufgate@<commit-sha-of-v1.2.0>
+- uses: GuardianVigil-Labs/Prufgate@<commit-sha-of-v1.3.0>
 ```
 
 Every release is signed and carries build provenance and an SBOM: [Verify a release](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/SECURITY.md#verify-a-release).
@@ -84,7 +84,7 @@ Or add it to your [pre-commit](https://pre-commit.com) configuration, `.pre-comm
 ```yaml
 repos:
   - repo: https://github.com/GuardianVigil-Labs/Prufgate
-    rev: v1.2.0
+    rev: v1.3.0
     hooks:
       - id: prufgate          # changed files, on every commit
       - id: prufgate-full     # whole repository, before a push (pre-commit install --hook-type pre-push)

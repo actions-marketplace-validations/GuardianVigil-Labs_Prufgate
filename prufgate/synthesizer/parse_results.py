@@ -32,6 +32,7 @@ from prufgate.config import (  # noqa: E402
     GitDiffError,
     PrufGateConfig,
 )
+from prufgate.console import utf8_output  # noqa: E402
 from prufgate.report_formats import gitlab_code_quality, junit_xml  # noqa: E402
 from prufgate.review.adjudicate import adjudicate  # noqa: E402
 from prufgate.rules import SARIF_RANK, confidence, visible  # noqa: E402
@@ -1005,6 +1006,7 @@ def print_ansi_table(
 
 
 def main() -> None:
+    utf8_output()
     workspace_env = os.environ.get("WORKSPACE")
     if workspace_env:
         workspace_dir = Path(workspace_env)

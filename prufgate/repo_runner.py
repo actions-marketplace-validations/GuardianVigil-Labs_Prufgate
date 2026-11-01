@@ -38,6 +38,11 @@ class RunError(Exception):
     """The run could not complete: exit 2, never a pass."""
 
 
+def supported() -> bool:
+    """Containment needs POSIX process groups (`start_new_session`, `os.killpg`): not on Windows."""
+    return hasattr(os, "killpg")
+
+
 def opted_in(flag: bool) -> bool:
     return flag or os.environ.get(OPT_IN_ENV) == "1"
 
@@ -157,6 +162,8 @@ def run_command(cmd: list[str], cwd: Path, environ: dict[str, str], timeout: int
     """Run `cmd` in its own process group, output to a file (a detached child holding a pipe cannot
     stall us). The whole group dies on timeout, and nothing it started outlives the run.
     Returns (exit code, the last 4000 bytes of output)."""
+    if not supported():
+        raise RunError("running repository code is not available on this system (no process groups)")
     keep = _children(os.getpid())
     mark = None if sys.platform.startswith("linux") else uuid.uuid4().hex
     if mark:

@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,7 @@ def gitleaks_files(workspace: Path, config: str) -> list[str]:
     return sorted(f["File"] for f in json.loads(report.read_text()))
 
 
+@unittest.skipIf(sys.platform == "win32", "the shell gate (prufgate.sh, runners/) needs a POSIX shell: on Windows use prufgate check, WSL or the container")
 class ReportsAreNeverCommitted(unittest.TestCase):
     def test_the_reports_folder_ignores_itself(self):
         with tempfile.TemporaryDirectory() as d:
@@ -57,6 +59,7 @@ class ReportsAreNeverCommitted(unittest.TestCase):
             self.assertFalse((ws / ".gitignore").exists())
 
 
+@unittest.skipIf(sys.platform == "win32", "the shell gate (prufgate.sh, runners/) needs a POSIX shell: on Windows use prufgate check, WSL or the container")
 class GitRepositoryDetection(unittest.TestCase):
     def test_a_worktree_counts_as_a_git_repository(self):
         with tempfile.TemporaryDirectory() as d:

@@ -282,7 +282,8 @@ class WorkerTest(unittest.TestCase):
         with patch.object(server, "PRUFGATE_ROOT", Path("/nonexistent")):
             cmd, on_stdout = server.scan_command("fast", Path("/ws"))
         self.assertTrue(on_stdout)
-        self.assertEqual(cmd[1:5], ["-m", "prufgate.cli", "check", "/ws"])
+        # The workspace as the OS spells it (`\\ws` on Windows).
+        self.assertEqual(cmd[1:5], ["-m", "prufgate.cli", "check", str(Path("/ws"))])
         self.assertIn("--changed", cmd)
         self.assertEqual(cmd[-2:], ["--format", "sarif"])
 

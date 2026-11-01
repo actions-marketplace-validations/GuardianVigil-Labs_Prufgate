@@ -458,8 +458,44 @@ def _documented_example(lines: list[str], i: int) -> bool:
     return bool(re.search(r"\bplaceholder\s*[:=]", prev, re.IGNORECASE))
 
 
-def v2_findings(rel: str, suffix: str, lines: list[str]) -> list[Finding]:
-    """The core rules. Comments are skipped; exemptions are applied by the caller."""
+_ABSTRACT_CLASS_NAME_RE = re.compile(r"(?:^Base|Base$|Abstract|Interface$|Mixin$|Protocol$)")
+
+
+def _python_abstract_stub_lines(text: str) -> set[int]:
+    """1-based lines of `raise NotImplementedError` that make a method abstract: the method's
+    only statement (after a docstring), in a class the same file subclasses, whose name says it
+    is a base (`BaseTransport`, `SessionInterface`), or that inherits ABC or Protocol. Such a
+    method is meant to be overridden; it is not unfinished code."""
+    import ast
+
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return set()
+    classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+    subclassed = {b.id if isinstance(b, ast.Name) else getattr(b, "attr", "") for c in classes for b in c.bases}
+    out: set[int] = set()
+    for cls in classes:
+        bases = {b.id if isinstance(b, ast.Name) else getattr(b, "attr", "") for b in cls.bases}
+        if not (cls.name in subclassed or _ABSTRACT_CLASS_NAME_RE.search(cls.name) or bases & {"ABC", "Protocol"}):
+            continue
+        for fn in cls.body:
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            body = list(fn.body)
+            if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant):
+                body = body[1:]  # the docstring
+            if len(body) == 1 and isinstance(body[0], ast.Raise) and body[0].exc is not None:
+                exc = body[0].exc.func if isinstance(body[0].exc, ast.Call) else body[0].exc
+                if isinstance(exc, ast.Name) and exc.id == "NotImplementedError":
+                    out.add(body[0].lineno)
+    return out
+
+
+def v2_findings(rel: str, suffix: str, lines: list[str], skip: set[int] | None = None,
+                abstract_stubs: set[int] | None = None) -> list[Finding]:
+    """The core rules. Comments, and the 0-based `skip` lines (inside Python strings: a docstring's
+    usage example is not code), are skipped; exemptions are applied by the caller."""
     out: list[Finding] = []
     if "core" not in ENABLED_RULE_PACKS:
         if "cti" in ACTIVE_PACKS:
@@ -468,7 +504,7 @@ def v2_findings(rel: str, suffix: str, lines: list[str]) -> list[Finding]:
     route = suffix == ".ts" and rel.endswith("route.ts") and "/app/" in "/" + rel
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith(("//", "#", "*", "/*")):
+        if stripped.startswith(("//", "#", "*", "/*")) or (skip and i in skip):
             continue
         if DOC_ADDRESS.search(line) and not _documented_example(lines, i):
             out.append(Finding(rel, i + 1, "documentation-address", line))
@@ -478,7 +514,7 @@ def v2_findings(rel: str, suffix: str, lines: list[str]) -> list[Finding]:
             out.append(Finding(rel, i + 1, "demo-named-data", line))
         if SCORE_OWNERS and SCORE_ASSIGNMENT.search(line) and not rel.endswith(SCORE_OWNERS):
             out.append(Finding(rel, i + 1, "score-outside-scoring", line))
-        if UNIMPLEMENTED_STUB_RE.search(line):
+        if UNIMPLEMENTED_STUB_RE.search(line) and not (abstract_stubs and i + 1 in abstract_stubs):
             prev_window = "\n".join(lines[max(0, i - 6) : i + 1])
             if not ABSTRACT_CONTEXT_RE.search(prev_window):
                 out.append(Finding(rel, i + 1, "unimplemented-production-stub", line))
@@ -1018,11 +1054,12 @@ def raw_findings(rel: str, suffix: str, text: str) -> list[Finding]:
     lines = text.split("\n")
     if suffix == ".json":
         return data_findings(rel, lines)
-    findings = v2_findings(rel, suffix, lines)
+    skip_lines = _python_string_lines(text) if suffix == ".py" else set()
+    abstract_stubs = _python_abstract_stub_lines(text) if suffix == ".py" and "NotImplementedError" in text else set()
+    findings = v2_findings(rel, suffix, lines, skip_lines, abstract_stubs)
     findings.extend(generic_fake_findings(rel, suffix, lines))
     if any(p in SEED_DIR_SEGMENTS for p in _norm_path(rel).split("/")[:-1]):
         return findings
-    skip_lines = _python_string_lines(text) if suffix == ".py" else set()
     cti_enabled = "cti" in ACTIVE_PACKS
     core_enabled = "core" in ENABLED_RULE_PACKS
 
@@ -1798,4 +1835,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from prufgate.console import utf8_output  # Windows: piped output is cp1252
+
+    utf8_output()
     sys.exit(main())

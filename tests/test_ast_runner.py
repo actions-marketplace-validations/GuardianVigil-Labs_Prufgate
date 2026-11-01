@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +23,7 @@ def run(ws: Path, extra_env: dict[str, str] | None = None, path_prefix: str = ""
     return [json.loads(line) for line in manifest.read_text().splitlines()] if manifest.exists() else []
 
 
+@unittest.skipIf(sys.platform == "win32", "the shell gate (prufgate.sh, runners/) needs a POSIX shell: on Windows use prufgate check, WSL or the container")
 class AstRunner(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

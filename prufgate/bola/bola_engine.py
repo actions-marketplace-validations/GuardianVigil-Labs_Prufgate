@@ -860,12 +860,37 @@ def discover_workspace_api_routes(workspace: Path | None) -> list[str]:
     return unique[:25]
 
 
-def _build_auth_guard_regex(config: PrufGateConfig) -> re.Pattern[str]:
+# FastAPI's recommended style: `CurrentUser = Annotated[User, Depends(get_current_user)]`, then
+# `current_user: CurrentUser` in a route. The alias, often in another module, is the guard.
+_FASTAPI_GUARD_ALIAS_RE = re.compile(
+    r"^(\w+)\s*(?::\s*\w+\s*)?=\s*Annotated\[[^\n]*?\bDepends\s*\(\s*(?:\w+\.)?"
+    r"(?:get_current\w*|require_\w*|verify_\w*|auth\w*|current_\w*)",
+    re.M,
+)
+
+
+def _fastapi_guard_aliases(workspace: Path) -> list[str]:
+    """Names bound to `Annotated[..., Depends(<auth guard>)]` anywhere in the workspace's Python."""
+    names: set[str] = set()
+    for p in iter_workspace_files(workspace, {".py"}):
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if "Annotated" in text and "Depends" in text:
+            names.update(_FASTAPI_GUARD_ALIAS_RE.findall(text))
+    return sorted(names)
+
+
+def _build_auth_guard_regex(config: PrufGateConfig, guard_aliases: list[str] | tuple[str, ...] = ()) -> re.Pattern[str]:
     patterns = list(DEFAULT_AUTH_GUARD_PATTERNS)
     for custom in config.auth_guards:
         clean = custom.strip()
         if clean:
             patterns.append(rf"\b{re.escape(clean)}\b")
+    if guard_aliases:
+        # A route parameter typed with the alias: `current_user: CurrentUser`.
+        patterns.append(r":\s*(?:" + "|".join(map(re.escape, guard_aliases)) + r")\b")
     return re.compile("|".join(patterns))
 
 
@@ -1495,7 +1520,26 @@ def _django_cbv_routes(workspace: Path, tenant_re: re.Pattern[str]) -> list[Disc
     return routes
 
 
-_USE_SERVER_RE = re.compile(r"""^\s*(?:(?://[^\n]*|/\*[\s\S]*?\*/)\s*)*["']use server["']""")
+def _starts_with_use_server(text: str) -> bool:
+    """The module's first statement is `"use server"`, after any comments. A linear scan: the
+    regex it replaces backtracked exponentially on a banner line such as `/////...`."""
+    i, n = 0, len(text)
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                return False
+            i = j + 2
+        else:
+            break
+    return text.startswith(('"use server"', "'use server'"), i)
+
+
 _SERVER_ACTION_EXPORT_RE = re.compile(
     r"^\s*export\s+(?:default\s+)?(?:async\s+function\s+(\w+)|const\s+(\w+)\s*=\s*async\b)"
 )
@@ -1512,7 +1556,7 @@ def _server_action_findings(workspace: Path, cfg: PrufGateConfig, auth_re: re.Pa
             text = af.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        if not _USE_SERVER_RE.match(text):
+        if not _starts_with_use_server(text):
             continue
         lines = text.splitlines()
         for i, line in enumerate(lines):
@@ -1726,7 +1770,7 @@ def _static_matrix_audit(workspace: Path, config: PrufGateConfig | None) -> list
         cfg = config
     else:
         cfg = PrufGateConfig.load(workspace) if (workspace / ".prufgate").exists() else PrufGateConfig()
-    auth_re = _build_auth_guard_regex(cfg)
+    auth_re = _build_auth_guard_regex(cfg, _fastapi_guard_aliases(workspace))
     tenant_re = _build_tenant_key_regex(cfg)
 
     print("  [BOLA Static Matrix] Scanning server actions and database queries for missing tenant constraints...")
@@ -2426,4 +2470,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from prufgate.console import utf8_output  # Windows: piped output is cp1252
+
+    utf8_output()
     sys.exit(main())

@@ -26,6 +26,7 @@ jobs:
           - { python: '3.9', os: ubuntu-24.04, label: '' }
           - { python: '3.14', os: ubuntu-latest, label: '' }
           - { python: '3.14', os: macos-latest, label: ' (macOS)' }
+          - { python: '3.14', os: windows-latest, label: ' (Windows)' }
     steps:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,6 +40,9 @@ jobs:
         # `python` is the setup-python interpreter on every runner.
         shell: bash
         run: |
+          # Windows: UTF-8 mode (the default from Python 3.15, PEP 686), so tests decode PrufGate's
+          # UTF-8 output as such. tests/test_console.py still checks a cp1252 stream directly.
+          if [ "$RUNNER_OS" = "Windows" ]; then export PYTHONUTF8=1; fi
           python -m pip install --require-hashes -r .github/ci-requirements.txt
           python prufgate/cli.py --self-check
           python -m unittest discover -s tests

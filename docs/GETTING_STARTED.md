@@ -3,6 +3,7 @@
 ## Requirements
 
 - Python 3.9 or newer, with PyYAML (installed automatically).
+- Linux or macOS for everything; both run the full test suite in CI. On Windows, `prufgate check` and every other Python command, the agent hooks (they run in Git Bash), the MCP server and the API work. Two parts need a POSIX system, so on Windows run them in WSL, a Linux container or CI: the shell gate `prufgate.sh` (and so the GitHub Action, which uses Linux runners anyway), and `prufgate verify`, which refuses to start there because it cannot contain the repository's tests without process groups.
 - Git, for anything that looks at changes (`--changed`, `--base`, the diff engines).
 - Optional, for the full `prufgate.sh` gate: [ast-grep](https://ast-grep.github.io/), [gitleaks](https://github.com/gitleaks/gitleaks) and [zizmor](https://docs.zizmor.sh/). A step whose tool is missing is reported as skipped.
 
@@ -11,7 +12,7 @@
 | Method | What you get |
 |---|---|
 | `pipx install prufgate` or `pip install prufgate` | The `prufgate` and `prufgate-mcp` commands from PyPI: every engine, the CLI, the MCP server and the API. The `prufgate.sh` shell gate is not part of the wheel. |
-| `docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.2.0` | The signed release image (amd64 and arm64): the `prufgate` command plus the full `prufgate.sh` gate with ast-grep, gitleaks and zizmor. With no arguments it runs `fast` on the mounted repository; `... prufgate:1.2.0 prufgate check .` runs the CLI. |
+| `docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.3.0` | The signed release image (amd64 and arm64): the `prufgate` command plus the full `prufgate.sh` gate with ast-grep, gitleaks and zizmor. With no arguments it runs `fast` on the mounted repository; `... prufgate:1.3.0 prufgate check .` runs the CLI. |
 | `pip install .` (in a checkout) | The same commands from a checkout. |
 | `./install.sh` | A `prufgate` launcher in `~/.local/bin` (or `/usr/local/bin`) that runs this checkout. Keep the checkout where it is. |
 | `make build`, then `bin/prufgate --docker ...` | A container image built from your checkout, the same as the release image. It is about 460 MB uncompressed (about 100 MB gzipped): the Python base and git, plus the three scanners (ast-grep about 55 MB, zizmor 27 MB, gitleaks 22 MB). The pip install and the GitHub Action need none of that. |

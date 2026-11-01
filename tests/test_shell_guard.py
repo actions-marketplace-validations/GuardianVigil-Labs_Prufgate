@@ -3,7 +3,9 @@ force pushes and removing tests or CI configuration."""
 
 import io
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -356,7 +358,8 @@ class HookProtocol(unittest.TestCase):
 
     def test_hook_command_end_to_end(self):
         # The installed hook, as Claude Code runs it, with the engine importable from this checkout.
-        env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(ROOT)}
+        # This interpreter's folder comes first: on Windows it holds `python` and no `python3`.
+        env = {"PATH": os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"]), "PYTHONPATH": str(ROOT)}
         with tempfile.TemporaryDirectory() as tmp:
             env["HOME"] = tmp
             blocked = subprocess.run(["sh", "-c", SHELL_GUARD_COMMAND], cwd=tmp, env=env, capture_output=True,
@@ -366,6 +369,22 @@ class HookProtocol(unittest.TestCase):
             allowed = subprocess.run(["sh", "-c", SHELL_GUARD_COMMAND], cwd=tmp, env=env, capture_output=True,
                                      text=True, input=self._payload("git status"))
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
+
+    @unittest.skipIf(sys.platform == "win32", "builds a POSIX sh shim for python3")
+    def test_hook_command_falls_back_to_python(self):
+        # Windows has `python` and no `python3`: here `python3` cannot import the engine, `python` can.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "python").symlink_to(sys.executable)
+            shim = bin_dir / "python3"
+            shim.write_text("#!/bin/sh\nexit 1\n")
+            shim.chmod(0o755)
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "PYTHONPATH": str(ROOT), "HOME": tmp}
+            blocked = subprocess.run(["sh", "-c", SHELL_GUARD_COMMAND], cwd=tmp, env=env, capture_output=True,
+                                     text=True, input=self._payload("git push -f"))
+            self.assertEqual(blocked.returncode, 2, blocked.stderr)
+            self.assertIn("shell-guard blocked", blocked.stderr)
 
     def test_hook_command_blocks_when_prufgate_is_not_installed(self):
         with tempfile.TemporaryDirectory() as tmp:

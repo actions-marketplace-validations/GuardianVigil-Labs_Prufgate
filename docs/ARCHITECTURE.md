@@ -31,6 +31,15 @@ PrufGate is plain Python (3.9+, one dependency: PyYAML) plus a small shell gate.
 
 Every engine module runs on its own (`python3 prufgate/<engine>/<module>.py --help`) and has a `--self-check` with invented positive and near-miss cases. `prufgate --self-check` runs them all.
 
+## Around the engines
+
+| Module | What it does |
+|---|---|
+| `prufgate/baseline.py` | Reads `.prufgate/baseline.yaml` (at the base ref in a changed scan) and leaves out the findings it lists. `prufgate check` and the synthesizer both use it, after the debt ceilings, so a baselined finding still counts toward `known_debt`. `prufgate baseline` writes the file. |
+| `prufgate/pr_summary.py` | `prufgate pr-summary`: the verdict, the first findings and facts about the change, from `reports/prufgate.sarif`. The GitHub Action writes it to the job summary and, when asked, keeps it as one pull request comment. It reports the result and never changes it. |
+| `prufgate/explain.py` | `prufgate explain` and the MCP tool `prufgate_explain`: what each rule catches and how to fix it. A test keeps it in step with `prufgate/rules.py` and `docs/ENGINES.md`. |
+| `prufgate/console.py` | Switches output that cannot print PrufGate's characters (Windows sends piped output in cp1252) to UTF-8, so printing a report never crashes a run. |
+
 ## Changed files
 
 "Changed" means the diff between a base ref and the working tree, plus untracked files. The base is chosen once (`--base`, `PRUFGATE_BASE_REF`, `origin/$GITHUB_BASE_REF`, then `origin/HEAD`, or `HEAD~1` on a clean tree) and passed to every engine. Git is always run with the workspace as its directory, with `--end-of-options`, and refs that start with `-` are refused.

@@ -101,6 +101,20 @@ What the last round of fixes changed (the previous measurement was precision 0.9
 
 The unit test `tests/test_bench.py` runs the corpus with `--min-precision 1.0 --min-recall 1.0`: a change that lowers either fails the build. A new case PrufGate gets wrong lowers them; lower the floor to the new measurement in the same pull request and say why.
 
+## Real-world scan
+
+The corpus above is small and written by the people who wrote the engines. To see what a new user sees, PrufGate was also run with default settings on well-known open-source projects in Python, JavaScript/TypeScript, Go, Java, Ruby and PHP, and every finding was sampled by hand. The projects are not named here.
+
+These are mature, well-tested codebases, so a blocking finding on them is most often a false positive. The first run reported 364 findings on the projects that finished and hung on a large TypeScript project. The fixes that came out of it, each with a case it must stop reporting and a near miss it must still report (`tests/test_real_world_precision.py`):
+
+- `zero-assertion-test` missed assertions made in helper functions, Spring `andExpect(...)`, Mocha's `done` callback, type-level `assertEqual<A, B>()`, Prophecy and Ruby `fail`, and lost the end of a JavaScript test after a regex literal containing `//`.
+- `unimplemented-production-stub` reported abstract methods of base classes; `documentation-address` reported usage examples in docstrings.
+- `undeclared-or-hallucinated-import` reported `examples/` and `docs/`, packages a declared framework provides, and imports under a flag set by an optional import.
+- `static-bola-unscoped-access` did not recognise FastAPI's `Annotated[..., Depends(...)]` guard aliases.
+- A `"use server"` check backtracked exponentially on a banner comment line of slashes; the scan of that project now takes seconds.
+
+After the fixes the same projects report 124 findings (66% fewer), and the large TypeScript project finishes in about five seconds. Most of what remains is a test that only calls code which throws on failure, an empty `catch`, or a tautology: what those rules are for.
+
 ## Adding a case
 
 A case is one file, `bench/cases/<case-id>.txt`, in a txtar-like format: a `-- name --` line starts each section.

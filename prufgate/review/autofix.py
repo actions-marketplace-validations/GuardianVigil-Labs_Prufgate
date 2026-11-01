@@ -450,6 +450,25 @@ def _safe_target(root: Path, rel: str) -> Path:
 
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+# Directories can be opened relative to each other without following links (not on Windows).
+_DIR_FD = os.open in os.supports_dir_fd and bool(_NOFOLLOW) and hasattr(os, "O_DIRECTORY")
+
+
+def _open_by_path_checked(root: Path, rel: str, target: Path) -> int:
+    """Without dir_fd (Windows): open by path, then check that the descriptor is the very
+    file at the resolved path, inside the repository. A directory swapped for a link
+    before the open redirects it outside (refused), and one swapped and swapped back
+    leaves a descriptor that is not the file now at that path (refused)."""
+    fd = os.open(target, os.O_RDWR | _NOFOLLOW)
+    try:
+        real = Path(target).resolve(strict=True)
+        opened, there = os.fstat(fd), os.stat(real)
+        if not real.is_relative_to(root.resolve()) or (opened.st_dev, opened.st_ino) != (there.st_dev, there.st_ino):
+            raise ApplyRefused(f"{rel}: refusing to follow a symlink")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _open_target(root: Path, rel: str) -> int:
@@ -458,8 +477,8 @@ def _open_target(root: Path, rel: str) -> int:
     after the check cannot redirect the write; the file is then read and rewritten
     through this one descriptor."""
     target = _safe_target(root, rel)
-    if not (os.open in os.supports_dir_fd and _NOFOLLOW and hasattr(os, "O_DIRECTORY")):
-        return os.open(target, os.O_RDWR | _NOFOLLOW)  # ponytail: no dir_fd (Windows): path checks only
+    if not _DIR_FD:
+        return _open_by_path_checked(root, rel, target)
     parts = Path(rel).parts
     fd = os.open(root.resolve(), os.O_RDONLY | os.O_DIRECTORY)
     try:

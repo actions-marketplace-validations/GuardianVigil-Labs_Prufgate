@@ -181,6 +181,7 @@ def fake_tool(bin_dir: Path, name: str, version: str, log: Path) -> None:
     script.chmod(0o755)
 
 
+@unittest.skipIf(sys.platform == "win32", "the shell gate (prufgate.sh, runners/) needs a POSIX shell: on Windows use prufgate check, WSL or the container")
 class RunnerScope(unittest.TestCase):
     def gate(self, ws: Path, mode: str, bin_dir: Path) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_BASE_REF", "PRUFGATE_BASE_REF", "TARGET_URL",

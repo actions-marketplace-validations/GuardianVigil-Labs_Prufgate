@@ -37,7 +37,7 @@ jobs:
 | `target_url` | none | Base URL for live BOLA probing of a service the job starts. Pass the tokens as `PRUFGATE_TEST_PROBE_TOKEN_A` / `_B` in `env`. |
 | `fail_on_blocker` | `true` | Fail the step on a FAILED or ERROR verdict. |
 | `sarif_upload` | `true` | Upload `reports/prufgate.sarif` to code scanning (skipped when no report was written). |
-| `image` | `ghcr.io/guardianvigil-labs/prufgate:1.2.0` | Only used when the runner has no `python3`: the signed release image of this version, or an image you built. |
+| `image` | `ghcr.io/guardianvigil-labs/prufgate:1.3.0` | Only used when the runner has no `python3`: the signed release image of this version, or an image you built. |
 | `job_summary` | `true` | Write a short summary of the run to the job summary page: see [the run summary](#the-run-summary-and-pull-request-comment). |
 | `pr_comment` | `false` | Keep the same summary as one pull request comment, updated on every run. Needs `pull-requests: write`. |
 | `github_token` | `github.token` | Token for the pull request comment. Passed to the summary step only when `pr_comment` is `true`. |
@@ -135,7 +135,7 @@ This repository is a [pre-commit](https://pre-commit.com) hook repository (pre-c
 ```yaml
 repos:
   - repo: https://github.com/GuardianVigil-Labs/Prufgate
-    rev: v1.2.0
+    rev: v1.3.0
     hooks:
       - id: prufgate
       - id: prufgate-full

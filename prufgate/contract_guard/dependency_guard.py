@@ -326,11 +326,27 @@ def _pyproject_dependency_names(text: str) -> set[str]:
     return names
 
 
+# Packages a declared framework installs and documents as part of its API: importing them is
+# not a hallucination. Only well-known, stable pairs; anything else must be declared.
+PROVIDED_BY: dict[str, frozenset[str]] = {
+    "fastapi": frozenset({"starlette", "pydantic"}),
+    "sqlmodel": frozenset({"sqlalchemy", "pydantic"}),
+    "flask": frozenset({"werkzeug", "jinja2", "click", "itsdangerous", "markupsafe"}),
+    "requests": frozenset({"urllib3", "idna", "certifi", "charset_normalizer"}),
+    "httpx": frozenset({"httpcore", "anyio", "sniffio", "certifi", "idna"}),
+    "celery": frozenset({"kombu", "billiard", "vine"}),
+    "pytest": frozenset({"_pytest", "pluggy"}),
+}
+# Example and documentation folders are not the package: their imports have their own setup.
+NON_PACKAGE_DIRS = frozenset({"examples", "example", "docs", "doc"})
+
+
 def _add_python_dep(manifests: WorkspaceManifests, raw_spec: str) -> None:
     norm = _normalize_pypi_name(raw_spec)
     if norm:
         manifests.python_modules.add(norm)
         manifests.python_modules |= {x.lower() for x in PYPI_TO_IMPORT_MAP.get(norm, set())}
+        manifests.python_modules |= PROVIDED_BY.get(norm, frozenset())
 
 
 def find_manifest_files(workspace: Path) -> dict[str, list[Path]]:
@@ -548,6 +564,7 @@ def _scan_python_imports(
         tree = ast.parse(content)
         # Collect AST nodes inside `try: ... except (ImportError, ModuleNotFoundError):` or `if TYPE_CHECKING:`
         optional_nodes: set[int] = set()
+        optional_flags: set[str] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Try):
                 catches_import_err = False
@@ -561,9 +578,15 @@ def _scan_python_imports(
                 if catches_import_err:
                     for sub in ast.walk(node):
                         optional_nodes.add(id(sub))
-            elif isinstance(node, ast.If):
+                        # `has_simplejson = True` / `= False` in the try or its handler: a flag
+                        # whose `if has_simplejson:` block imports the optional module again.
+                        if isinstance(sub, ast.Assign):
+                            optional_flags.update(t.id for t in sub.targets if isinstance(t, ast.Name))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
                 cond_str = ast.unparse(node.test) if hasattr(ast, "unparse") else ""
-                if "TYPE_CHECKING" in cond_str:
+                flagged = any(isinstance(n, ast.Name) and n.id in optional_flags for n in ast.walk(node.test))
+                if "TYPE_CHECKING" in cond_str or flagged:
                     for sub in ast.walk(node):
                         optional_nodes.add(id(sub))
 
@@ -718,6 +741,8 @@ def scan_file_dependencies(
 
     cfg = config or PrufGateConfig()
     if cfg.is_excluded(rel_path) or cfg.is_exempt(rel_path, "undeclared-or-hallucinated-import"):
+        return []
+    if NON_PACKAGE_DIRS & set(rel_path.split("/")[:-1]):
         return []
 
     mf = manifests or load_declared_dependencies(workspace)

@@ -411,4 +411,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from prufgate.console import utf8_output  # Windows: piped output is cp1252
+
+    utf8_output()
     sys.exit(main())

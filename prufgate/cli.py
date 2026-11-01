@@ -56,6 +56,7 @@ from prufgate.config import (  # noqa: E402
     expand_rule_aliases,
     rules_match,
 )
+from prufgate.console import utf8_output  # noqa: E402
 from prufgate.diff_guard import tamper_detector as dg_engine  # noqa: E402
 from prufgate.hooks.adapters import AGENTS, EVENTS  # noqa: E402
 from prufgate.hooks.agent_hooks import AGENT_CHOICES, HookConfigError, init_workspace  # noqa: E402
@@ -951,6 +952,13 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         print("prufgate verify: name one mode (--differential or --mutation)", file=sys.stderr)
         return 2
     mode = "--differential" if args.differential else "--mutation"
+    if not repo_runner.supported():
+        print(
+            f"prufgate verify {mode} is not available on Windows: it contains the repository's tests with "
+            "process groups, which Windows does not have. Run it in WSL, a Linux container or CI.",
+            file=sys.stderr,
+        )
+        return 2
     if not repo_runner.opted_in(args.allow_run_tests):
         print(
             f"prufgate verify {mode} runs the repository's tests, which is code from the repository "
@@ -1069,6 +1077,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    utf8_output()
     raw_args = list(sys.argv[1:] if argv is None else argv)
 
     if "--self-check" in raw_args or (raw_args and raw_args[0] == "self-check"):

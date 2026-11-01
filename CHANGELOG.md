@@ -4,6 +4,8 @@ All notable changes to PrufGate. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [1.3.0]
+
 ### Added
 - **Run summary and pull request comment.** The GitHub Action writes a short summary of each run to the job summary page: the verdict, the first ten findings (most severe first) and facts about the change against the base ref (lines changed in production code, tests, configuration and docs; assertion lines added and removed; dependency manifests and CI, lint, test or coverage configuration touched). With the new `pr_comment: 'true'` input it keeps the same summary as one pull request comment, edited on each run. `job_summary` (default `true`) turns the page off. The new `exit_code` output gives the gate's exit code. The summary never changes the verdict: if it cannot be written or posted, the step warns.
 - `prufgate pr-summary` prints that summary from `reports/prufgate.sarif` anywhere, and `--post-comment` keeps the pull request comment. Text from the code under review is shown only as inline code and redacted; a secret scanner's match is never included.
@@ -11,11 +13,18 @@ All notable changes to PrufGate. The format follows [Keep a Changelog](https://k
 - **`prufgate baseline`** records every current finding in `.prufgate/baseline.yaml`, so a codebase that already has findings can adopt PrufGate and be blocked only by new ones. Each entry carries a fingerprint (the rule and the finding's line, with a counter for identical lines), so it hides that one finding: a new finding of the same rule in the same file is still reported, and so is a baselined one whose line is edited, while lines moving around it change nothing. `--stdout` prints the file instead of writing it.
 
 ### Changed
-- CI runs the unit tests on macOS as well as Linux.
+- CI runs the unit tests on macOS and Windows as well as Linux. On Windows the tests of the shell gate and of `prufgate verify`, which need a POSIX system, are skipped.
 - **`prufgate check`, and so the MCP server and the REST API, honour the baseline** like the `prufgate.sh` gate: read at the base ref in a changed scan, so a branch cannot baseline its own findings. `check` prints how many findings the baseline left out, writes them to SARIF as suppressed results, and in a full scan names entries that no longer match anything. A baseline that does not parse is still ignored (every finding is reported), and now says so.
 - Baseline rule names match through rule aliases and with or without the `anti-fabrication-` prefix, in `check` and the gate alike. `prufgate-config-self-exemption`, `prufgate-config-not-applied` and `debt-ceiling-breached` can no longer be hidden by a baseline entry.
 
 ### Fixed
+- **Fewer false positives on real code** (a scan of well-known open-source projects: 66% fewer findings, see `docs/BENCHMARK.md`). `zero-assertion-test` counts assertions made in a helper defined in the test file (or a Go package's test files) unless the helper only asserts a tautology, Spring `andExpect(...)`, Mocha's `done` handed on as a callback, type-level `assertEqual<A, B>()` / `expectTypeOf<T>()`, Prophecy `shouldBeCalled()` and Ruby `fail`; a JavaScript regex literal containing `//` no longer ends the test early. `unimplemented-production-stub` skips abstract methods of base classes. `documentation-address` and the other line rules skip text inside Python strings. `undeclared-or-hallucinated-import` skips `examples/` and `docs/`, accepts packages a declared framework provides, and treats imports under a flag set by an optional import as optional. Engine 5 recognises FastAPI `Annotated[..., Depends(get_current_user)]` aliases as guards.
+- **A scan no longer hangs** on a file whose header is a comment line of slashes (`//////...`): the `"use server"` check backtracked exponentially and now scans linearly.
+- **Windows:** output that cannot encode PrufGate's characters (piped output is cp1252 there) is switched to UTF-8 at start-up, so printing the summary table or a check mark no longer crashes the CLI, the gate or an engine.
+- **Windows:** the agent hook commands try `python` after `python3`, which Windows does not have.
+- **Windows:** `prufgate verify` refuses to start (exit 2) with a message naming WSL, a container or CI, instead of crashing: containing the repository's tests needs POSIX process groups.
+- **Windows:** `prufgate fix --apply` refuses a directory swapped for a symlink after its path check, as on Linux and macOS: without `dir_fd` it opens by path and then checks that the descriptor is the file at the resolved path inside the repository.
+- **Windows:** an invalid base configuration is named `.prufgate/config.yaml`, not `.prufgate\config.yaml`.
 - **Windows:** `diff-test-file-deleted` no longer reports a test deleted together with the module it imports. Import paths were compared with `\\` separators against the diff's `/`.
 - **macOS and symlinked workspaces:** SARIF locations are repository-relative when the workspace and a finding's path name the same folder through a symlink (macOS temporary folders live under `/var` -> `/private/var`), so code scanning shows them on the right file.
 - **`prufgate verify` outside Linux:** a process the repository's tests start and detach (`setsid`, a double fork) no longer outlives the run. Linux keeps its subreaper; elsewhere every process the command starts carries a run marker in its environment and is found with `ps` at the end. A process that clears its own environment can still escape it there.

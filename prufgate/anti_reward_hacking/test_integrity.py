@@ -323,9 +323,26 @@ def _infer_subject_stem(path: Path | str) -> str:
     return _infer_subject_stem_str(str(path))
 
 
-def _strip_comments_and_strings_Preserve_len(text: str, keep_strings: bool = False) -> str:
+_REGEX_PRECEDERS = set("(,=:[!&|?{};")
+
+
+def _regex_may_start(text: str, i: int) -> bool:
+    """Whether the `/` at `i` can open a JavaScript regex literal: the previous non-blank
+    character is an operator or opening bracket, `return` precedes it, or nothing does."""
+    j = i - 1
+    while j >= 0 and text[j] in " \t":
+        j -= 1
+    if j < 0 or text[j] == "\n":
+        return False  # a line starting with `/` is far more often a comment or division
+    if text[j] in _REGEX_PRECEDERS:
+        return True
+    return text[max(0, j - 5) : j + 1] == "return" and (j - 6 < 0 or not (text[j - 6].isalnum() or text[j - 6] == "_"))
+
+
+def _strip_comments_and_strings_Preserve_len(text: str, keep_strings: bool = False, js_regex: bool = False) -> str:
     """Replace contents of string literals and comments with spaces while keeping newlines and indices intact.
-    With `keep_strings`, only comments are blanked; string literals are skipped over unchanged."""
+    With `keep_strings`, only comments are blanked; string literals are skipped over unchanged.
+    `js_regex` (JavaScript, TypeScript) also blanks regex literals, so a `//` inside one is not a comment."""
     out = list(text)
     i = 0
     n = len(text)
@@ -358,6 +375,28 @@ def _strip_comments_and_strings_Preserve_len(text: str, keep_strings: bool = Fal
                 if text[i] != "\n":
                     out[i] = " "
                 i += 1
+        # A regex literal (`/\/user:(\w+)\//`) holds `//`, which must not start a comment. A `/` opens one
+        # where a value starts: at the start of the text, or after an operator or `return`.
+        elif js_regex and ch == "/" and _regex_may_start(text, i):
+            j, in_class = i + 1, False
+            while j < n and text[j] != "\n":
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == "[":
+                    in_class = True
+                elif text[j] == "]":
+                    in_class = False
+                elif text[j] == "/" and not in_class:
+                    break
+                j += 1
+            if j >= n or text[j] != "/":
+                i += 1  # no closing `/` on the line: division after all
+                continue
+            if not keep_strings:
+                for k in range(i, j + 1):
+                    out[k] = " "
+            i = j + 1
         # Strings '...', "...", `...`
         elif ch in ("'", '"', "`"):
             quote, start = ch, i
@@ -479,7 +518,7 @@ def _extract_python_test_blocks(content: str) -> list[TestBlock]:
 
 def _extract_brace_test_blocks(content: str, language: str) -> list[TestBlock]:
     """Extract brace-delimited test blocks for TS/JS, Go, Rust, and Java/Kotlin."""
-    masked = _strip_comments_and_strings_Preserve_len(content)
+    masked = _strip_comments_and_strings_Preserve_len(content, js_regex=language in ("typescript", "javascript"))
     line_starts = [0]
     for idx, ch in enumerate(content):
         if ch == "\n":
@@ -779,7 +818,11 @@ ASSERTION_PATTERNS_BY_LANG: dict[str, re.Pattern[str]] = {
         r"|\bexpect\s*\("
     ),
     "typescript": re.compile(
-        r"\bexpect\s*\("
+        # Mocha `done` handed on as a callback (`app.on("x", done)`): the test fails if it is never called.
+        r"[(,]\s*done\s*[),]"
+        # A type-level assertion with type arguments: `assertEqual<A, B>(true)`, `expectTypeOf<T>()`.
+        r"|\b(?:assert|expect)\w*\s*<"
+        r"|\bexpect\s*\("
         r"|\bexpectTypeOf\s*\("
         r"|\bassert(?:\.\w+|\s*\()"
         r"|\bshould\b"
@@ -793,7 +836,11 @@ ASSERTION_PATTERNS_BY_LANG: dict[str, re.Pattern[str]] = {
         r"|\bthrow\s+new\s+\w*Error\s*\("
     ),
     "javascript": re.compile(
-        r"\bexpect\s*\("
+        # Mocha `done` handed on as a callback (`app.on("x", done)`): the test fails if it is never called.
+        r"[(,]\s*done\s*[),]"
+        # A type-level assertion with type arguments: `assertEqual<A, B>(true)`, `expectTypeOf<T>()`.
+        r"|\b(?:assert|expect)\w*\s*<"
+        r"|\bexpect\s*\("
         r"|\bassert(?:\.\w+|\s*\()"
         r"|\bshould\b"
         r"|\.should\."
@@ -825,6 +872,9 @@ ASSERTION_PATTERNS_BY_LANG: dict[str, re.Pattern[str]] = {
         r"|\bverify\s*\("
         r"|\bexpect\w*\s*\("
         r"|\bfail\s*\("
+        # Spring MockMvc `.andExpect(status().isOk())`, WebTestClient `.expectStatus()`
+        r"|\.andExpect\w*\s*\("
+        r"|\.expect(?:Status|Body|Header|Cookie)\w*\s*\("
     ),
     "kotlin": re.compile(
         r"\bassert\w*\s*\("
@@ -840,6 +890,8 @@ ASSERTION_PATTERNS_BY_LANG: dict[str, re.Pattern[str]] = {
         r"|\bAssert::\w+\s*\("
         r"|\bexpect\s*\("
         r"|->shouldReceive\s*\("
+        # Prophecy: `->shouldBeCalled()`, `->shouldNotHaveBeenCalled()`
+        r"|->should(?:Not)?(?:Be|HaveBeen)Called\w*\s*\("
         r"|\bassert\w*\s*\("
     ),
     "csharp": re.compile(
@@ -857,6 +909,8 @@ ASSERTION_PATTERNS_BY_LANG: dict[str, re.Pattern[str]] = {
         r"|\bshould(?:_not)?\b"
         r"|\b(?:assert|refute)\w*\b"
         r"|\.must_\w+|\.wont_\w+"
+        # `cookies.each { fail }`: the test fails if the block runs.
+        r"|\b(?:fail|flunk)\b"
     ),
 }
 
@@ -959,6 +1013,107 @@ def _find_assertion_lines_in_block(block: TestBlock) -> list[tuple[int, str]]:
                 continue
             hits.append((ln, s))
     return hits
+
+
+# Functions a test calls instead of asserting inline: Go's `checkArgs(err, t)`, a `common_test(app)`,
+# a JS helper handed `done`. Found in the test file (and, for Go, the package's other test files).
+_HELPER_DEF_RES: dict[str, re.Pattern[str]] = {
+    "go": re.compile(r"^[ \t]*func\s+(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*\([^{]*\{", re.M),
+    "javascript": re.compile(
+        r"^[ \t]*(?:export\s+)?(?:async\s+)?function\s*\*?\s*(?P<name>[A-Za-z_$][\w$]*)\s*\([^)]*\)[^{;]*\{"
+        r"|^[ \t]*(?:export\s+)?(?:const|let|var)\s+(?P<name2>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?"
+        r"(?:function\b[^(]*\([^)]*\)|\([^)]*\)\s*(?::[^=]*)?=>|[A-Za-z_$][\w$]*\s*=>)\s*\{",
+        re.M,
+    ),
+    "java": re.compile(
+        r"^[ \t]*(?:(?:public|private|protected|static|final|abstract|synchronized|override|internal|suspend|open|fun)\s+)*"
+        r"(?:[\w<>\[\],.?]+\s+)?(?P<name>[A-Za-z_]\w*)\s*\([^;{)]*\)\s*(?:throws\s+[\w.,\s]+)?(?::\s*[\w<>?.]+\s*)?\{",
+        re.M,
+    ),
+    "php": re.compile(r"\bfunction\s+(?P<name>\w+)\s*\([^)]*\)[^{;]*\{"),
+    "rust": re.compile(r"\bfn\s+(?P<name>\w+)\s*(?:<[^>]*>)?\s*\([^{]*\{"),
+}
+_HELPER_DEF_RES["typescript"] = _HELPER_DEF_RES["javascript"]
+_HELPER_DEF_RES["kotlin"] = _HELPER_DEF_RES["csharp"] = _HELPER_DEF_RES["java"]
+_NOT_HELPER_NAMES = frozenset({"if", "for", "while", "switch", "catch", "synchronized", "return", "new", "else", "do", "try", "when"})
+_MAX_GO_SIBLINGS = 200
+
+
+def _function_bodies(content: str, lang: str) -> dict[str, list[str]]:
+    """{name: body lines} of the functions defined in `content` (tests included)."""
+    out: dict[str, list[str]] = {}
+    if lang == "python":
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError):
+            return out
+        lines = content.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+                start, end = node.body[0].lineno, getattr(node, "end_lineno", None) or node.body[-1].lineno
+                out.setdefault(node.name, lines[start - 1 : end])
+        return out
+    rx = _HELPER_DEF_RES.get(lang)
+    if rx is None:
+        return out
+    masked = _strip_comments_and_strings_Preserve_len(content, js_regex=lang in ("typescript", "javascript"))
+    for m in rx.finditer(masked):
+        name = m.groupdict().get("name") or m.groupdict().get("name2")
+        if not name or name in _NOT_HELPER_NAMES:
+            continue
+        open_brace = m.end() - 1
+        close_brace = _find_matching_brace(masked, open_brace)
+        if close_brace == -1:
+            continue
+        out.setdefault(name, content[open_brace + 1 : close_brace].splitlines())
+    return out
+
+
+def _asserts(lines: list[str], pat: re.Pattern[str]) -> bool:
+    """A line that asserts and is not a tautology: `assert True` in a helper hides nothing."""
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith(("#", "//", "/*", "*")):
+            continue
+        if pat.search(s) and not any(t.search(s) for t in TAUTOLOGY_PATTERNS):
+            return True
+    return False
+
+
+def _assertion_helpers(path: Path, content: str, lang: str) -> set[str]:
+    """Names of functions that assert, directly or through another such function, defined in this
+    test file or, for Go, in the package's other `_test.go` files."""
+    pat = ASSERTION_PATTERNS_BY_LANG.get(lang)
+    if pat is None:
+        return set()
+    bodies = _function_bodies(content, lang)
+    if lang == "go" and path.parent.is_dir():
+        for sib in sorted(path.parent.glob("*_test.go"))[:_MAX_GO_SIBLINGS]:
+            if sib.name == path.name:
+                continue
+            try:
+                for name, body in _function_bodies(sib.read_text(encoding="utf-8", errors="ignore"), lang).items():
+                    bodies.setdefault(name, body)
+            except OSError:
+                continue
+    helpers = {name for name, body in bodies.items() if _asserts(body, pat)}
+    for _ in range(3):  # helpers that call helpers
+        if not helpers:
+            break
+        call = re.compile(r"(?<![\w$])(?:" + "|".join(map(re.escape, sorted(helpers))) + r")\s*\(")
+        more = {name for name, body in bodies.items() if name not in helpers and any(call.search(b) for b in body)}
+        if not more:
+            break
+        helpers |= more
+    return helpers
+
+
+def _calls_helper(block: TestBlock, helpers: set[str]) -> bool:
+    names = helpers - {block.name}
+    if not names:
+        return False
+    call = re.compile(r"(?<![\w$])(?:" + "|".join(map(re.escape, sorted(names))) + r")\s*\(")
+    return any(call.search(raw) for _, raw in block.body_lines if not raw.strip().startswith(("#", "//")))
 
 
 def _check_python_swallowed_exception(block: TestBlock, rel_path: str) -> list[Finding]:
@@ -1330,6 +1485,7 @@ def scan_test_file(
         blocks = []
 
     # 1. Per-block checks: zero-assertion-test, superficial single-assertion tautology, swallowed exception
+    helpers = _assertion_helpers(p, content, lang) if blocks else set()
     for block in blocks:
         if _block_is_skipped_or_expected_panic(block):
             continue
@@ -1361,6 +1517,8 @@ def scan_test_file(
                 continue
 
         assertion_lines = _find_assertion_lines_in_block(block)
+        if not assertion_lines and _calls_helper(block, helpers):
+            continue
         if not assertion_lines:
             raw_findings.append(
                 Finding(
@@ -3782,4 +3940,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from prufgate.console import utf8_output  # Windows: piped output is cp1252
+
+    utf8_output()
     sys.exit(main())

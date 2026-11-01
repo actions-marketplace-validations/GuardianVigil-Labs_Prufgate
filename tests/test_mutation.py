@@ -125,6 +125,7 @@ def git(cwd: Path, *args: str) -> str:
     ).stdout
 
 
+@unittest.skipIf(sys.platform == "win32", "prufgate verify needs process groups; Windows refuses it (NeverOnWindows)")
 class MutationTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()

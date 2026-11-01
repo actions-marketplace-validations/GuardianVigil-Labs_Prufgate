@@ -49,6 +49,7 @@ def git(cwd: Path, *args: str) -> str:
     ).stdout
 
 
+@unittest.skipIf(sys.platform == "win32", "prufgate verify needs process groups; Windows refuses it (NeverOnWindows)")
 class DifferentialTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -357,6 +358,28 @@ class NeverAutomatic(unittest.TestCase):
             r"from prufgate(?:\.repo_runner| import [^\n]*\b(?:differential|mutation|repo_runner)\b)|"
             r"from prufgate\.(?:differential|mutation) import", p.read_text(encoding="utf-8"))]
         self.assertEqual(sorted(top), ["cli.py", "differential.py", "mutation.py"])
+
+
+class NeverOnWindows(unittest.TestCase):
+    """Without process groups (Windows) the repository's tests cannot be contained: verify refuses, exit 2."""
+
+    def test_verify_refuses_without_process_groups(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        from prufgate import repo_runner
+        from prufgate.cli import main as cli_main
+
+        for mode in ("--differential", "--mutation"):
+            err = io.StringIO()
+            with mock.patch.object(repo_runner, "supported", return_value=False), redirect_stderr(err):
+                rc = cli_main(["verify", mode, ".", "--allow-run-tests"])
+            self.assertEqual(rc, 2, mode)
+            self.assertIn("not available on Windows", err.getvalue())
+        with mock.patch.object(repo_runner, "supported", return_value=False):
+            with self.assertRaises(repo_runner.RunError):
+                repo_runner.run_command(["true"], Path("."), {}, 5, Path("unused.log"))
 
 
 class RunMarkTest(unittest.TestCase):

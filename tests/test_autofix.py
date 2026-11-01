@@ -238,7 +238,9 @@ class AutofixTest(unittest.TestCase):
         self.assertIn("symlink", err)
         self.assertEqual(target.read_text(), head)
 
-    def test_directory_swapped_for_symlink_after_the_check_is_refused(self) -> None:
+    def _swap_dir_after_check(self) -> tuple[int, str, str, str]:
+        """Apply a fix while `t/` is swapped for a symlink to an outside folder right after
+        the path check. Returns (exit code, stderr, the outside file's text, its original text)."""
         outside = tempfile.TemporaryDirectory()
         self.addCleanup(outside.cleanup)
         base = "it('a', () => { expect(f()).toBe(1); });\n"
@@ -257,9 +259,21 @@ class AutofixTest(unittest.TestCase):
 
         with patch.object(autofix, "_safe_target", check_then_swap):
             rc, _, err = self.run_cli("--apply")
+        return rc, err, target.read_text(), head
+
+    def test_directory_swapped_for_symlink_after_the_check_is_refused(self) -> None:
+        rc, err, outside_text, head = self._swap_dir_after_check()
         self.assertEqual(rc, 2)
         self.assertIn("symlink", err)
-        self.assertEqual(target.read_text(), head)
+        self.assertEqual(outside_text, head)
+
+    def test_directory_swapped_for_symlink_is_refused_without_dir_fd(self) -> None:
+        # Windows has no dir_fd: the same swap is caught by checking the opened file's identity.
+        with patch.object(autofix, "_DIR_FD", False):
+            rc, err, outside_text, head = self._swap_dir_after_check()
+        self.assertEqual(rc, 2)
+        self.assertIn("symlink", err)
+        self.assertEqual(outside_text, head)
 
     def test_force_moves_edits_onto_shifted_working_tree_lines(self) -> None:
         skip = "@pytest.mark" + SKIP + "\n"

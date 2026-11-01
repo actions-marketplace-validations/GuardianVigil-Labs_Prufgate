@@ -124,7 +124,7 @@ class Bug07WholeSegments(unittest.TestCase):
             (root / "tests").mkdir()
             (root / "tests/x.py").write_text("x = 1\n")
             detector.apply_settings({})
-            got = {str(p.relative_to(root)) for p in detector.collect([str(root)])}
+            got = {p.relative_to(root).as_posix() for p in detector.collect([str(root)])}
             self.assertEqual(
                 got, {"src/checkout/pay.py", "src/layout/view.py", "src/contests/x.py", "src/app/reports/r.py"}
             )
