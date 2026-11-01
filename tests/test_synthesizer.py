@@ -112,6 +112,21 @@ class SynthesizerTest(unittest.TestCase):
         self.assertEqual(deduped[0].severity, "P1")
         self.assertIn("Also detected by: pr-reviewer", deduped[0].details)
 
+    def test_sarif_paths_are_relative_through_a_symlinked_workspace(self):
+        """macOS temporary folders are /var/... -> /private/var/...: a finding's absolute path and the
+        workspace can name the same folder in either spelling, and still give a relative URI."""
+        from prufgate.synthesizer.parse_results import _normalize_sarif_uri
+
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d) / "real"
+            real.mkdir()
+            link = Path(d) / "link"
+            link.symlink_to(real, target_is_directory=True)
+            for ws in (real, link):
+                for f in (real / "src" / "app.py", link / "src" / "app.py"):
+                    self.assertEqual(_normalize_sarif_uri(str(f), ws), "src/app.py", (ws, f))
+            self.assertEqual(_normalize_sarif_uri("src\\app.py", real), "src/app.py")
+
     def test_baseline_suppression_supports_yaml_and_json_schemas(self):
         (self.ws / ".prufgate").mkdir(exist_ok=True)
         (self.ws / ".prufgate" / "baseline.yaml").write_text(

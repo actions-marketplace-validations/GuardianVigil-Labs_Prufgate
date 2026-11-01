@@ -285,9 +285,28 @@ def prufgate_summary(workspace_path: str = ".") -> Dict[str, Any]:
     }
 
 
-def _tool(name: str, title: str, description: str, props: Dict[str, Any], open_world: bool = False) -> Dict[str, Any]:
+def prufgate_explain(rule: Any = None) -> Dict[str, Any]:
+    """What a rule catches and how to fix it (`prufgate explain`). Reads no workspace."""
+    from prufgate.explain import describe, lookup, suggestions
+
+    if not isinstance(rule, str) or not rule.strip():
+        raise ToolInputError("rule must be a rule ID, as a finding names it")
+    found = lookup(rule)
+    if found is None:
+        return {"tool": "prufgate_explain", "status": "error",
+                "error": f"no PrufGate rule named {rule!r}", "did_you_mean": suggestions(rule)}
+    return {"tool": "prufgate_explain", "status": "ok", **describe(found)}
+
+
+def _tool(
+    name: str, title: str, description: str, props: Dict[str, Any], open_world: bool = False,
+    required: Optional[List[str]] = None, workspace: bool = True,
+) -> Dict[str, Any]:
     hints = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": open_world}
-    schema = {"type": "object", "properties": {"workspace_path": WS_PROP, **props}, "additionalProperties": False}
+    properties = {"workspace_path": WS_PROP, **props} if workspace else dict(props)
+    schema: Dict[str, Any] = {"type": "object", "properties": properties, "additionalProperties": False}
+    if required:
+        schema["required"] = required
     return {"name": name, "description": description, "inputSchema": schema, "annotations": {"title": title, **hints}, **hints}
 
 
@@ -306,6 +325,9 @@ MCP_TOOLS = [
     _tool("prufgate_bola_check", "PrufGate BOLA Check", "Engine 5: routes and queries without auth or tenant scoping; the live two-token probe runs only when target_url is set.", {"target_url": URL_PROP}, open_world=True),
     _tool("prufgate_review", "PrufGate Diff Review", "Engine 6: deterministic review of the diff against base_ref (default: resolved like prufgate check --changed).", {"base_ref": BASE_PROP}),
     _tool("prufgate_summary", "PrufGate Summary", "Read the last SARIF/Markdown report written by ./prufgate.sh without running a scan.", {}),
+    _tool("prufgate_explain", "PrufGate Explain Rule", "What a rule catches, how to fix it, and how to record a false positive. Pass the rule ID a finding names.",
+          {"rule": {"type": "string", "description": "Rule ID, e.g. canned-error-fallback or test-skip-smuggling"}},
+          required=["rule"], workspace=False),
 ]
 
 HANDLERS = {
@@ -318,6 +340,7 @@ HANDLERS = {
     "prufgate_bola_check": prufgate_bola_check,
     "prufgate_review": prufgate_review,
     "prufgate_summary": prufgate_summary,
+    "prufgate_explain": prufgate_explain,
 }
 
 

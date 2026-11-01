@@ -2169,9 +2169,10 @@ def _retired_with(
                 root = base.joinpath(*[".."] * max(0, dots - 1)) if dots else Path()
                 parts = [p for p in mod.lstrip(".").split(".") if p]
                 names = [n.strip(" ()").split()[0] for n in (m.group(2) or "").split(",") if n.strip(" ()")]
-                top = os.path.normpath(str(root.joinpath(*parts))) if parts else None
+                # Diff paths always use "/": normpath writes "\\" on Windows.
+                top = os.path.normpath(str(root.joinpath(*parts))).replace("\\", "/") if parts else None
                 for n in names or [None]:
-                    chain = [os.path.normpath(str(root.joinpath(*parts, n)))] if n and n != "*" else []
+                    chain = [os.path.normpath(str(root.joinpath(*parts, n))).replace("\\", "/")] if n and n != "*" else []
                     refs.append((chain + ([top] if top else []), bool(dots), [n] if n and n != "*" else []))
             elif js:
                 imported = re.search(r"\{([^}]*)\}", raw)
@@ -2185,7 +2186,7 @@ def _retired_with(
                 for m in _JS_IMPORT_RE.finditer(raw):
                     spec = m.group(1)
                     rel = spec.startswith(".")
-                    cand = os.path.normpath(str(base / spec)) if rel else spec[2:]
+                    cand = os.path.normpath(str(base / spec)).replace("\\", "/") if rel else spec[2:]
                     refs.append(([_SOURCE_SUFFIX_RE.sub("", cand)], rel, [n for n in names if n]))
             for chain, rel, names in refs:
                 # A build tool's config (`next.config`) is loaded by many tests and is never their subject.
@@ -2210,7 +2211,7 @@ def _retired_with(
         if any(is_kept for _, is_kept, _, _ in subject):
             return None
         found = [g for g, _, _, _ in subject if g]
-        if not seen and not live_file(str(base / stem), exts) and not live_file(stem, exts):
+        if not seen and not live_file((base / stem).as_posix(), exts) and not live_file(stem, exts):
             # A test that imports nothing first-party and reads a file the diff deletes
             # (`readFileSync(".../rules.json")`) retires with that file.
             quoted = {next((g for g in m.groups() if g is not None), None) for raw in lines for m in _QUOTED_RE.finditer(raw)} - {None}

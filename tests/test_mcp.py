@@ -26,6 +26,7 @@ for _ci_var in ("GITHUB_BASE_REF", "PRUFGATE_BASE_REF"):
 TOOLS = {
     "prufgate_fast_scan", "prufgate_full_scan", "prufgate_anti_fabrication", "prufgate_test_audit",
     "prufgate_diff_guard", "prufgate_contract_check", "prufgate_bola_check", "prufgate_review", "prufgate_summary",
+    "prufgate_explain",
 }
 
 
@@ -48,6 +49,25 @@ class Catalog(unittest.TestCase):
         self.assertEqual(open_world, {"prufgate_full_scan", "prufgate_bola_check"})
 
 
+class Explain(unittest.TestCase):
+    def test_explains_a_rule_without_a_workspace(self):
+        tool = next(t for t in mcp.MCP_TOOLS if t["name"] == "prufgate_explain")
+        self.assertEqual(set(tool["inputSchema"]["properties"]), {"rule"})
+        self.assertEqual(tool["inputSchema"]["required"], ["rule"])
+        res = mcp.handle_tool_call("prufgate_explain", {"rule": "anti-fabrication-canned-error-fallback"})
+        self.assertEqual((res["status"], res["rule"]), ("ok", "canned-error-fallback"))
+        self.assertIn("fix", res)
+
+    def test_unknown_or_missing_rules(self):
+        res = mcp.handle_tool_call("prufgate_explain", {"rule": "tautological-asertion"})
+        self.assertEqual(res["status"], "error")
+        self.assertIn("tautological-assertion", res["did_you_mean"])
+        with self.assertRaises(mcp.ToolInputError):
+            mcp.handle_tool_call("prufgate_explain", {})
+        with self.assertRaises(mcp.ToolInputError):
+            mcp.handle_tool_call("prufgate_explain", {"rule": "x", "workspace_path": "."})
+
+
 class Tools(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -65,7 +85,7 @@ class Tools(unittest.TestCase):
             mcp.prufgate_fast_scan(workspace_path=str(self.ws / "nope"))
 
     def test_clean_workspace_passes_every_engine_tool(self):
-        for name in TOOLS - {"prufgate_summary"}:
+        for name in TOOLS - {"prufgate_summary", "prufgate_explain"}:
             res = mcp.handle_tool_call(name, {"workspace_path": str(self.ws)})
             self.assertEqual(res["status"], "ok", f"{name}: {res.get('error')}")
             self.assertTrue(res["passed"], name)

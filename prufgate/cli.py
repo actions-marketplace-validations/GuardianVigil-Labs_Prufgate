@@ -10,11 +10,14 @@ Subcommands:
   - `prufgate verify --differential [path] [--base REF] [--test-cmd CMD] [--allow-run-tests]` (runs repository tests: opt-in only)
   - `prufgate verify --mutation [path] [--base REF] [--tool NAME] [--max-mutants N] [--allow-run-tests]` (runs repository tests: opt-in only)
   - `prufgate init [path] [--hooks] [--agent NAME ...] [--agents-md] [--bugbot] [--overwrite]`
+  - `prufgate baseline [path] [--config FILE] [--stdout]` (record existing findings in .prufgate/baseline.yaml)
+  - `prufgate explain RULE [--format text|json]` / `prufgate explain --list` (what a rule catches and how to fix it)
   - `prufgate shell-guard` (Claude Code PreToolUse hook: payload on stdin, exit 2 blocks)
   - `prufgate hook <agent> <event>` (fail-closed coding-agent hook adapters, docs/AGENT_HOOKS.md)
   - `prufgate transcript FILE [--format text|json|sarif] [--format-in claude|codex|text]` (suspicious commands an agent ran)
   - `prufgate bench [--cases DIR] [--format text|json|markdown] [--rule RULE] [--min-precision X] [--min-recall Y]`
   - `prufgate export-rules [--format semgrep] [--out FILE] [--pack cti]`
+  - `prufgate pr-summary [path] [--sarif FILE] [--base REF] [--exit-code N] [--max-findings N] [--post-comment] [--repo OWNER/NAME] [--pr N]`
   - `prufgate mcp`
   - `prufgate api [--host 127.0.0.1] [--port 8000]`
   - `prufgate fast` / `prufgate full` (shortcuts for `check --changed` / `check`)
@@ -41,6 +44,7 @@ if str(_THIS_DIR.parent) not in sys.path:
 
 import prufgate.contract_guard as cg_engine  # noqa: E402
 from prufgate import PROJECT_URL, __version__, diff_scope, inline_ignore  # noqa: E402
+from prufgate import baseline as baseline_file  # noqa: E402
 from prufgate.anti_fabrication import detector as af_detector  # noqa: E402
 from prufgate.anti_reward_hacking import test_integrity as ti_engine  # noqa: E402
 from prufgate.bola import bola_engine  # noqa: E402
@@ -93,8 +97,13 @@ def _collect_unified_findings(
     honoured: list[dict[str, Any]] | None = None,
     ai_dismissed: list[dict[str, Any]] | None = None,
     ai_provider: str | None = None,
+    baselined: list[dict[str, Any]] | None = None,
+    apply_baseline: bool = True,
 ) -> list[dict[str, Any]]:
     """Run Engines 1-5 on `target_path` and return normalized finding dicts.
+
+    Findings the baseline lists (prufgate/baseline.py) are left out, and appended to
+    `baselined` when it is given; `apply_baseline=False` keeps them (`prufgate baseline`).
 
     A reasonless inline ignore is returned as an `ignore-without-reason` finding;
     the ignores the engines honoured are appended to `honoured` when it is given.
@@ -114,7 +123,7 @@ def _collect_unified_findings(
         with inline_ignore.recording() as records:
             found = _collect_in_workspace(
                 workspace, target_path, changed_only, base_ref, config_path, ai_dismissed, ai_provider,
-                records=records, honoured=honoured,
+                records=records, honoured=honoured, baselined=baselined, apply_baseline=apply_baseline,
             )
     finally:
         os.chdir(previous_cwd)
@@ -202,6 +211,8 @@ def _collect_in_workspace(
     ai_provider: str | None = None,
     records: list[dict[str, Any]] | None = None,
     honoured: list[dict[str, Any]] | None = None,
+    baselined: list[dict[str, Any]] | None = None,
+    apply_baseline: bool = True,
 ) -> list[dict[str, Any]]:
     # A changed scan judges only the lines the change touched (prufgate/diff_scope.py).
     ranges: diff_scope.Ranges | None = None
@@ -410,6 +421,14 @@ def _collect_in_workspace(
             or not any(rules_match(str(f["rule"]), r) for r in cfg.known_debt_ceilings)
         ]
 
+    # After the debt ratchet, so baselined findings still count toward a known_debt ceiling.
+    if apply_baseline:
+        deduped = _apply_baseline(
+            deduped, workspace, cfg_ref, baselined,
+            report_stale=not changed_only and target_path == workspace,
+            changed_ref=base_ref if changed_only else None,
+        )
+
     for e in records or ():
         if ranges is not None and not diff_scope.in_scope(
             ranges, str(e.get("engine") or ""), str(e.get("rule") or ""), str(e.get("file") or ""),
@@ -455,6 +474,51 @@ def _collect_in_workspace(
             ai_dismissed.append({**deduped[i], "kind": "ai-dismissed", "reason": reason})
         deduped = [f for i, f in enumerate(deduped) if i not in verdicts]
     return deduped
+
+
+def _apply_baseline(
+    findings: list[dict[str, Any]],
+    workspace: Path,
+    ref: str | None,
+    baselined: list[dict[str, Any]] | None,
+    report_stale: bool,
+    changed_ref: str | None = None,
+) -> list[dict[str, Any]]:
+    """Leave out the findings the baseline lists. It is read where the configuration
+    is (`ref`: the base, else the working tree), so a change cannot baseline itself."""
+    try:
+        found = baseline_file.read_baseline(workspace, ref)
+    except GitDiffError as exc:
+        raise ConfigError(f"cannot read the baseline at {ref!r}: {exc}") from exc
+    if changed_ref is not None:
+        try:
+            if baseline_file.read_baseline(workspace) != found:
+                print("notice: this change edits the PrufGate baseline; it applies after merge.", file=sys.stderr)
+        except GitDiffError:
+            pass
+    try:
+        entries = baseline_file.parse_entries(found)
+    except baseline_file.BaselineError as exc:
+        print(f"notice: the baseline is ignored, so every finding is reported: {exc}", file=sys.stderr)
+        return findings
+    if not entries:
+        return findings
+    matcher = baseline_file.Matcher(entries, workspace)
+    kept = []
+    listed = matcher.match_all([(f.get("file"), f.get("rule"), f.get("line")) for f in findings])
+    for f, hit in zip(findings, listed):
+        if not hit:
+            kept.append(f)
+        elif baselined is not None:
+            baselined.append({**f, "kind": "baselined", "reason": "in the PrufGate baseline"})
+    stale = matcher.stale() if report_stale else []
+    if stale and found is not None:
+        print(
+            f"notice: {len(stale)} {'entry' if len(stale) == 1 else 'entries'} in {found[0]} "
+            "match no finding any more; `prufgate baseline` rewrites the file without them.",
+            file=sys.stderr,
+        )
+    return kept
 
 
 def _trusted_adjudication(workspace: Path, config_path: str | None, cfg: PrufGateConfig, cfg_ref: str | None) -> AiAdjudicate:
@@ -516,6 +580,8 @@ def _sarif_findings_doc(
             results[-1]["suppressions"] = [{"kind": "inSource", "justification": str(f.get("reason", ""))}]
         elif f.get("kind") == "ai-dismissed":
             results[-1]["suppressions"] = [{"kind": "external", "justification": f"AI-dismissed: {f.get('reason', '')}"}]
+        elif f.get("kind") == "baselined":
+            results[-1]["suppressions"] = [{"kind": "external", "justification": "In the PrufGate baseline"}]
     add_partial_fingerprints(results, root)
     sarif = {
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
@@ -567,6 +633,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
     honoured: list[dict[str, Any]] = []
     dismissed: list[dict[str, Any]] = []
+    baselined: list[dict[str, Any]] = []
     try:
         findings = _collect_unified_findings(
             target,
@@ -574,6 +641,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
             base_ref=args.base,
             config_path=args.config,
             honoured=honoured,
+            baselined=baselined,
             # The agent hooks (and the MCP server and REST API, which set the variable)
             # never call AI adjudication: an agent must not get a judge to iterate against.
             ai_dismissed=None if args.format == "agent-hook" or os.environ.get("PRUFGATE_NO_AI_ADJUDICATE") else dismissed,
@@ -596,9 +664,9 @@ def _cmd_check(args: argparse.Namespace) -> int:
         print(json.dumps(findings, indent=2))
     elif args.format == "sarif":
         # Finding paths are relative to the scanned directory, or to the file's directory for one file.
-        print(_format_sarif_findings(findings, target if target.is_dir() else target.parent, honoured + dismissed))
+        print(_format_sarif_findings(findings, target if target.is_dir() else target.parent, honoured + dismissed + baselined))
     elif args.format in ("gitlab", "junit"):
-        doc = _sarif_findings_doc(findings, target if target.is_dir() else target.parent, honoured + dismissed)
+        doc = _sarif_findings_doc(findings, target if target.is_dir() else target.parent, honoured + dismissed + baselined)
         print(gitlab_code_quality(doc) if args.format == "gitlab" else junit_xml(doc))
     elif args.format == "agent-hook":
         if blockers:
@@ -612,7 +680,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             print(
-                "Fix the fabricated logic, hollow test, or unscoped BOLA query above before finishing.",
+                "Fix the fabricated logic, hollow test, or unscoped BOLA query above before finishing. "
+                "`prufgate explain <rule>` says how to fix each one.",
                 file=sys.stderr,
             )
             return 2
@@ -622,6 +691,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
             print(f"{len(honoured)} finding(s) suppressed by an inline prufgate-ignore:")
             for e in honoured:
                 print(f"  [{e['engine']}:{e['rule']}] {e['file']}:{e['line']} — {e['reason']}")
+        if baselined:
+            print(f"{len(baselined)} finding(s) left out because the baseline lists them (`prufgate baseline` rewrites it).")
         if dismissed:
             print(f"AI-dismissed: {len(dismissed)} finding(s) an AI judged not real (not blocking):")
             for e in dismissed:
@@ -632,8 +703,56 @@ def _cmd_check(args: argparse.Namespace) -> int:
         print(f"✖ PrufGate check detected {len(findings)} finding(s) ({len(blockers)} blocker(s)):")
         for f in findings:
             print(f"  [{f['severity']}] [{f['engine']}:{f['rule']}] {f['file']}:{f['line']} — {f['message']}")
+        print(f"`prufgate explain {findings[0]['rule']}` (or any rule above) says what it catches and how to fix it.")
 
     return 1 if blockers else 0
+
+
+def _cmd_baseline(args: argparse.Namespace) -> int:
+    """Record every current finding in the baseline file, so only new ones are reported."""
+    target = Path(args.path).resolve()
+    if not target.is_dir():
+        print(f"prufgate baseline: not a directory: {args.path}", file=sys.stderr)
+        return 2
+    try:
+        findings = _collect_unified_findings(target, config_path=args.config, apply_baseline=False)
+    except (ConfigError, af_detector.SettingsError) as exc:
+        print(f"prufgate baseline: {exc}", file=sys.stderr)
+        return 2
+    except SystemExit as exc:
+        print(f"prufgate baseline: an engine stopped the scan (exit {exc.code})", file=sys.stderr)
+        return 2
+    except Exception as exc:  # a crash must never write a baseline that hides findings
+        print(f"prufgate baseline: engine error: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    ordered = baseline_file.entries_for([(f["file"], f["rule"], f.get("line")) for f in findings], target)
+
+    existing = baseline_file.read_baseline(target)
+    rel = existing[0] if existing else baseline_file.DEFAULT_FILE
+    text = baseline_file.render(ordered, as_json=rel.endswith(".json"))
+    if args.stdout:
+        sys.stdout.write(text)
+        return 0
+    try:
+        before = {(e.file, e.rule, e.fingerprint or "") for e in baseline_file.parse_entries(existing)}
+    except baseline_file.BaselineError:
+        before = set()
+    after = {(str(e["file"]), str(e["rule"]), str(e["fingerprint"])) for e in ordered}
+    try:
+        baseline_file.write(target / rel, text)
+    except OSError as exc:
+        print(f"prufgate baseline: cannot write {rel}: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"prufgate baseline: wrote {len(ordered)} {'entry' if len(ordered) == 1 else 'entries'} to {rel} "
+        f"({len(after - before)} new, {len(before - after)} removed)."
+    )
+    print(
+        "Commit it. A full `prufgate check` uses it now; changed-file checks and the CI gate read it from the base "
+        "branch, so for them it applies once merged, and the gate asks a maintainer to review each new entry."
+    )
+    return 0
 
 
 def _cmd_test_audit(args: argparse.Namespace) -> int:
@@ -1137,6 +1256,38 @@ def main(argv: list[str] | None = None) -> int:
     p_export.add_argument("--out", default=None, metavar="FILE", help="Write to FILE instead of standard output")
     p_export.add_argument("--pack", action="append", choices=("cti",), default=[], help="Also export an opt-in pack's rules")
 
+    # 5f. prufgate pr-summary
+    p_sum = subparsers.add_parser(
+        "pr-summary",
+        help="Print a Markdown summary of a gate run for a pull request; optionally keep it as one PR comment",
+    )
+    p_sum.add_argument("path", nargs="?", default=".", help="Workspace (default: current directory)")
+    p_sum.add_argument("--sarif", default=None, help="SARIF report to summarise (default: reports/prufgate.sarif)")
+    p_sum.add_argument("--base", default=None, help="Base ref for the change facts (default: the ref the gate used)")
+    p_sum.add_argument("--exit-code", type=int, default=None, help="The gate's exit code, shown as the verdict")
+    p_sum.add_argument("--max-findings", type=int, default=10, help="Findings listed before the rest are counted only")
+    p_sum.add_argument(
+        "--post-comment",
+        action="store_true",
+        help="Create or update one pull request comment (token from PRUFGATE_GITHUB_TOKEN or GITHUB_TOKEN)",
+    )
+    p_sum.add_argument("--repo", default=None, help="owner/name (default: GITHUB_REPOSITORY)")
+    p_sum.add_argument("--pr", type=int, default=None, help="Pull request number (default: from GITHUB_EVENT_PATH)")
+
+    # 5g. prufgate baseline
+    p_base = subparsers.add_parser(
+        "baseline", help="Record every current finding in .prufgate/baseline.yaml so that only new findings are reported"
+    )
+    p_base.add_argument("path", nargs="?", default=".", help="Workspace (default: current directory)")
+    p_base.add_argument("--config", default=None, help="Path to .prufgate/config.yaml")
+    p_base.add_argument("--stdout", action="store_true", help="Print the baseline instead of writing the file")
+
+    # 5h. prufgate explain
+    p_explain = subparsers.add_parser("explain", help="Show what a rule catches, how to fix it, and how to record a false positive")
+    p_explain.add_argument("rule", nargs="?", default=None, help="Rule ID as a report shows it")
+    p_explain.add_argument("--list", action="store_true", help="List every rule")
+    p_explain.add_argument("--format", choices=("text", "json"), default="text")
+
     # 6. prufgate mcp
     subparsers.add_parser("mcp", help="Start PrufGate Model Context Protocol (MCP) stdio server")
 
@@ -1170,6 +1321,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.subcommand == "test-audit":
         return _cmd_test_audit(args)
+    if args.subcommand == "baseline":
+        return _cmd_baseline(args)
+    if args.subcommand == "explain":
+        from prufgate.explain import main as explain_main
+
+        return explain_main(args.rule, args.list, args.format)
     if args.subcommand == "bola":
         return _cmd_bola(args)
     if args.subcommand == "review":
@@ -1198,6 +1355,11 @@ def main(argv: list[str] | None = None) -> int:
         from prufgate.export_rules import main as export_main
 
         return export_main(args.format, args.out, tuple(args.pack))
+    if args.subcommand == "pr-summary":
+        from prufgate.pr_summary import main as summary_main
+
+        return summary_main(args.path, args.sarif, args.base, args.exit_code, args.max_findings,
+                            args.post_comment, args.repo, args.pr)
     if args.subcommand == "mcp":
         from prufgate.mcp.prufgate_mcp_server import main as mcp_main
 

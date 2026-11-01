@@ -14,16 +14,18 @@ permissions:
 
 jobs:
   python-versions:
-    name: Unit tests on Python ${{ matrix.python }}
+    name: Unit tests on Python ${{ matrix.python }}${{ matrix.label }}
     # Python 3.9 is the oldest supported version and is not built for the
-    # newest runner image, so that leg stays on 24.04.
+    # newest runner image, so that leg stays on 24.04. macOS runs the newest
+    # Python: paths, symlinked temporary folders and process handling differ there.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { python: '3.9', os: ubuntu-24.04 }
-          - { python: '3.14', os: ubuntu-latest }
+          - { python: '3.9', os: ubuntu-24.04, label: '' }
+          - { python: '3.14', os: ubuntu-latest, label: '' }
+          - { python: '3.14', os: macos-latest, label: ' (macOS)' }
     steps:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,10 +36,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Self-check and unit tests
+        # `python` is the setup-python interpreter on every runner.
+        shell: bash
         run: |
-          python3 -m pip install --require-hashes -r .github/ci-requirements.txt
-          python3 prufgate/cli.py --self-check
-          python3 -m unittest discover -s tests
+          python -m pip install --require-hashes -r .github/ci-requirements.txt
+          python prufgate/cli.py --self-check
+          python -m unittest discover -s tests
 
   self-test:
     name: Self-Checks & Engine Verifications

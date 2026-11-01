@@ -38,8 +38,34 @@ jobs:
 | `fail_on_blocker` | `true` | Fail the step on a FAILED or ERROR verdict. |
 | `sarif_upload` | `true` | Upload `reports/prufgate.sarif` to code scanning (skipped when no report was written). |
 | `image` | `ghcr.io/guardianvigil-labs/prufgate:1.2.0` | Only used when the runner has no `python3`: the signed release image of this version, or an image you built. |
+| `job_summary` | `true` | Write a short summary of the run to the job summary page: see [the run summary](#the-run-summary-and-pull-request-comment). |
+| `pr_comment` | `false` | Keep the same summary as one pull request comment, updated on every run. Needs `pull-requests: write`. |
+| `github_token` | `github.token` | Token for the pull request comment. Passed to the summary step only when `pr_comment` is `true`. |
 
-Outputs: `verdict` (`PASSED` or `FAILED`), `sarif_path`, `markdown_path`.
+Outputs: `verdict` (`PASSED` or `FAILED`), `exit_code` (`0`, `1` or `2`), `sarif_path`, `markdown_path`.
+
+### The run summary and pull request comment
+
+After the gate, the action writes a short summary to the job summary page. It shows:
+
+- the verdict, and the number of blocking (P0/P1), warning (P2) and note (P3) findings, plus how many were ignored with a reason or dismissed by AI adjudication;
+- the first ten findings, most severe first, with rule, file and line;
+- facts about the change, compared with the base ref the gate used: files and lines changed in production code, tests, build and CI configuration, and documentation; assertion lines added and removed in tests; dependency manifests and CI, lint, test or coverage configuration touched; and a note when production code changed but no test file did.
+
+With `pr_comment: 'true'` the same summary is kept as one comment on the pull request. Each run edits that comment instead of adding a new one. Add the permission to the workflow:
+
+```yaml
+permissions:
+  contents: read
+  security-events: write   # SARIF upload
+  pull-requests: write     # the summary comment
+```
+
+A pull request from a fork gets a read-only token, so no comment is posted there; the step logs a warning and the job summary is still written. Do not switch to `pull_request_target` to get a write token: that event runs with the base repository's secrets, and the gate reads the pull request's code.
+
+The summary reports the result; it never changes it. If the summary cannot be written or posted, the step warns and the gate's verdict stands. Paths and messages come from the code under review, so they are shown only as inline code, which cannot mention anyone, link or render HTML; messages pass through the same redaction as AI adjudication, and a secret scanner's match is never included.
+
+The same summary is available anywhere with `prufgate pr-summary` (see [GETTING_STARTED.md](GETTING_STARTED.md#commands)).
 
 ### Alert tracking
 
@@ -172,7 +198,7 @@ It is a guard rail against an agent's habits, not a sandbox. Known gaps, which t
 }
 ```
 
-Nine tools, all read-only. They write nothing into the workspace.
+Ten tools, all read-only. They write nothing into the workspace.
 
 | Tool | Runs |
 |---|---|
@@ -185,8 +211,9 @@ Nine tools, all read-only. They write nothing into the workspace.
 | `prufgate_bola_check` | Engine 5 (static, or live with `target_url`) |
 | `prufgate_review` | Engine 6 |
 | `prufgate_summary` | A summary of the last report in `reports/` |
+| `prufgate_explain` | What a rule catches and how to fix it (`rule`; reads no workspace) |
 
-Arguments: `workspace_path`, `base_ref`, `changed_only`, `target_url`. Each result has `status` (`ok` or `error`), `passed`, `blockers` and `findings`. An engine that fails sets `isError`; it never comes back as `passed: true`.
+Arguments: `workspace_path`, `base_ref`, `changed_only`, `target_url` (and `rule` for `prufgate_explain`). Each result has `status` (`ok` or `error`), `passed`, `blockers` and `findings`. An engine that fails sets `isError`; it never comes back as `passed: true`.
 
 ## REST API
 

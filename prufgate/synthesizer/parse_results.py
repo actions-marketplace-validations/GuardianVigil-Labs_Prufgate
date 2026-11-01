@@ -20,13 +20,17 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from prufgate import PROJECT_URL, __version__, diff_scope, inline_ignore  # noqa: E402
+from prufgate.baseline import (  # noqa: E402, F401 (BASELINE_FILES and read_baseline are re-exported)
+    BASELINE_FILES,
+    BaselineError,
+    Matcher,
+    parse_entries,
+    read_baseline,
+)
 from prufgate.config import (  # noqa: E402
     ConfigError,
     GitDiffError,
     PrufGateConfig,
-    _diff_base,
-    git_blob,
-    repo_prefix,
 )
 from prufgate.report_formats import gitlab_code_quality, junit_xml  # noqa: E402
 from prufgate.review.adjudicate import adjudicate  # noqa: E402
@@ -498,32 +502,8 @@ def deduplicate_findings(findings: List[Finding]) -> List[Finding]:
     return list(dedup_map.values())
 
 
-BASELINE_FILES = (".prufgate/baseline.yaml", ".prufgate/baseline.yml", ".prufgate/baseline.json")
 # Written by runners/run_fast.sh in a changed-files run: the base ref it diffed against.
 BASE_REF_FILE = "base_ref"
-
-
-def read_baseline(workspace_dir: Path, ref: Optional[str] = None) -> Optional[tuple]:
-    """(path, text) of the first baseline file, or None. With `ref` it is read as
-    it is at the merge base with that ref, never from the working tree, so a
-    change cannot baseline its own findings. Raises GitDiffError when git cannot
-    read the base: the gate then fails closed."""
-    if ref is None:
-        for rel in BASELINE_FILES:
-            p = workspace_dir / rel
-            if p.is_file():
-                try:
-                    return rel, p.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
-                    return rel, ""
-        return None
-    commit = _diff_base(ref, workspace_dir)
-    prefix = repo_prefix(workspace_dir)
-    for rel in BASELINE_FILES:
-        text = git_blob(commit, prefix + rel, workspace_dir)
-        if text is not None:
-            return rel, text
-    return None
 
 
 def filter_confidence(findings: List[Finding], enable_low_confidence: bool) -> List[Finding]:
@@ -531,66 +511,29 @@ def filter_confidence(findings: List[Finding], enable_low_confidence: bool) -> L
     return visible(findings, enable_low_confidence)
 
 
-def baseline_keys(baseline: Optional[tuple]) -> set:
-    """The (file, rule) pairs a baseline from `read_baseline` ignores ("*" for any)."""
-    if baseline is None:
-        return set()
+def _entries(baseline: Optional[tuple]) -> list:
+    """The entries of a baseline (prufgate/baseline.py). One that does not parse is
+    ignored, which keeps every finding, and says so."""
     try:
-        rel, raw_text = baseline
-        if rel.endswith((".yaml", ".yml")):
-            import yaml
+        return parse_entries(baseline)
+    except BaselineError as exc:
+        print(f"prufgate: the baseline is ignored: {exc}", file=sys.stderr)
+        return []
 
-            data = yaml.safe_load(raw_text) or {}
-        else:
-            data = json.loads(raw_text)
 
-        if isinstance(data, list):
-            entries = data
-        elif isinstance(data, dict):
-            entries = (
-                data.get("ignore")
-                or data.get("ignored")
-                or data.get("baseline")
-                or []
-            )
-        else:
-            return set()
-
-        ignored_keys = set()
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            raw_file = entry.get("file") if "file" in entry else entry.get("file_path")
-            raw_rule = entry.get("rule_id") if "rule_id" in entry else entry.get("rule")
-            if raw_file is None and raw_rule is None:
-                continue
-            e_file = re.sub(r"^(?:/workspace/|\./|/)+", "", str(raw_file).strip()) if raw_file is not None else None
-            e_rule = str(raw_rule).strip().lower() if raw_rule is not None else None
-            if e_file and e_rule:
-                ignored_keys.add((e_file, e_rule))
-            elif e_rule and raw_file == "*":
-                ignored_keys.add(("*", e_rule))
-            elif e_file and raw_rule == "*":
-                ignored_keys.add((e_file, "*"))
-        return ignored_keys
-    except Exception:
-        return set()
+def baseline_keys(baseline: Optional[tuple]) -> set:
+    """(file, rule, fingerprint) of each entry in a baseline from `read_baseline`."""
+    return {(e.file, e.rule, e.fingerprint) for e in _entries(baseline)}
 
 
 def filter_baseline_findings(findings: List[Finding], workspace_dir: Path, ref: Optional[str] = None) -> List[Finding]:
-    """Filter out findings matching entries in .prufgate/baseline.yaml or .prufgate/baseline.json if present
-    (at the base ref when one is given)."""
-    ignored_keys = baseline_keys(read_baseline(workspace_dir, ref))
-    if not ignored_keys:
+    """Drop the findings the baseline lists (read at the base ref when one is given).
+    Raises GitDiffError when git cannot read the base."""
+    entries = _entries(read_baseline(workspace_dir, ref))
+    if not entries:
         return findings
-    filtered = []
-    for f in findings:
-        norm_file = re.sub(r"^(?:/workspace/|\./|/)+", "", f.file_path or "workspace")
-        norm_rule = f.rule_id.lower()
-        if (norm_file, norm_rule) in ignored_keys or ("*", norm_rule) in ignored_keys or (norm_file, "*") in ignored_keys:
-            continue
-        filtered.append(f)
-    return filtered
+    listed = Matcher(entries, workspace_dir).match_all([(f.file_path, f.rule_id, f.line) for f in findings])
+    return [f for f, hit in zip(findings, listed) if not hit]
 
 
 # Raw output each runner step writes. An executed step whose output is missing
@@ -686,10 +629,22 @@ def _normalize_sarif_uri(file_path: str, workspace_dir: Optional[Path] = None) -
         return "PRUFGATE_AUDIT_TARGET"
     if raw.startswith(("http://", "https://")):
         return "PRUFGATE_DYNAMIC_TARGET"
+    raw = raw.replace("\\", "/")
     if workspace_dir:
-        ws_prefix = str(workspace_dir.resolve()) + "/"
-        if raw.startswith(ws_prefix):
-            raw = raw[len(ws_prefix) :]
+        # The workspace and an absolute finding path may name the same folder through a symlink
+        # (macOS: /var -> /private/var), so both spellings of each are compared.
+        prefixes = {str(p).replace("\\", "/").rstrip("/") + "/" for p in (workspace_dir, workspace_dir.resolve())}
+        spellings = [raw]
+        if os.path.isabs(raw):
+            try:
+                spellings.append(str(Path(raw).resolve()).replace("\\", "/"))
+            except (OSError, RuntimeError):
+                pass
+        for spelled in spellings:
+            prefix = next((p for p in prefixes if spelled.startswith(p)), None)
+            if prefix:
+                raw = spelled[len(prefix) :]
+                break
     raw = re.sub(r"^(?:/workspace/|\./|/)+", "", raw)
     return raw or "PRUFGATE_AUDIT_TARGET"
 
@@ -1103,7 +1058,8 @@ def main() -> None:
             )
         # Like a configuration exemption: an entry the branch adds silences a
         # finding once merged, so it needs a maintainer's review.
-        for e_file, e_rule in sorted(baseline_keys(head_baseline) - baseline_keys(base_baseline)):
+        added = baseline_keys(head_baseline) - baseline_keys(base_baseline)
+        for e_file, e_rule, _fp in sorted(added, key=lambda k: (k[0], k[1], k[2] or "")):
             findings.append(
                 Finding(
                     tool="prufgate-gate",

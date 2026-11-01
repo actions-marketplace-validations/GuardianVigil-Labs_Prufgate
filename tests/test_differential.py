@@ -359,5 +359,27 @@ class NeverAutomatic(unittest.TestCase):
         self.assertEqual(sorted(top), ["cli.py", "differential.py", "mutation.py"])
 
 
+class RunMarkTest(unittest.TestCase):
+    """Outside Linux, leftover processes are found by the run marker in their environment."""
+
+    def test_only_processes_with_this_exact_mark(self) -> None:
+        from unittest import mock
+
+        from prufgate import repo_runner
+
+        ps = (
+            "  101 python -m pytest PATH=/usr/bin PRUFGATE_RUN_MARK=abc123\n"
+            "  102 sleep 60 TERM=xterm PRUFGATE_RUN_MARK=abc123 LANG=C\n"
+            "  103 sleep 60 PRUFGATE_RUN_MARK=abc1234\n"
+            "  104 editor notes.txt X=PRUFGATE_RUN_MARK=abc123extra\n"
+            "  105 bash\n"
+            f"  {os.getpid()} prufgate verify PRUFGATE_RUN_MARK=abc123\n"
+        )
+        with mock.patch.object(repo_runner.subprocess, "run", return_value=mock.Mock(stdout=ps)):
+            self.assertEqual(repo_runner._marked("abc123"), {101, 102})
+        with mock.patch.object(repo_runner.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertEqual(repo_runner._marked("abc123"), set())
+
+
 if __name__ == "__main__":
     unittest.main()

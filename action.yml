@@ -30,6 +30,18 @@ inputs:
     description: 'Git ref that changed files are compared with in fast mode. Defaults to the pull request base branch (origin/<base>). Check out with fetch-depth: 0 so that ref exists.'
     required: false
     default: ''
+  job_summary:
+    description: 'Write a short summary of the run (verdict, findings, facts about the change) to the job summary page'
+    required: false
+    default: 'true'
+  pr_comment:
+    description: 'Keep the same summary as one pull request comment, updated on every run. Needs permissions: pull-requests: write. A pull request from a fork gets a read-only token, so no comment is posted there (a warning, not a failure).'
+    required: false
+    default: 'false'
+  github_token:
+    description: 'Token used to post the pull request comment. Read only when pr_comment is true.'
+    required: false
+    default: ${{ github.token }}
 
 outputs:
   sarif_path:
@@ -41,6 +53,9 @@ outputs:
   verdict:
     description: 'Overall audit verdict: PASSED or FAILED'
     value: ${{ steps.run-prufgate.outputs.verdict }}
+  exit_code:
+    description: 'Exit code of the gate: 0 clean, 1 blocking findings, 2 PrufGate could not run'
+    value: ${{ steps.run-prufgate.outputs.exit_code }}
 
 runs:
   using: 'composite'
@@ -89,6 +104,7 @@ runs:
 
         echo "sarif_path=${GITHUB_WORKSPACE}/reports/prufgate.sarif" >> "${GITHUB_OUTPUT}"
         echo "markdown_path=${GITHUB_WORKSPACE}/reports/prufgate-review.md" >> "${GITHUB_OUTPUT}"
+        echo "exit_code=${EXIT_CODE}" >> "${GITHUB_OUTPUT}"
         if [ $EXIT_CODE -eq 0 ]; then
           echo "verdict=PASSED" >> "${GITHUB_OUTPUT}"
         else
@@ -96,6 +112,56 @@ runs:
           if [ "${FAIL_ON_BLOCKER}" = "true" ]; then
             exit $EXIT_CODE
           fi
+        fi
+
+    - name: Write the PrufGate summary
+      if: always() && (inputs.job_summary == 'true' || inputs.pr_comment == 'true') && hashFiles('reports/prufgate.sarif') != ''
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        GITHUB_WORKSPACE: ${{ github.workspace }}
+        PRUFGATE_IMAGE: ${{ inputs.image }}
+        PRUFGATE_BASE_REF: ${{ inputs.base_ref }}
+        GATE_EXIT_CODE: ${{ steps.run-prufgate.outputs.exit_code }}
+        JOB_SUMMARY: ${{ inputs.job_summary }}
+        PR_COMMENT: ${{ inputs.pr_comment }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        # The token reaches this step only when the comment is wanted.
+        PRUFGATE_GITHUB_TOKEN: ${{ inputs.pr_comment == 'true' && inputs.github_token || '' }}
+      run: |
+        set +e
+        # The summary reports the result; the verdict and exit code above stay as they are.
+        ARGS=(pr-summary)
+        [ -n "${GATE_EXIT_CODE}" ] && ARGS+=(--exit-code "${GATE_EXIT_CODE}")
+        if [ "${PR_COMMENT}" = "true" ]; then
+          if [ -n "${PR_NUMBER}" ]; then
+            ARGS+=(--post-comment --pr "${PR_NUMBER}")
+          else
+            echo "::notice::pr_comment is on, but this run is not for a pull request: no comment posted."
+          fi
+        fi
+        SUMMARY_FILE="${RUNNER_TEMP:-/tmp}/prufgate-summary.md"
+        if [ -f "${ACTION_PATH}/prufgate.sh" ] && command -v python3 >/dev/null 2>&1; then
+          python3 "${ACTION_PATH}/prufgate/cli.py" "${ARGS[@]}" "${GITHUB_WORKSPACE}" > "${SUMMARY_FILE}"
+          RC=$?
+        else
+          docker run --rm \
+            -e PRUFGATE_UID="$(id -u)" \
+            -e PRUFGATE_GID="$(id -g)" \
+            -e PRUFGATE_BASE_REF \
+            -e GITHUB_BASE_REF \
+            -e GITHUB_REPOSITORY \
+            -e GITHUB_API_URL \
+            -e PRUFGATE_GITHUB_TOKEN \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            "${PRUFGATE_IMAGE}" python3 /tools/prufgate/prufgate/cli.py "${ARGS[@]}" /workspace > "${SUMMARY_FILE}"
+          RC=$?
+        fi
+        if [ "${JOB_SUMMARY}" = "true" ] && [ -s "${SUMMARY_FILE}" ]; then
+          cat "${SUMMARY_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+        fi
+        if [ "${RC}" -ne 0 ]; then
+          echo "::warning::PrufGate could not write or post its summary (exit ${RC}); the gate result is unchanged. See the log above."
         fi
 
     - name: Upload SARIF to GitHub Code Scanning

@@ -4,7 +4,8 @@
 Everything here exists to keep that contained: the operator's opt-in, a temporary detached worktree of
 the committed HEAD (the user's checkout is never touched), a reduced environment, git with repository
 hooks and fsmonitor off, a timeout that kills the whole process group, a Linux subreaper so no detached
-descendant survives, removal of the worktree on SIGTERM and SIGINT, and pruning of worktrees a killed
+descendant survives (elsewhere, a run marker in the environment of everything the command starts, found
+with `ps` at the end: a process that clears its own environment can escape it), removal of the worktree on SIGTERM and SIGINT, and pruning of worktrees a killed
 (SIGKILL) earlier run left behind. Nothing in `check`, the batteries, the MCP server, the API or the
 hooks may import this module.
 """
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -113,11 +115,52 @@ def _kill_leftovers(keep: set[int]) -> None:
                 pass  # not our child (yet): reparented to us on a later round
 
 
+# Outside Linux there is no subreaper and no /proc: every process the command starts inherits this
+# variable, so one that detached (setsid, double fork) is still found with `ps -E` and killed.
+RUN_MARK_ENV = "PRUFGATE_RUN_MARK"
+
+
+def _marked(mark: str) -> set[int]:
+    """Processes whose environment carries `RUN_MARK_ENV=mark` (BSD/macOS `ps -E`; own user's only)."""
+    try:
+        out = subprocess.run(["ps", "-A", "-E", "-ww", "-o", "pid=,command="], capture_output=True,
+                             text=True, errors="replace", timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    needle = f"{RUN_MARK_ENV}={mark}"
+    found = set()
+    for line in out.splitlines():
+        pid, _, rest = line.strip().partition(" ")
+        if needle in rest.split() and pid.isdigit() and int(pid) != os.getpid():
+            found.add(int(pid))
+    return found
+
+
+def _kill_marked(mark: str) -> None:
+    for _ in range(20):  # bounded rounds, like _kill_leftovers
+        found = _marked(mark)
+        if not found:
+            return
+        for pid in found:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        for pid in found:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                pass  # not our child: launchd or init reaps it
+
+
 def run_command(cmd: list[str], cwd: Path, environ: dict[str, str], timeout: int, log: Path) -> tuple[int, str]:
     """Run `cmd` in its own process group, output to a file (a detached child holding a pipe cannot
     stall us). The whole group dies on timeout, and nothing it started outlives the run.
     Returns (exit code, the last 4000 bytes of output)."""
     keep = _children(os.getpid())
+    mark = None if sys.platform.startswith("linux") else uuid.uuid4().hex
+    if mark:
+        environ = {**environ, RUN_MARK_ENV: mark}
     with open(log, "wb") as out:
         try:
             proc = subprocess.Popen(
@@ -139,6 +182,8 @@ def run_command(cmd: list[str], cwd: Path, environ: dict[str, str], timeout: int
                 proc.kill()
                 proc.wait()
             _kill_leftovers(keep)
+            if mark:
+                _kill_marked(mark)
     with open(log, "rb") as fh:
         fh.seek(max(0, log.stat().st_size - 4000))
         return rc, fh.read().decode("utf-8", "replace")

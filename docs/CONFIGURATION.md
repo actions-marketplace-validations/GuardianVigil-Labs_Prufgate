@@ -151,7 +151,20 @@ known_debt:
     - { path: src/old/client.ts, reason: "#88: replace the old client" }
 ```
 
-**Baseline** (the `prufgate.sh` gate only): `.prufgate/baseline.yaml`, `.yml` or `.json` holds a list, or a mapping under `ignore`, `ignored` or `baseline`, of `{file, rule}` entries (`file_path` and `rule_id` are accepted too; `"*"` in one field matches any value there; an entry needs a real value in at least one field). Rule names are matched case-insensitively against the report's rule IDs, where anti-fabrication rules carry an `anti-fabrication-` prefix. `prufgate check`, the MCP server and the API do not read the baseline. A baseline file that cannot be parsed is ignored, which keeps every finding. In a changed-files run the baseline is read at the base ref, like the configuration.
+**Baseline**: to adopt PrufGate on a codebase that already has findings, record them once and report only new ones:
+
+```bash
+prufgate baseline          # scan the repository and write .prufgate/baseline.yaml
+git add .prufgate/baseline.yaml && git commit -m "PrufGate baseline"
+```
+
+Each entry hides one finding: `{rule, file, fingerprint, line}`. The fingerprint is a hash of the rule and the finding's line with whitespace removed, plus a counter for findings of that rule on identical lines in the file (`<hash>:1`, `<hash>:2`). Lines moving, or code changing elsewhere in the file, do not change it, so the entry keeps matching. A new finding of the same rule in the same file is reported, and so is a baselined finding whose line is edited. `line` is only there for people reading the file.
+
+`prufgate check` (and so the MCP server and the REST API) and the `prufgate.sh` gate all honour the baseline. `prufgate check` prints how many findings it left out, writes them to SARIF as suppressed results, and in a full scan names entries that no longer match any finding. Run `prufgate baseline` again to drop them and to record what is there now; `prufgate baseline --stdout` prints the file instead of writing it. A scan that fails writes nothing. An existing `.prufgate/baseline.yml` or `.json` is rewritten in place.
+
+Hand-written entries work too. The file holds a list, or a mapping under `baseline`, `ignore` or `ignored`, of `{file, rule}` entries (`file_path` and `rule_id` are accepted; `"*"` in one field matches any value there). An entry without a fingerprint hides every finding of that rule in that file. Rule names match case-insensitively, through rule aliases, with or without the gate's `anti-fabrication-` prefix. Findings that guard the gate itself (`prufgate-config-self-exemption`, `prufgate-config-not-applied`, `debt-ceiling-breached`) are never hidden. A baseline file that cannot be parsed is ignored, which keeps every finding, and `prufgate check` says so.
+
+In a changed-files run the baseline is read at the base ref, like the configuration, so a branch cannot baseline its own findings: its baseline applies after merge, and the gate reports each entry it adds as `prufgate-config-self-exemption` (P1) for a maintainer to review. A pull request that adopts a baseline therefore fails the gate once, by design.
 
 Engine 3 reports a diff that adds a new exemption, debt entry or score owner to the PrufGate config itself (`prufgate-config-self-exemption`), so loosening the gate is always visible in review. With a base ref the edit is not applied until merge either way.
 
