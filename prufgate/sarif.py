@@ -19,6 +19,8 @@ import hashlib
 from pathlib import Path
 from typing import Any, Optional
 
+from prufgate.safe_fs import safe_read_bytes
+
 _BLOCK_SIZE = 100
 _MOD = 37
 _MASK = (1 << 64) - 1
@@ -82,7 +84,7 @@ def _read_hashes(root: Path, uri: str) -> Optional[dict[int, str]]:
         path = (base / uri).resolve()
         if not path.is_relative_to(base) or not path.is_file() or path.stat().st_size > _MAX_FILE_BYTES:
             return None
-        return line_hashes(path.read_bytes().decode("utf-8", errors="replace"))
+        return line_hashes(safe_read_bytes(path).decode("utf-8", errors="replace"))
     except (OSError, ValueError):
         return None
 

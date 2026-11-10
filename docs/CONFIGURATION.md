@@ -35,6 +35,7 @@ When a run compares against a base ref (`prufgate check --changed` or `--base`, 
 | `ghost_symbols` | mapping | `{third_party: false}` | `third_party: true` also checks names imported from installed Python packages for `ghost-symbol` (engine 4). CI must install the dependencies first. See [ENGINES.md](ENGINES.md#ghost-symbols). |
 | `enable_low_confidence` | boolean | `false` | Turn on low-confidence rules. See [confidence](#confidence). |
 | `ai_adjudicate` | `true`, `false` or a mapping | `false` | Let an AI provider dismiss low-confidence findings it judges not real. See [AI adjudication](#ai-adjudication). |
+| `enforcement` | mapping | strict P0/P1 enforcement | `mode: strict|advisory|selected`, exact `blocking_rules`, and `minimum_confidence: high|medium|low`. Errors remain fatal and the trusted base policy applies. See [gradual enforcement](REVIEW_WORKFLOW.md#gradual-enforcement). |
 
 Paths in `exclude`, `exempt` and `known_debt` match a file exactly, a directory and everything below it, or a glob (`src/legacy/**`). They never match a substring, so `a.ts` does not cover `data.ts`.
 
@@ -80,7 +81,7 @@ enable_low_confidence: true
 
 ## AI adjudication
 
-Off by default: it sends code to a provider, and it can dismiss findings. Only the configuration turns it on: `ai_adjudicate: true` (or a mapping) turns it on for `prufgate check` and the `prufgate.sh` gate. In a run with a base ref that is the configuration at the base, so a change cannot turn it on for itself. `prufgate check --ai-adjudicate` is a request: without `ai_adjudicate` enabled in the configuration in effect it prints a notice and runs without AI. No environment variable turns it on. The MCP server, the REST API and the agent hooks never call it: `--format agent-hook` and `PRUFGATE_NO_AI_ADJUDICATE` (which they set) switch it off.
+Off by default: it sends code to a provider, and it can dismiss findings. Two conditions are required: `ai_adjudicate: true` (or a mapping) in the trusted configuration, and explicit invocation consent using `check --ai-adjudicate` or `PRUFGATE_ALLOW_EXTERNAL_AI=1`. The Action uses `allow_external_ai: 'true'`. Configuration alone never transmits code. With a base ref, the configuration at the base applies, so a change cannot enable itself. The flag or environment consent alone cannot override disabled configuration. MCP, REST, editor and agent-hook scans disable adjudication. See [scan privacy and destinations](SCAN_RESULTS.md#external-ai-consent-and-destinations).
 
 ```yaml
 ai_adjudicate:
@@ -175,7 +176,7 @@ Engine 3 reports a diff that adds a new exemption, debt entry or score owner to 
 | `PRUFGATE_BASE_REF` | CLI, gate | Base ref for the changed scope. |
 | `GITHUB_BASE_REF` | CLI, gate | Set by GitHub Actions; `origin/<it>` is used when `PRUFGATE_BASE_REF` is not set. |
 | `WORKSPACE` | gate | The repository to scan (default: the current directory, or `/workspace` in the container). |
-| `PRUFGATE_REPORTS_DIR` | gate | Where reports go (default `WORKSPACE/reports`). |
+| `PRUFGATE_REPORTS_DIR` | gate | Where reports go (default `WORKSPACE/reports`). The gate decides on the folder's resolved location: outside the workspace any folder is allowed; inside it only the default `reports` folder, as a real directory, not a symlink. Known limit: the launcher checks the folder and then writes and cleans it in separate steps, so another process that replaces a folder with a symlink between those steps could redirect them. Run the gate where nothing else changes the workspace while it runs, and do not enable `PRUFGATE_ALLOW_REPO_HOOKS` or `PRUFGATE_ALLOW_RUN_TESTS` outside a sandbox or disposable job. |
 | `TARGET_URL` | gate | Base URL for live BOLA probing. |
 | `BOLA_STATIC_ONLY` | gate | `1` skips live probing even when `TARGET_URL` is set. |
 | `PRUFGATE_TEST_PROBE_TOKEN_A`, `_B` | engine 5 | Bearer tokens for live probing. |
@@ -187,12 +188,15 @@ Engine 3 reports a diff that adds a new exemption, debt entry or score owner to 
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OLLAMA_HOST` | engine 6 | Providers for `prufgate review --ai` and AI adjudication. Never written to output. |
 | `PRUFGATE_AI_PROVIDER` | `check`, gate | Provider for AI adjudication (default `auto`). |
 | `PRUFGATE_NO_AI_ADJUDICATE` | `check`, gate | Any value switches AI adjudication off. Set by the MCP server, the REST API and the agent hooks. |
+| `PRUFGATE_ALLOW_EXTERNAL_AI` | `check`, gate | Explicit invocation consent when set to `1`; also requires enabled trusted configuration. The Action controls this with `allow_external_ai`. |
 | `PRUFGATE_API_TOKEN` | API | Bearer token for every scan and report route. Generated and printed once when unset on loopback. |
 | `PRUFGATE_API_HOST` | API | Bind address (default `127.0.0.1`). A non-loopback address needs `PRUFGATE_API_TOKEN`. |
 | `PRUFGATE_WORKSPACE_ROOT` | API | Scans are confined to this directory; anything resolving outside it, including through a symlink, is refused. |
 | `PRUFGATE_DEFAULT_WORKSPACE` | API | Workspace used when a request names none. |
 | `PRUFGATE_WEBHOOK_SECRET` | API | Turns on `/api/v1/webhook`; deliveries must carry a valid GitHub or GitLab signature. |
 | `PRUFGATE_API_MAX_SCANS`, `PRUFGATE_API_SCAN_TIMEOUT` | API | Concurrent scan limit, and seconds per scan (default 600). |
+| `PRUFGATE_API_MAX_CONNECTIONS`, `PRUFGATE_API_HTTP_TIMEOUT` | API | Maximum simultaneous HTTP connections (default 16), and total connection deadline in seconds (default 30). Overload returns 503. |
+| `PRUFGATE_API_MAX_HISTORY`, `PRUFGATE_API_RETENTION_SECONDS` | API | Finished scan history and per-scan artifact retention: maximum 200 records, maximum age 86400 seconds by default. Active scans are retained. |
 | `PRUFGATE_MCP_TIMEOUT` | MCP | Seconds per tool call (default 300). |
 | `PRUFGATE_REGISTRY_CHECK` | engine 4 | `1` turns the registry check on, as `registry_check: true` does. It cannot turn off a check the configuration turns on. |
 | `XDG_CACHE_HOME` | engine 4, adjudication | Where the registry check and AI adjudication keep their caches (`prufgate/registry.json`, `prufgate/adjudicate.json`; default `~/.cache`). |

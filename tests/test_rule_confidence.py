@@ -236,9 +236,9 @@ class TestEverySurface(unittest.TestCase):
         self.assertFalse(res["passed"])
 
     def _api_scan(self) -> dict:
-        sarif = {"runs": [{"results": [
-            {"ruleId": "anti-fabrication-fake-named-data", "properties": {"severity": "P0"}},
-            {"ruleId": "anti-fabrication-unimplemented-production-stub", "properties": {"severity": "P2"}},
+        sarif = {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "fixture"}}, "results": [
+            {"message": {"text": "fixture finding"}, "ruleId": "anti-fabrication-fake-named-data", "properties": {"severity": "P0"}},
+            {"message": {"text": "fixture finding"}, "ruleId": "anti-fabrication-unimplemented-production-stub", "properties": {"severity": "P2"}},
         ]}]}
 
         def fake_run(scan_id, cmd, cwd, env):
@@ -350,7 +350,7 @@ class TestSettingReadAtTheBase(unittest.TestCase):
         self.assertFalse(mcp._result("t", self.ws, low, None, cfg_ref="main")["passed"])
 
     def test_rest_api_reads_the_base_setting(self) -> None:
-        sarif = {"runs": [{"results": [{"ruleId": "anti-fabrication-fake-named-data", "properties": {"severity": "P0"}}]}]}
+        sarif = {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "fixture"}}, "results": [{"message": {"text": "fixture finding"}, "ruleId": "anti-fabrication-fake-named-data", "properties": {"severity": "P0"}}]}]}
 
         def fake_run(scan_id, cmd, cwd, env):
             reports = Path(env["PRUFGATE_REPORTS_DIR"])
@@ -404,8 +404,8 @@ class TestEngineScriptsAndApi(unittest.TestCase):
 
 
     def test_rest_api_does_not_count_an_honoured_inline_ignore(self) -> None:
-        sarif = {"runs": [{"results": [
-            {"ruleId": "unimplemented-production-stub", "properties": {"severity": "P0"},
+        sarif = {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "fixture"}}, "results": [
+            {"message": {"text": "fixture finding"}, "ruleId": "unimplemented-production-stub", "properties": {"severity": "P0"},
              "suppressions": [{"kind": "inSource", "justification": "#1: fine"}]},
         ]}]}
 

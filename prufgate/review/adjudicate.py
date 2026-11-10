@@ -27,8 +27,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from prufgate.config import AiAdjudicate
+from prufgate.privacy import redact
 from prufgate.review import ai_adapter
 from prufgate.rules import HIGH, confidence, listed_confidence
+from prufgate.safe_fs import safe_read_bytes, safe_read_text
 from prufgate.sarif import add_partial_fingerprints
 
 PROMPT_VERSION = "1"
@@ -100,32 +102,7 @@ def addresses_judge(text: str) -> bool:
 EXTERNAL_TOOLS = frozenset({"gitleaks", "zizmor", "ast-grep", "ai-review"})
 
 
-_SECRET_PATTERNS = (
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"),
-    re.compile(r"\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{16,}"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"\bA[KS]IA[0-9A-Z]{16}\b"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
-    re.compile(r"\b(?=[A-Za-z+/_-]*[0-9])[A-Za-z0-9+/_-]{40,}={0,2}"),  # a long identifier is not a key
-)
-_SECRET_ASSIGN_RE = re.compile(
-    r"(?i)((?:secret|token|passw(?:or)?d|pwd|api[_-]?key|private[_-]?key|credential|auth)[A-Za-z0-9_]*"
-    r"[\"']?\s*[:=]\s*[\"'])([^\"'\n]{4,})([\"'])"
-)
-
 Invoke = Callable[[str, str, int], "tuple[bool, str]"]
-
-
-def redact(text: str) -> str:
-    """Remove credential-like values: environment secrets, known token shapes, and
-    string literals assigned to secret-named keys."""
-    text = ai_adapter._redact(text)
-    text = _SECRET_ASSIGN_RE.sub(r"\1[redacted]\3", text)
-    for pat in _SECRET_PATTERNS:
-        text = pat.sub("[redacted]", text)
-    return text
 
 
 def code_window(root: Path, rel: str, line: int, context: int, max_bytes: int) -> Optional[str]:
@@ -138,7 +115,7 @@ def code_window(root: Path, rel: str, line: int, context: int, max_bytes: int) -
         path = (base / rel).resolve()
         if not path.is_relative_to(base) or not path.is_file():
             return None
-        lines = path.read_bytes()[: 8 * 1024 * 1024].decode("utf-8", errors="replace").splitlines()
+        lines = safe_read_bytes(path)[: 8 * 1024 * 1024].decode("utf-8", errors="replace").splitlines()
     except (OSError, ValueError):
         return None
     if not 1 <= line <= len(lines):
@@ -207,7 +184,7 @@ def cache_path() -> Path:
 
 def _load_cache(path: Path) -> dict[str, dict[str, object]]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(safe_read_text(path, encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}

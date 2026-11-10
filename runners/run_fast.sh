@@ -37,7 +37,11 @@ run_step() {
   shift 2
   local t_start rc
   t_start=$(date +%s)
-  "$@" >"${RAW_DIR}/${tool}.log" 2>&1
+  if [ "${1:-}" = python3 ] && [ "${2:-}" = -I ]; then
+    python3 -I "${ENGINE}/engine_runner.py" "${RAW_DIR}/${tool}.coverage.json" "${tool}" "${@:3}" >"${RAW_DIR}/${tool}.log" 2>&1
+  else
+    "$@" >"${RAW_DIR}/${tool}.log" 2>&1
+  fi
   rc=$?
   record_tool_status "${tool}" "${pillar}" "executed" "${rc}" "$(( $(date +%s) - t_start ))" ""
   [ "${rc}" -ge 2 ] && echo "  ✘ ${tool} exited ${rc}: see ${RAW_DIR}/${tool}.log" >&2
@@ -55,7 +59,7 @@ if ! in_git_repo; then
   if [ "${FULL}" -eq 0 ]; then
     record_tool_status "base-ref" "config" "error" 2 0 "not a git repository: the changed scope has nothing to compare (use full)"
   fi
-elif ! BASE_REF="$(python3 "${ENGINE}/cli.py" base-ref "${WORKSPACE}" 2>"${RAW_DIR}/base-ref.log")"; then
+elif ! BASE_REF="$(python3 -I "${ENGINE}/cli.py" base-ref "${WORKSPACE}" 2>"${RAW_DIR}/base-ref.log")"; then
   BASE_REF=""
   DIFF_OK=0
   if [ "${FULL}" -eq 0 ]; then
@@ -68,8 +72,7 @@ if [ "${FULL}" -eq 0 ]; then
   SCOPE_ARGS=("--changed${BASE_REF:+=${BASE_REF}}")
 fi
 DIFF_ARGS=("--changed${BASE_REF:+=${BASE_REF}}")
-# The reviewer diffs <base>...HEAD; with no base, HEAD...HEAD is empty and it
-# falls back to the working-tree diff.
+# The reviewer compares the working tree with the merge base, including untracked files.
 REVIEW_ARGS=("--base=${BASE_REF:-HEAD}")
 # The synthesizer reads the configuration and baseline at the same base ref (an
 # empty file means HEAD). A full scan in a git repository does too, so a branch
@@ -84,7 +87,7 @@ fi
 export PRUFGATE_CHANGED_FILES=""
 if [ "${FULL}" -eq 0 ] && [ "${DIFF_OK}" -eq 1 ]; then
   PRUFGATE_CHANGED_FILES="${RAW_DIR}/changed_files.txt"
-  if ! python3 "${ENGINE}/diff_scope.py" "--base=${BASE_REF}" --json-out="${RAW_DIR}/changed_lines.json" \
+  if ! python3 -I "${ENGINE}/diff_scope.py" "--base=${BASE_REF}" --json-out="${RAW_DIR}/changed_lines.json" \
       >"${PRUFGATE_CHANGED_FILES}" 2>"${RAW_DIR}/diff-scope.log"; then
     record_tool_status "diff-scope" "config" "error" 2 0 "$(tr '\n' ' ' <"${RAW_DIR}/diff-scope.log")"
   fi
@@ -100,20 +103,22 @@ fi
 # Optional secret scan
 if command -v gitleaks >/dev/null 2>&1; then
   echo "  Running gitleaks secret scan..."
-  if in_git_repo && [ -n "${PRUFGATE_CHANGED_FILES}" ]; then
+  if ! GITLEAKS_CONFIG="$(gitleaks_config)"; then
+    record_tool_status "gitleaks" "security" "error" 2 0 "could not prepare trusted Gitleaks configuration"
+  elif in_git_repo && [ -n "${PRUFGATE_CHANGED_FILES}" ]; then
     # Changed scope: the branch's commits, and uncommitted edits (line-scoped later).
     if [ -n "${BASE_REF}" ]; then
-      run_step gitleaks security gitleaks git --no-banner --log-opts="${BASE_REF}..HEAD" --config "$(gitleaks_config)" --report-format json --report-path "${RAW_DIR}/gitleaks.json"
+      run_step gitleaks security gitleaks git --redact=100 --no-banner --log-opts="${BASE_REF}..HEAD" --config "${GITLEAKS_CONFIG}" --report-format json --report-path "${RAW_DIR}/gitleaks.json"
     else
       echo "[]" >"${RAW_DIR}/gitleaks.json"
     fi
     if [ -n "$(git -C "${WORKSPACE}" -c core.hooksPath=/dev/null -c core.fsmonitor=false status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
-      run_step gitleaks-worktree security gitleaks dir --no-banner --config "$(gitleaks_config)" --report-format json --report-path "${RAW_DIR}/gitleaks_worktree.json" .
+      run_step gitleaks-worktree security gitleaks dir --redact=100 --no-banner --config "${GITLEAKS_CONFIG}" --report-format json --report-path "${RAW_DIR}/gitleaks_worktree.json" .
     fi
   elif in_git_repo; then
-    run_step gitleaks security gitleaks git --no-banner --config "$(gitleaks_config)" --report-format json --report-path "${RAW_DIR}/gitleaks.json"
+    run_step gitleaks security gitleaks git --redact=100 --no-banner --config "${GITLEAKS_CONFIG}" --report-format json --report-path "${RAW_DIR}/gitleaks.json"
   else
-    run_step gitleaks security gitleaks detect --no-git --config "$(gitleaks_config)" --report-format json --report-path "${RAW_DIR}/gitleaks.json"
+    run_step gitleaks security gitleaks detect --redact=100 --no-git --config "${GITLEAKS_CONFIG}" --report-format json --report-path "${RAW_DIR}/gitleaks.json"
   fi
 else
   record_tool_status "gitleaks" "security" "skipped" 0 0 "gitleaks binary not found"
@@ -134,14 +139,14 @@ fi
 
 if [ "${CHANGED_ENGINES}" -eq 1 ]; then
 echo "  [Engine 1/6] Production anti-fabrication..."
-run_step anti-fabrication security python3 "${ENGINE}/anti_fabrication/detector.py" ${SCOPE_ARGS[@]+"${SCOPE_ARGS[@]}"} --json-out="${RAW_DIR}/anti_fabrication.json"
+run_step anti-fabrication security python3 -I "${ENGINE}/anti_fabrication/detector.py" ${SCOPE_ARGS[@]+"${SCOPE_ARGS[@]}"} --json-out="${RAW_DIR}/anti_fabrication.json"
 
 echo "  [Engine 2/6] Test integrity & anti-reward-hacking..."
-run_step test-integrity qa python3 "${ENGINE}/anti_reward_hacking/test_integrity.py" ${SCOPE_ARGS[@]+"${SCOPE_ARGS[@]}"} --json-out="${RAW_DIR}/test_integrity.json"
+run_step test-integrity qa python3 -I "${ENGINE}/anti_reward_hacking/test_integrity.py" ${SCOPE_ARGS[@]+"${SCOPE_ARGS[@]}"} --json-out="${RAW_DIR}/test_integrity.json"
 
 echo "  [Engine 3/6] Diff tampering guard..."
 if [ "${DIFF_OK}" -eq 1 ]; then
-  run_step diff-guard security python3 "${ENGINE}/diff_guard/tamper_detector.py" "${DIFF_ARGS[@]}" --json-out="${RAW_DIR}/diff_guard.json"
+  run_step diff-guard security python3 -I "${ENGINE}/diff_guard/tamper_detector.py" "${DIFF_ARGS[@]}" --json-out="${RAW_DIR}/diff_guard.json"
 else
   skip_step diff-guard security "no git diff to check (not a git repository, or no base ref)"
 fi
@@ -150,7 +155,7 @@ fi
 echo "  [Engine 4/6] Ghost dependency, API contract & env drift guard..."
 CG_ARGS=()
 [ "${SCAN_SCOPE}" = "changed" ] && CG_ARGS=("--changed${BASE_REF:+=${BASE_REF}}")
-run_step contract-guard security python3 "${ENGINE}/contract_guard/__init__.py" ${CG_ARGS[@]+"${CG_ARGS[@]}"} --workspace="${WORKSPACE}" --json-out="${RAW_DIR}/contract_guard.json"
+run_step contract-guard security python3 -I "${ENGINE}/contract_guard/__init__.py" ${CG_ARGS[@]+"${CG_ARGS[@]}"} --workspace="${WORKSPACE}" --json-out="${RAW_DIR}/contract_guard.json"
 
 echo "  [Engine 5/6] Multi-tenant BOLA / IDOR..."
 # Static checks always; the live two-token probe only when TARGET_URL is set.
@@ -163,12 +168,12 @@ fi
 [ "${FULL}" -eq 0 ] && [ -n "${BASE_REF}" ] && BOLA_ARGS+=("--base=${BASE_REF}")
 # Only the changed route, action and migration files.
 [ -n "${PRUFGATE_CHANGED_FILES}" ] && BOLA_ARGS+=("--changed")
-bola_json() { python3 "${ENGINE}/cli.py" bola "${WORKSPACE}" "${BOLA_ARGS[@]}" --format json >"${RAW_DIR}/bola_matrix.json"; }
+bola_json() { python3 -I "${ENGINE}/cli.py" bola "${WORKSPACE}" "${BOLA_ARGS[@]}" --format json >"${RAW_DIR}/bola_matrix.json"; }
 run_step bola-matrix security bola_json
 
 echo "  [Engine 6/6] Diff reviewer..."
 if [ "${DIFF_OK}" -eq 1 ]; then
-  run_step pr-reviewer quality python3 "${ENGINE}/review/reviewer.py" --workspace="${WORKSPACE}" "${REVIEW_ARGS[@]}" --output-json="${RAW_DIR}/pr_review.json" --output-md="${RAW_DIR}/pr_review.md"
+  run_step pr-reviewer quality python3 -I "${ENGINE}/review/reviewer.py" --workspace="${WORKSPACE}" "${REVIEW_ARGS[@]}" --output-json="${RAW_DIR}/pr_review.json" --output-md="${RAW_DIR}/pr_review.md"
 elif [ "${FULL}" -eq 1 ]; then
   skip_step pr-reviewer quality "no git diff to review (not a git repository, or no base ref)"
 fi

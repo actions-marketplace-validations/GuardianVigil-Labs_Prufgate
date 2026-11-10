@@ -38,6 +38,7 @@ from typing import Any, Iterator
 import yaml
 
 from prufgate.config import expand_rule_aliases
+from prufgate.process import git_command
 
 CATEGORIES = (
     "fabrication",
@@ -54,8 +55,7 @@ CATEGORIES = (
     "clean",
 )
 _SECTION = re.compile(r"^-- (\S+) --$")
-_GIT = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
-        "-c", "diff.ignoreSubmodules=all", "-c", "user.name=bench", "-c", "user.email=bench@example.com", "-c", "init.defaultBranch=main"]
+_GIT = git_command("-c", "commit.gpgsign=false", "-c", "diff.ignoreSubmodules=all", "-c", "user.name=bench", "-c", "user.email=bench@example.com", "-c", "init.defaultBranch=main")
 
 
 class CaseError(ValueError):
@@ -165,9 +165,11 @@ def _commit(root: Path, msg: str) -> str:
     return subprocess.run([*_GIT, "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
 
 
-def fired_rules(case: dict[str, Any]) -> set[str]:
+def fired_rules(case: dict[str, Any], profile: str = "core") -> set[str]:
     """Rules that `check --changed --base <base>` reports on the case."""
     from prufgate.cli import _collect_unified_findings
+    if profile not in ("core", "review"):
+        raise CaseError("unsupported evaluation profile")
 
     with tempfile.TemporaryDirectory(prefix="prufgate-bench-") as tmp:
         root = Path(tmp)
@@ -177,7 +179,13 @@ def fired_rules(case: dict[str, Any]) -> set[str]:
         _write_tree(root, case["head"])
         _commit(root, "head")
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            findings = _collect_unified_findings(root, changed_only=True, base_ref=base)
+            if profile == "review":
+                from prufgate.review.reviewer import get_git_diff, run_hybrid_review
+                from prufgate.rules import review_rule_id
+                comments = run_hybrid_review(get_git_diff(base, root, strict=True), enable_ai=False)
+                findings = [{"rule": review_rule_id(c.title)} for c in comments]
+            else:
+                findings = _collect_unified_findings(root, changed_only=True, base_ref=base)
     return {str(f["rule"]) for f in findings}
 
 

@@ -369,8 +369,10 @@ class BolaBugs(unittest.TestCase):
                 bola_engine.main,
                 [f"--workspace={ws}", f"--output={out}", "--target-url=http://127.0.0.1:9", "--id-a=a", "--id-b=b"],
             )
-            self.assertEqual(rc, 1)
-            self.assertEqual(len(json.loads(out.read_text())), 1)
+            self.assertEqual(rc, 2)
+            report = json.loads(out.read_text())
+            self.assertEqual(report["status"], "incomplete")
+            self.assertEqual(len(report["findings"]), 1)
             self.assertEqual(_quiet(bola_engine.main, [f"--workspace={ws}/nope", f"--output={out}"]), 2)
 
     def test_no_live_probe_without_explicit_target(self) -> None:
@@ -431,11 +433,12 @@ class BolaBugs(unittest.TestCase):
         ) as opener:
             opener.return_value.open.side_effect = OSError("offline")
             out = io.StringIO()
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out), self.assertRaises(bola_engine.ProbeIncomplete) as caught:
                 bola_engine.run_dynamic_matrix("http://127.0.0.1:1")
             for call in opener.return_value.open.call_args_list:
                 self.assertIsNone(call.args[0].headers.get("Authorization"))
-            self.assertIn("token", out.getvalue().lower())
+            self.assertIn("token", str(caught.exception).lower())
+            opener.return_value.open.assert_not_called()
 
     def test_server_action_files_anywhere_and_arrow_exports(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -540,6 +543,10 @@ class ReviewerBugs(unittest.TestCase):
                 {"file": "/etc/passwd", "line": 1, "severity": "P0", "title": "[AI] x", "message": "m", "suggestion": None},
             ],
         )
+        with mock.patch.object(reviewer, "review_diff_with_ai", return_value=fake):
+            with self.assertRaisesRegex(reviewer.DiffUnavailableError, "outside the reviewed changed lines"):
+                reviewer.run_hybrid_review(diff, enable_ai=True)
+        fake.comments = fake.comments[:1]
         with mock.patch.object(reviewer, "review_diff_with_ai", return_value=fake):
             comments = reviewer.run_hybrid_review(diff, enable_ai=True)
         self.assertEqual([(c.file_path, c.line) for c in comments], [("src/a.ts", 2)])

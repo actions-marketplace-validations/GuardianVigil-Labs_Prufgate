@@ -1,0 +1,20 @@
+-- label.yaml --
+category: clean
+description: Syntax and control flow example dead-branch
+must_fire: []
+must_not_fire: [canned-error-fallback]
+evaluation:
+  origin: synthetic
+  language: python
+  framework: none
+  author: maintainer-role
+  reviewers: []
+  split: regression
+-- head/app.py --
+def run():
+    try:
+        return calculate()
+    except ValueError:
+        if False:
+            return {"ok": True}
+        raise

@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,9 +20,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+
 from prufgate import cli  # noqa: E402
 from prufgate.config import ConfigError, PrufGateConfig, path_matches_pattern  # noqa: E402
 from prufgate.hooks.agent_hooks import HOOK_COMMAND, HookConfigError, init_workspace  # noqa: E402
+from tests.support import installed_python
 
 # Hermetic: CI exports these on pull requests; a test that needs a base ref sets it.
 for _ci_var in ("GITHUB_BASE_REF", "PRUFGATE_BASE_REF"):
@@ -155,6 +158,15 @@ class Gate(unittest.TestCase):
         findings = json.loads((self.ws / "reports" / "raw" / "anti_fabrication.json").read_text())
         self.assertTrue(any(f["file"].endswith("users.ts") for f in findings))
 
+    def test_workspace_under_a_symlinked_parent_is_scanned(self):
+        # macOS /tmp and /home -> /var/home put a link above the workspace; it is not the repository's.
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "link"
+            link.symlink_to(self.ws.parent)
+            proc = run_gate(self.ws, "fast", str(link / self.ws.name))
+            self.assertEqual(proc.returncode, 1, proc.stdout[-2000:] + proc.stderr[-2000:])
+            self.assertTrue((self.ws / "reports" / "prufgate.sarif").stat().st_size > 0)
+
     def test_github_base_ref_is_used(self):
         git(self.ws, "update-ref", "refs/remotes/origin/main", "main")
         proc = run_gate(self.ws, "fast", str(self.ws), env={"GITHUB_BASE_REF": "main"})
@@ -227,6 +239,75 @@ class Gate(unittest.TestCase):
             keep.parent.mkdir()
             keep.write_text("keep")
             (self.ws / "reports").symlink_to(outside)
+            proc = run_gate(self.ws, "fast", str(self.ws))
+            self.assertEqual(proc.returncode, 2)
+            self.assertTrue(keep.exists())
+
+    def test_reports_dir_with_a_trailing_slash_or_dot_dot_is_refused(self):
+        # `[ -L dir/ ]` follows the link, so a trailing slash bypassed the symlink refusal.
+        with tempfile.TemporaryDirectory() as outside:
+            keep = Path(outside) / "raw" / "keep.txt"
+            keep.parent.mkdir()
+            keep.write_text("keep")
+            (self.ws / "reports").symlink_to(outside)
+            for value in (f"{self.ws}/reports/", f"{self.ws}/x/../reports"):
+                with self.subTest(value=value):
+                    proc = run_gate(self.ws, "fast", str(self.ws), env={"PRUFGATE_REPORTS_DIR": value})
+                    self.assertEqual(proc.returncode, 2)
+                    self.assertIn("PRUFGATE_REPORTS_DIR", proc.stderr)
+                    self.assertTrue(keep.exists())
+
+    def test_reports_dir_through_a_workspace_symlink_is_refused(self):
+        # `[ -L reports/. ]` does not see the link, and a link in a parent directory
+        # was never checked: both wrote reports outside the workspace.
+        (self.ws / "nested").mkdir()
+        for link, value in (("reports", f"{self.ws}/reports/."), ("nested/out", f"{self.ws}/nested/out/reports"),
+                            # A doubled leading slash once skipped the symlink walk.
+                            ("nested/out", f"/{self.ws}/nested/out/reports"), ("reports", "reports/.")):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as outside:
+                keep = Path(outside) / "raw" / "keep.txt"
+                keep.parent.mkdir()
+                keep.write_text("keep")
+                (Path(outside) / "reports" / "raw").mkdir(parents=True)
+                before = sorted(p.relative_to(outside) for p in Path(outside).rglob("*"))
+                (self.ws / link).symlink_to(outside)
+                try:
+                    proc = run_gate(self.ws, "fast", str(self.ws), env={"PRUFGATE_REPORTS_DIR": value})
+                finally:
+                    (self.ws / link).unlink()
+                self.assertEqual(proc.returncode, 2)
+                self.assertTrue(keep.exists())
+                self.assertEqual(sorted(p.relative_to(outside) for p in Path(outside).rglob("*")), before)
+
+    def test_reports_dir_inside_the_workspace_must_be_the_default(self):
+        for value in (f"{self.ws}/out", f"{self.ws}/reports/sub", "out", str(self.ws)):
+            with self.subTest(value=value):
+                proc = run_gate(self.ws, "fast", str(self.ws), env={"PRUFGATE_REPORTS_DIR": value})
+                self.assertEqual(proc.returncode, 2)
+                self.assertIn("must be", proc.stderr)
+                self.assertFalse((self.ws / "out").exists())
+
+    def test_default_reports_dir_spelled_otherwise_is_used(self):
+        for value in (f"{self.ws}/reports", f"/{self.ws}/reports/", "reports"):
+            with self.subTest(value=value):
+                proc = run_gate(self.ws, "fast", str(self.ws), env={"PRUFGATE_REPORTS_DIR": value})
+                self.assertEqual(proc.returncode, 1, proc.stdout[-2000:] + proc.stderr[-2000:])
+                self.assertTrue((self.ws / "reports" / "prufgate.sarif").stat().st_size > 0)
+
+    def test_reports_dir_outside_the_workspace_is_used(self):
+        with tempfile.TemporaryDirectory() as outside:
+            reports = Path(outside) / "a" / "reports"
+            proc = run_gate(self.ws, "fast", str(self.ws), env={"PRUFGATE_REPORTS_DIR": str(reports)})
+            self.assertEqual(proc.returncode, 1, proc.stdout[-2000:] + proc.stderr[-2000:])
+            self.assertTrue((reports / "prufgate.sarif").stat().st_size > 0)
+            self.assertFalse((self.ws / "reports").exists())
+
+    def test_symlinked_raw_dir_is_refused(self):
+        with tempfile.TemporaryDirectory() as outside:
+            keep = Path(outside) / "keep.txt"
+            keep.write_text("keep")
+            (self.ws / "reports").mkdir()
+            (self.ws / "reports" / "raw").symlink_to(outside)
             proc = run_gate(self.ws, "fast", str(self.ws))
             self.assertEqual(proc.returncode, 2)
             self.assertTrue(keep.exists())
@@ -411,13 +492,16 @@ class Hooks(unittest.TestCase):
     @unittest.skipUnless(shutil.which("sh"), "needs sh")
     @unittest.skipIf(sys.platform == "win32", "links a POSIX python3; test_shell_guard covers Windows' python")
     def test_hook_falls_back_to_the_module_without_prufgate_on_path(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as install:
             git(Path(tmp), "init", "-q")
             git(Path(tmp), "commit", "-q", "--allow-empty", "-m", "init")
             env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(ROOT), "HOME": tmp}
             fake = Path(tmp) / "bin"
             fake.mkdir()
-            (fake / "python3").symlink_to(sys.executable)
+            python = installed_python(Path(install) / "venv")
+            launcher = fake / "python3"
+            launcher.write_text("#!/bin/sh\nexec " + shlex.quote(str(python)) + ' "$@"\n')
+            launcher.chmod(0o755)
             env["PATH"] = f"{fake}:/usr/bin:/bin"
             proc = subprocess.run(["sh", "-c", HOOK_COMMAND], cwd=tmp, env=env, capture_output=True, text=True, input="{}")
             self.assertEqual(proc.returncode, 0, proc.stderr)

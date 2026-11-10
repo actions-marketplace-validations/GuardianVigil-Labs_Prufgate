@@ -169,15 +169,16 @@ class RoutesFromCli(unittest.TestCase):
             return real_open(director, req, *a, **kw)
 
         err = io.StringIO()
+        probe_env = {"PRUFGATE_BOLA_PATHS": "/api/known", "PRUFGATE_TEST_PROBE_TOKEN_A": "fixture-alpha", "PRUFGATE_TEST_PROBE_TOKEN_B": "fixture-bravo", **(env or {})}
         with patch.object(urllib.request.OpenerDirector, "open", spy), \
-                patch.dict(os.environ, env or {"PRUFGATE_BOLA_PATHS": "/api/known"}), \
+                patch.dict(os.environ, probe_env), \
                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             rc = cli_main(["bola", str(self.ws), "--url", self.url, *extra])
         return rc, err.getvalue(), opened
 
     def test_paths_join_onto_url_and_file_host_is_never_contacted(self) -> None:
         rc, err, opened = self._run("--routes-from", self._file("s.har", HAR), "--routes-from", self._file("c.json", POSTMAN))
-        self.assertEqual(rc, 0, err)
+        self.assertEqual(rc, 2, err)
         self.assertIn("/api/me", self.hits)
         self.assertIn("/api/health", self.hits)
         self.assertIn("/api/items", self.hits)
@@ -191,29 +192,30 @@ class RoutesFromCli(unittest.TestCase):
                "PRUFGATE_TEST_PROBE_TOKEN_A": "probe_a", "PRUFGATE_TEST_PROBE_TOKEN_B": "probe_b",
                "PRUFGATE_TEST_PROBE_TENANT_B_ID": "tenant-b-2222"}
         rc, err, _ = self._run("--routes-from", self._file("c.json", POSTMAN), env=env)
-        self.assertEqual(rc, 0, err)
+        self.assertEqual(rc, 2, err)
         self.assertIn("/api/items/tenant-b-2222", self.hits)
 
     def test_dedupe_against_known_paths(self) -> None:
         har = {"log": {"entries": [{"request": {"method": "GET", "url": "https://app.example.com/api/known"}},
                                    {"request": {"method": "GET", "url": "https://app.example.com/api/known"}}]}}
         rc, err, _ = self._run("--routes-from", self._file("d.har", har))
-        self.assertEqual(rc, 0, err)
+        self.assertEqual(rc, 2, err)
         self.assertEqual(self.hits.count("/api/known"), 1)
 
     def test_cap(self) -> None:
         har = {"log": {"entries": [{"request": {"method": "GET", "url": f"https://app.example.com/api/r{i}"}}
                                    for i in range(5)]}}
         err_buf = io.StringIO()
-        with patch.dict(os.environ, {"PRUFGATE_BOLA_PATHS": "/api/known"}), \
+        with patch.dict(os.environ, {"PRUFGATE_BOLA_PATHS": "/api/known", "PRUFGATE_TEST_PROBE_TOKEN_A": "fixture-alpha", "PRUFGATE_TEST_PROBE_TOKEN_B": "fixture-bravo"}), \
                 contextlib.redirect_stdout(err_buf), contextlib.redirect_stderr(io.StringIO()):
-            bola_engine.run_dynamic_matrix(self.url, extra_paths=load_route_paths(self._file("c.har", har))[0],
+            with self.assertRaises(bola_engine.ProbeIncomplete) as caught:
+                bola_engine.run_dynamic_matrix(self.url, extra_paths=load_route_paths(self._file("c.har", har))[0],
                                            max_extra_paths=2)
         self.assertEqual(sorted(h for h in self.hits if h.startswith("/api/r")), ["/api/r0", "/api/r1"])
-        self.assertIn("3 over the --max-routes cap", err_buf.getvalue())
+        self.assertIn("--max-routes", str(caught.exception))
         self.hits.clear()
         rc, err, _ = self._run("--routes-from", self._file("c.har", har), "--max-routes", "3")
-        self.assertEqual(rc, 0, err)
+        self.assertEqual(rc, 2, err)
         self.assertEqual(len([h for h in self.hits if h.startswith("/api/r")]), 3)
 
     def test_malformed_file_exits_2(self) -> None:

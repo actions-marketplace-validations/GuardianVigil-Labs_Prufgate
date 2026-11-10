@@ -1,8 +1,10 @@
 # CI and agent integration
 
+Use the [documentation index](README.md) for the full guide set. Detailed [API](API.md), [MCP](MCP.md), [review workflow](REVIEW_WORKFLOW.md) and [upgrade](UPGRADING.md) references cover current checkout features and installation compatibility.
+
 ## GitHub Actions: the composite action
 
-This repository is a composite action. It runs the `prufgate.sh` gate with the runner's `python3`, uploads the SARIF report to code scanning, and fails the job on P0/P1 findings or on an error.
+This repository is a composite action. It runs the `prufgate.sh` gate natively or in a container, uploads the SARIF report to code scanning, and fails the job on P0/P1 findings or on an error.
 
 ```yaml
 name: PrufGate
@@ -22,10 +24,10 @@ jobs:
         with:
           fetch-depth: 0                      # the base branch must be present
           persist-credentials: false
-      - run: python3 -m pip install "PyYAML>=6.0"   # needed to read .prufgate/config.yaml
       - uses: GuardianVigil-Labs/Prufgate@<commit-sha>
         with:
           battery: fast            # fast (changed files) or full
+          execution: container     # use the release image with all dependencies
           fail_on_blocker: 'true'
           sarif_upload: 'true'
 ```
@@ -33,18 +35,25 @@ jobs:
 | Input | Default | Meaning |
 |---|---|---|
 | `battery` | `fast` | `fast` scans what the pull request changed; `full` (alias `review`) scans everything; `bola` and `test-audit` run one engine. |
+| `profile` | `battery` | `core` matches Engines 1–5 from CLI check, MCP fast scan, API core and editor scans. `battery` adds diff review and external scanners. |
+| `allow_external_ai` | `false` | Explicitly consent to AI adjudication, also requiring trusted enabled configuration. Destinations and content are described in [scan privacy](SCAN_RESULTS.md#external-ai-consent-and-destinations). |
 | `base_ref` | the pull request base | Ref that changed files are compared with. On pull requests `origin/$GITHUB_BASE_REF` is used automatically. |
 | `target_url` | none | Base URL for live BOLA probing of a service the job starts. Pass the tokens as `PRUFGATE_TEST_PROBE_TOKEN_A` / `_B` in `env`. |
-| `fail_on_blocker` | `true` | Fail the step on a FAILED or ERROR verdict. |
+| `fail_on_blocker` | `true` | Fail on blocking findings. With `false`, findings remain FAILED but do not fail the step. Execution errors always fail the step with ERROR. |
 | `sarif_upload` | `true` | Upload `reports/prufgate.sarif` to code scanning (skipped when no report was written). |
-| `image` | `ghcr.io/guardianvigil-labs/prufgate:1.3.0` | Only used when the runner has no `python3`: the signed release image of this version, or an image you built. |
+| `execution` | `auto` | `native` validates the runner's dependencies; `container` always uses `image`; `auto` selects native only when all required dependencies are present, otherwise container. |
+| `image` | `ghcr.io/guardianvigil-labs/prufgate:1.4.0` | Container image. Set `execution: container` to force an image you built even when Python is installed. |
 | `job_summary` | `true` | Write a short summary of the run to the job summary page: see [the run summary](#the-run-summary-and-pull-request-comment). |
 | `pr_comment` | `false` | Keep the same summary as one pull request comment, updated on every run. Needs `pull-requests: write`. |
+| `github_checks` | `false` | Publish a separate Check Run with changed-line annotations, coverage and next actions. Requires `checks: write`; fork PR publication is skipped. |
+| `checks_token` | `github.token` | Token used only by the opted-in Checks publishing step. |
 | `github_token` | `github.token` | Token for the pull request comment. Passed to the summary step only when `pr_comment` is `true`. |
 
-Outputs: `verdict` (`PASSED` or `FAILED`), `exit_code` (`0`, `1` or `2`), `sarif_path`, `markdown_path`.
+Outputs: `scan_status` (`clean`, `findings`, `incomplete`, `error`), `result_path` (versioned JSON), compatibility `verdict` (`PASSED`, `FAILED` or `ERROR`), `exit_code` (`0`, `1` or `2`), `execution_mode`, `sarif_path`, and `markdown_path`. Native core mode requires Python 3.9+, PyYAML, tomli on Python 3.9/3.10, and Git; battery mode also requires Gitleaks, ast-grep (`sg`), and zizmor. Container mode requires Docker (a Linux runner such as `ubuntu-latest`; macOS and Windows runners have no Docker) and an image from the same PrufGate version as the action. The default `image` is the signed release image of the action's own version, so an action pinned to a release tag works as is; an action pinned to an unreleased commit needs `image:` set to an image built from that commit, or `execution: native` with the dependencies installed, otherwise the run stops with an error because the older image writes no versioned scan status. The `execution`, `profile` and `allow_external_ai` inputs are not in the published 1.3.0 action; with 1.3.0, install PyYAML on the runner as the README shows. Missing dependencies or missing result metadata are errors; `fail_on_blocker: false` cannot suppress them. Previous result artifacts are cleared before execution. See [consistent scan results](SCAN_RESULTS.md).
 
 ### The run summary and pull request comment
+
+See [the developer and PR workflow](REVIEW_WORKFLOW.md) for reviewed dismissals, gradual enforcement, Check Run previews/publication, and new-versus-existing finding comparisons using `--previous-sarif`.
 
 After the gate, the action writes a short summary to the job summary page. It shows:
 
@@ -76,7 +85,7 @@ Every SARIF result PrufGate writes (the gate report, `prufgate check --format sa
 
 A finding without a readable file or line (a live BOLA target, a path outside the scanned folder) gets a fallback built from its rule, path and message, so it is still stable between runs.
 
-The gate's optional tools (ast-grep, gitleaks, zizmor) are skipped if they are not on the runner; install them in an earlier step if you want those checks.
+When running `prufgate.sh` directly, ast-grep, Gitleaks and zizmor are optional and skipped if absent. The composite action validates these dependencies so its native and container modes provide the same scanner coverage.
 
 Do not set `PRUFGATE_ALLOW_REPO_HOOKS=1` in workflows that run on pull requests from forks: it runs scripts from the pull request.
 
@@ -135,7 +144,7 @@ This repository is a [pre-commit](https://pre-commit.com) hook repository (pre-c
 ```yaml
 repos:
   - repo: https://github.com/GuardianVigil-Labs/Prufgate
-    rev: v1.3.0
+    rev: v1.4.0
     hooks:
       - id: prufgate
       - id: prufgate-full
@@ -213,7 +222,7 @@ Ten tools, all read-only. They write nothing into the workspace.
 | `prufgate_summary` | A summary of the last report in `reports/` |
 | `prufgate_explain` | What a rule catches and how to fix it (`rule`; reads no workspace) |
 
-Arguments: `workspace_path`, `base_ref`, `changed_only`, `target_url` (and `rule` for `prufgate_explain`). Each result has `status` (`ok` or `error`), `passed`, `blockers` and `findings`. An engine that fails sets `isError`; it never comes back as `passed: true`.
+Arguments include `workspace_path`, applicable `base_ref`, `changed_only` and `target_url`, and `rule` for `prufgate_explain`; discover exact per-tool schemas with `tools/list`. Results retain compatibility `status: ok|error` and expose the common `scan_status`, `exit_code`, coverage and policy decisions. Incomplete/error tools set `isError` and cannot be reported as a pass. The full tool is `core+review`, not the external-scanner battery. See [MCP](MCP.md).
 
 ## REST API
 
@@ -222,10 +231,19 @@ Arguments: `workspace_path`, `base_ref`, `changed_only`, `target_url` (and `rule
 | Route | Purpose |
 |---|---|
 | `GET /api/v1/health` | Health check (no token). |
-| `POST /api/v1/scan` | Start a scan: `{"workspace": "...", "battery": "fast|check|review|full"}`. |
+| `POST /api/v1/scan` | Start a scan: `{"workspace": "...", "battery": "fast|check|review|full", "profile": "core|battery"}`. |
 | `GET /api/v1/scans/{id}` | Scan status and verdict (`PASSED`, `FAILED` or `ERROR`). |
+| `DELETE /api/v1/scans/{id}` | Cancel an active scan or delete a finished scan and its per-scan artifacts. |
 | `GET /api/v1/scans/{id}/sarif`, `/report` | The SARIF and Markdown reports. |
 | `POST /api/v1/webhook` | Signed GitHub or GitLab webhook (only when `PRUFGATE_WEBHOOK_SECRET` is set). |
 | `GET /docs`, `/openapi.json` | API documentation. |
 
-Every route except health needs `Authorization: Bearer $PRUFGATE_API_TOKEN`. Scans are confined to `PRUFGATE_WORKSPACE_ROOT`. From a checkout, a scan runs the `prufgate.sh` gate; from a pip install it runs `prufgate check --format sarif` (engines 1 to 5, SARIF only). The security model is in [SECURITY.md](../SECURITY.md#running-prufgate-safely), and the variables are in [CONFIGURATION.md](CONFIGURATION.md#environment-variables).
+Scan submission, list/status, cancellation and artifacts require `Authorization: Bearer $PRUFGATE_API_TOKEN`; health and schema/docs routes are public, while webhooks use their own signature secret. Scans are confined to `PRUFGATE_WORKSPACE_ROOT`. The core profile uses the common Python scanner; checkout battery scans include additional engines/tools, while an installed-package fallback can have narrower coverage. Inspect the actual profile/coverage. See the [API reference](API.md), [security model](../SECURITY.md#running-prufgate-safely) and [environment variables](CONFIGURATION.md#environment-variables).
+
+Set `profile: core` for equivalent CLI/MCP/editor scans and versioned coverage metadata with either installation. `scan_status` is separate from the API's job lifecycle `status`. Completed responses include explainable findings, coverage, privacy metadata, errors and incomplete reasons. The core profile is static; a live `target_url` requires the battery profile.
+
+On POSIX, cancellation and timeout terminate the scan's process group, escalate to SIGKILL after a one-second grace period, and reap the scan process before dropping its registration. On Windows the scan process is terminated and reaped. A cancelled scan cannot publish a new shared report. Only an explicit request `target_url` enables live probes; an inherited `TARGET_URL` does not.
+
+The server permits 16 simultaneous HTTP connections by default; excess connections receive 503. Each connection has a 30-second total deadline, including headers and body, so sending occasional bytes cannot hold a request thread indefinitely. Synchronous scans must finish within this connection deadline; use asynchronous scans for longer work, or increase `PRUFGATE_API_HTTP_TIMEOUT`.
+
+Finished scan history and its per-scan artifacts are limited to 200 records and 24 hours by default. Cleanup runs on scan submission, completion and periodic server maintenance. Orphaned UUID report directories from a previous server run are reclaimed when that workspace is next scanned. Active scans are excluded; filesystem links are never followed during cleanup. The shared latest validated report remains available separately in `reports/`.

@@ -29,7 +29,7 @@ case "${1:-fast}" in
   fast|check|review|full|all|bola|test-audit|test|init|mcp|api|--self-check|--version)
     exec "${AS_USER[@]}" /tools/prufgate/prufgate.sh "${@:-fast}" ;;
   --help|-h|help)
-    exec "${AS_USER[@]}" python3 /tools/prufgate/prufgate/cli.py --help ;;
+    exec "${AS_USER[@]}" python3 -I /tools/prufgate/prufgate/cli.py --help ;;
   *)
     exec "${AS_USER[@]}" "$@" ;;
 esac

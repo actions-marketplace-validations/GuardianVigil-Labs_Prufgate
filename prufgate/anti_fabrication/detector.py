@@ -43,11 +43,16 @@ from prufgate.anti_fabrication.packs import cti  # noqa: E402
 from prufgate.config import (  # noqa: E402
     DEFAULT_PACKS,
     ConfigError,
+    GitDiffError,
     PrufGateConfig,
+    _diff_base,
     expand_rule_aliases,
     rules_match,
 )
+from prufgate.privacy import redact  # noqa: E402
+from prufgate.process import git_command  # noqa: E402
 from prufgate.rules import visible  # noqa: E402
+from prufgate.safe_fs import safe_read_text, safe_write_text  # noqa: E402
 
 # Multi-language file extension mapping
 LANGUAGE_BY_SUFFIX: dict[str, str] = {
@@ -202,7 +207,7 @@ V2_EXEMPT: dict[tuple[str, str], str] = {}
 
 class Finding:
     def __init__(self, path: str, line: int, rule: str, text: str, end_line: int = 0):
-        self.path, self.line, self.rule, self.text = path, line, rule, text.strip()[:110]
+        self.path, self.line, self.rule, self.text = path, line, rule, redact(text.strip())[:110]
         self.end_line = end_line
 
     def to_dict(self) -> dict:
@@ -555,7 +560,7 @@ def scan_file(path: Path, root: Path | None = None) -> list[Finding]:
     use the workspace-relative path even when `path` is absolute."""
     path = Path(path)
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = safe_read_text(path, encoding="utf-8", errors="replace")
     except OSError as e:
         raise ScanError(f"cannot read {path}: {e.strerror or e}") from e
     return scan_text(workspace_relative(path, root), path.suffix, text)
@@ -960,6 +965,10 @@ def disconnected_submit(lines: list[str], i: int, col: int) -> int:
 def generic_fake_findings(rel: str, suffix: str, lines: list[str]) -> list[Finding]:
     out: list[Finding] = []
     core_enabled = "core" in ENABLED_RULE_PACKS
+    python_handlers = None
+    if core_enabled and suffix == ".py":
+        from prufgate.python_flow import canned_handlers
+        python_handlers = canned_handlers("\n".join(lines))
     web_ui_enabled = "web-ui" in ENABLED_RULE_PACKS
     is_web_ui = suffix in WEB_UI_SUFFIXES
 
@@ -982,7 +991,8 @@ def generic_fake_findings(rel: str, suffix: str, lines: list[str]) -> list[Findi
                 rule = "canned-error-fallback" if kind == "canned" else "unhandled-empty-catch"
                 out.append(Finding(rel, i + 1, rule, line))
         brace_catch = suffix in BRACE_CATCH_SUFFIXES and BRACE_CATCH_RE.search(line)
-        if core_enabled and (brace_catch or MULTI_LANG_ERROR_SWALLOW_RE.search(line)):
+        python_canned = suffix == ".py" and python_handlers is not None and i + 1 in python_handlers
+        if core_enabled and (python_canned or brace_catch or MULTI_LANG_ERROR_SWALLOW_RE.search(line)):
             end = min(len(lines), i + 6)
             brace = line.find("{", brace_catch.end() if brace_catch else 0)
             if brace >= 0:  # a brace language: the handler ends at its closing brace
@@ -996,7 +1006,10 @@ def generic_fake_findings(rel: str, suffix: str, lines: list[str]) -> list[Findi
                         end = k
                         break
             window = "\n".join(lines[i:end])
-            if _canned_ok(window):
+            canned = (i + 1 in python_handlers) if suffix == ".py" and python_handlers is not None else _canned_ok(window)
+            if canned:
+                if suffix == ".py" and python_handlers is not None:
+                    end = python_handlers[i + 1]
                 out.append(Finding(rel, i + 1, "canned-error-fallback", line, end_line=end))
             # `except Exception: pass` in a close()/cleanup helper is a best-effort release, not a fake.
             elif suffix == ".py" and PY_BROAD_EXCEPT_RE.match(line) and _only_pass(lines, i, end) and not _in_cleanup_def(lines, i):
@@ -1663,7 +1676,7 @@ def collect(paths: list[str]) -> list[Path]:
 def _git(args: list[str], cwd: Path | str | None) -> str:
     try:
         res = subprocess.run(
-            ["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+            git_command(*args), cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace"
         )
     except OSError as e:
         raise GitError(f"cannot run git: {e}") from e
@@ -1684,7 +1697,12 @@ def changed_files(base: str | None = None, cwd: Path | str | None = None) -> lis
     answer, so a broken diff never reads as "nothing changed"."""
     if base is not None and (not base or base.startswith("-")):
         raise GitError(f"refusing base ref {base!r}")
-    rng = [f"{base}...HEAD"] if base else ["HEAD"]
+    try:
+        rng = [_diff_base(base, cwd)]
+    except GitDiffError as exc:
+        if base:
+            _git(["rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}"], cwd)
+        raise GitError(str(exc)) from exc
     diff = _git(["diff", "--name-only", "-z", "--relative", "--end-of-options", *rng], cwd)
     untracked = _git(["ls-files", "-z", "--others", "--exclude-standard"], cwd)
     return [f for f in (diff + untracked).split("\0") if f]
@@ -1743,7 +1761,7 @@ def main() -> int:
             print("No changed files to scan.")
             if json_out:
                 Path(json_out).parent.mkdir(parents=True, exist_ok=True)
-                Path(json_out).write_text("[]")
+                safe_write_text(Path(json_out), "[]")
             return 0
     else:
         targets = args or ["."]
@@ -1766,14 +1784,14 @@ def main() -> int:
             for (path, rule), reason in entries.items():
                 p = Path(path)
                 if p.is_file():
-                    text = p.read_text(encoding="utf-8", errors="replace")
+                    text = safe_read_text(p, encoding="utf-8", errors="replace")
                     live = any(rules_match(f.rule, rule) for f in raw_findings(path, p.suffix, text))
                 else:  # a glob or a directory: stale when no scanned file matching it still trips the rule
                     live = any(
                         rules_match(f.rule, rule)
                         for g in files
                         if _path_matches_pattern(workspace_relative(g), path)
-                        for f in raw_findings(workspace_relative(g), g.suffix, g.read_text(encoding="utf-8", errors="replace"))
+                        for f in raw_findings(workspace_relative(g), g.suffix, safe_read_text(g, encoding="utf-8", errors="replace"))
                     )
                 if not live:
                     findings.append(
@@ -1812,7 +1830,7 @@ def main() -> int:
 
     if json_out:
         Path(json_out).parent.mkdir(parents=True, exist_ok=True)
-        Path(json_out).write_text(json.dumps([f.to_dict() for f in findings], indent=2))
+        safe_write_text(Path(json_out), json.dumps([f.to_dict() for f in findings], indent=2))
 
     if not findings:
         print(f"No fabrication patterns found across {len(files)} file(s).")

@@ -1,4 +1,5 @@
 # Tools the CI and release checks install (pip install --require-hashes).
 # Regenerate: uv pip compile --universal --python-version 3.9 --generate-hashes .github/ci-requirements.in -o .github/ci-requirements.txt
 PyYAML==6.0.3
-ruff==0.17.2
+ruff==0.17.3
+tomli==2.2.1; python_version < "3.11"

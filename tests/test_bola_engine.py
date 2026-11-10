@@ -50,11 +50,11 @@ class _BolaTestHttpHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             target_tenant = self.path.rsplit("/", 1)[-1]
-            if "token_alpha" in auth and target_tenant == "tenant-a-1111":
+            if ("token_alpha" in auth and target_tenant == "tenant-a-1111") or ("token_bravo" in auth and target_tenant == "tenant-b-2222"):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"order": "tenant-a-1111"}')
+                self.wfile.write(json.dumps({"order": target_tenant}).encode())
                 return
             self.send_response(403)
             self.end_headers()
@@ -196,6 +196,38 @@ class TestUniversalBolaEngine(unittest.TestCase):
                 self.assertFalse(any("/api/v1/safe-orders/" in t for t in targets))
             finally:
                 httpd.shutdown()
+
+
+class TestTenantSubstitution(unittest.TestCase):
+    def test_numeric_tenant_ids_fill_only_the_placeholder(self) -> None:
+        from unittest import mock
+
+        from prufgate.bola import bola_engine
+
+        seen: list[str] = []
+
+        class Recorder(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                seen.append(self.path)
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, *args) -> None:
+                pass
+
+        env = {"PRUFGATE_TEST_PROBE_TOKEN_A": "probe_token_alpha", "PRUFGATE_TEST_PROBE_TOKEN_B": "probe_token_bravo",
+               "PRUFGATE_TEST_PROBE_TENANT_A_ID": "2", "PRUFGATE_TEST_PROBE_TENANT_B_ID": "1",
+               "PRUFGATE_BOLA_PATHS": "/api/v1/projects", "PRUFGATE_CROSS_TENANT_PATHS": "/api/v1/tenants/{tenant_id}"}
+        with socketserver.TCPServer(("127.0.0.1", 0), Recorder) as httpd, mock.patch.dict(os.environ, env):
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            try:
+                with self.assertRaises(bola_engine.ProbeIncomplete):
+                    bola_engine.run_dynamic_matrix(f"http://127.0.0.1:{httpd.server_address[1]}")
+            finally:
+                httpd.shutdown()
+        self.assertIn("/api/v1/tenants/2", seen)
+        self.assertIn("/api/v1/tenants/1", seen)
+        self.assertFalse(any(p.startswith("/api/v2/") for p in seen), seen)
 
 
 class TestUnsafeTargetRefused(unittest.TestCase):

@@ -4,7 +4,7 @@
 # ==============================================================================
 # Stage 1: Static Binary Extractor (ast-grep, gitleaks, zizmor)
 # ==============================================================================
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS binary-extractor
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS binary-extractor
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -56,7 +56,7 @@ FROM python:3.14-slim-bookworm@sha256:945c2676dc2b18e0c1f16879244122c57c0ffede60
 # tests/test_workflows.py keeps the version equal to prufgate.__version__.
 LABEL org.opencontainers.image.title="PrufGate" \
       org.opencontainers.image.description="Checks whether code, and the tests that claim it works, are real" \
-      org.opencontainers.image.version="1.3.0" \
+      org.opencontainers.image.version="1.4.0" \
       org.opencontainers.image.source="https://github.com/GuardianVigil-Labs/Prufgate" \
       org.opencontainers.image.url="https://github.com/GuardianVigil-Labs/Prufgate" \
       org.opencontainers.image.documentation="https://github.com/GuardianVigil-Labs/Prufgate/tree/main/docs" \

@@ -1,0 +1,16 @@
+-- label.yaml --
+category: clean
+description: Syntax and control flow example ts-reraise
+must_fire: []
+must_not_fire: [canned-error-fallback]
+evaluation:
+  origin: synthetic
+  language: typescript
+  framework: none
+  author: maintainer-role
+  reviewers: []
+  split: regression
+-- head/app.ts --
+export function run(): object {
+  try { return calculate(); } catch (err) { throw err; }
+}

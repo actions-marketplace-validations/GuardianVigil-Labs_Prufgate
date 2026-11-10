@@ -15,6 +15,7 @@ appended to the file named by `PRUFGATE_SUPPRESSIONS_FILE`.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import json
 import os
 import re
@@ -26,6 +27,9 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from prufgate.config import rules_match  # noqa: E402
+from prufgate.privacy import redact_data  # noqa: E402
+from prufgate.safe_fs import safe_read_text  # noqa: E402
+from prufgate.source_text import comment_text, views  # noqa: E402
 
 MISSING_REASON_RULE = "ignore-without-reason"
 MISSING_REASON_MESSAGE = (
@@ -48,14 +52,41 @@ _sink: list[dict] | None = None
 _seen: set[tuple] = set()
 
 
-def parse(text: str) -> tuple[tuple[str, ...], str] | None:
+def _metadata(text: str, path: str = "") -> tuple[dict, str]:
+    m = _IGNORE_RE.search(text if isinstance(text, _Comment) else comment_text(text, path))
+    reason = _COMMENT_END_RE.sub("", m.group("reason") or "").strip() if m else ""
+    tail = re.search(r"(?:^|\s+)\[(owner|expires)=([^\]]*)\]\s*$", reason)
+    if tail is None:
+        return {}, "Invalid inline suppression metadata." if re.search(r"\[(?:owner|expires)=", reason) else ""
+    values = {}
+    for part in tail.group(0).strip()[1:-1].split(";"):
+        key, eq, value = part.strip().partition("=")
+        if not eq or key not in ("owner", "expires") or key in values or not value.strip():
+            return {}, "Invalid inline suppression metadata."
+        values[key] = value.strip()
+    if "expires" in values:
+        try:
+            expires = dt.date.fromisoformat(values["expires"])
+        except ValueError:
+            return values, "Invalid inline suppression expiration."
+        if expires < dt.datetime.now(dt.timezone.utc).date():
+            return values, "Inline suppression has expired."
+    return values, ""
+
+
+class _Comment(str):
+    """A comment fragment already lexed in its full source context."""
+
+
+def parse(text: str, path: str = "") -> tuple[tuple[str, ...], str] | None:
     """`(rules, reason)` for the first `prufgate-ignore` in `text`, else None.
     An empty rule tuple covers every rule; an empty reason means none was given."""
-    m = _IGNORE_RE.search(text)
+    m = _IGNORE_RE.search(text if isinstance(text, _Comment) else comment_text(text, path))
     if not m:
         return None
     rules = tuple(re.split(r"[\s,]+", m.group("rules") or "")) if m.group("rules") else ()
     reason = _COMMENT_END_RE.sub("", m.group("reason") or "").strip()
+    reason = re.sub(r"(?:^|\s+)\[(?:owner|expires)=[^\]]*\]\s*$", "", reason).strip()
     # At least three non-space characters, with a letter or digit: `-- x` is not a reason.
     if not re.search(r"[A-Za-z0-9]", reason) or len(re.sub(r"\s", "", reason)) < 3:
         reason = ""
@@ -72,13 +103,25 @@ def covers(rules: tuple[str, ...], rule: str) -> bool:
     return not rules or any(r.lower() == "all" or rules_match(rule, r) for r in rules)
 
 
-def context(lines: list[str], line_num: int) -> list[str]:
-    """Line `line_num` (1-indexed) and the comment line just above it, if any."""
+def context(lines: list[str], line_num: int, path: str = "") -> list[str]:
+    """Only actual comments on this line or a standalone comment above it."""
     if not 1 <= line_num <= len(lines):
         return []
-    out = [lines[line_num - 1]]
+    text = "\n".join(lines)
+    spans = views(text, path)[2]
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line) + 1)
+
+    def on_line(number: int) -> str:
+        lo, hi = starts[number - 1], starts[number - 1] + len(lines[number - 1])
+        found = [text[max(lo, a):min(hi, b)] for a, b in spans if a < hi and lo < b]
+        # Reconstruct comment tokens when this line continues a block comment.
+        return _Comment(" ".join(found))
+
+    out = [on_line(line_num)]
     if line_num >= 2 and lines[line_num - 2].strip().startswith(_COMMENT_START):
-        out.append(lines[line_num - 2])
+        out.append(on_line(line_num - 1))
     return out
 
 
@@ -97,11 +140,15 @@ def suppressed(
     missing-reason entry the report turns into an `ignore-without-reason` finding."""
     reasonless = False
     for text in texts:
-        parsed = parse(text)
+        parsed = parse(text, path)
         if parsed is None or not covers(parsed[0], rule):
             continue
+        metadata, refusal = _metadata(text, path)
+        if refusal:
+            _record("refused", engine, path, line, rule, severity, message, refusal, metadata)
+            continue
         if parsed[1]:
-            _record("honoured", engine, path, line, rule, severity, message, parsed[1])
+            _record("honoured", engine, path, line, rule, severity, message, parsed[1], metadata)
             return True
         reasonless = True
     if reasonless:
@@ -110,10 +157,10 @@ def suppressed(
 
 
 def suppressed_at(lines: list[str], line_num: int, rule: str, **kw) -> bool:
-    return suppressed(context(lines, line_num), rule, line=line_num, **kw)
+    return suppressed(context(lines, line_num, str(kw.get("path") or "")), rule, line=line_num, **kw)
 
 
-def _record(kind: str, engine: str, path: str, line: int, rule: str, severity: str, message: str, reason: str) -> None:
+def _record(kind: str, engine: str, path: str, line: int, rule: str, severity: str, message: str, reason: str, metadata: dict | None = None) -> None:
     entry = {
         "kind": kind,
         "engine": engine,
@@ -123,7 +170,11 @@ def _record(kind: str, engine: str, path: str, line: int, rule: str, severity: s
         "severity": severity,
         "message": message,
         "reason": reason,
+        "owner": (metadata or {}).get("owner"),
+        "expires": (metadata or {}).get("expires"),
+        "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
+    entry = redact_data(entry)
     if _sink is not None:
         key = (kind, engine, path, entry["line"], rule)
         if key not in _seen:
@@ -155,12 +206,12 @@ def load(path: Path) -> list[dict]:
         return []
     seen: set[tuple] = set()
     out: list[dict] = []
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw in safe_read_text(path, encoding="utf-8", errors="replace").splitlines():
         try:
             e = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if not isinstance(e, dict) or e.get("kind") not in ("honoured", "missing-reason"):
+        if not isinstance(e, dict) or e.get("kind") not in ("honoured", "missing-reason", "refused"):
             continue
         key = (e.get("kind"), e.get("engine"), e.get("file"), e.get("line"), e.get("rule"))
         if key not in seen:

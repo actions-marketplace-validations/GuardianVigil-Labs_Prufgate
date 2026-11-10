@@ -89,6 +89,8 @@ from prufgate.config import (  # noqa: E402
     path_matches_pattern,
 )
 from prufgate.diff_guard import fake_exit, harness_edits, linter_drift  # noqa: E402
+from prufgate.privacy import redact  # noqa: E402
+from prufgate.safe_fs import safe_read_text, safe_write_text  # noqa: E402
 
 
 @dataclass
@@ -103,7 +105,8 @@ class Finding:
     message: str = ""
 
     def __post_init__(self) -> None:
-        self.text = self.text.strip()[:140]
+        self.text = redact(self.text.strip())[:140]
+        self.message = redact(self.message)
         if not self.message:
             self.message = f"Diff tampering violation ({self.rule}): {self.text}"
 
@@ -485,6 +488,9 @@ def _compare_configs(head: PrufGateConfig, base: PrufGateConfig, path: str, igno
     def finding(why: str, severity: str = "P1", text: str = "") -> None:
         out.append(_config_finding(path, why, severity, text, ignored))
 
+    if head.enforcement != base.enforcement:
+        finding("changes enforcement policy; policy changes require review and take effect from the trusted base")
+
     for pat in head.exclude:
         if pat not in base.exclude:
             if _disables_prufgate(pat):
@@ -626,7 +632,7 @@ def with_linter_drift(
         # Test-runner settings: the same swap, for `test-config-weakening`.
         if harness_edits.config_kind(rel) and not cfg.is_exempt(rel, TEST_CONFIG_RULE):
             try:
-                tc = harness_edits.compare_config(rel, git_blob(base_commit, rel, top), (top / rel).read_text(encoding="utf-8"))
+                tc = harness_edits.compare_config(rel, git_blob(base_commit, rel, top), safe_read_text(top / rel, encoding="utf-8"))
             except (OSError, UnicodeDecodeError, GitDiffError):
                 tc = None
             if tc is not None:
@@ -646,7 +652,7 @@ def with_linter_drift(
         if not _is_linter_config_file(rel) or cfg.is_exempt(rel, LINTER_RULE):
             continue
         try:
-            head_text = (top / rel).read_text(encoding="utf-8")
+            head_text = safe_read_text(top / rel, encoding="utf-8")
             base_text = git_blob(base_commit, rel, top)
         except (OSError, UnicodeDecodeError, GitDiffError):
             continue
@@ -978,6 +984,12 @@ def scan_diff_for_tampering(
                         message=f"Test harness edited at '{rel_path}:{h.line}': {h.why}. Fix the code under test instead.",
                     )
                 )
+
+        if Path(rel_path).name == ".gitleaks.toml" and (hunk.added_lines or hunk.removed_lines):
+            findings.append(Finding(
+                path=rel_path, line=hunk.added_lines[0][0] if hunk.added_lines else 1,
+                rule="prufgate-config-self-exemption", severity="P1", text="Gitleaks configuration changed",
+                message="This change edits secret-scanner policy. The gate uses the comparison base's policy; policy changes require maintainer review and take effect after merge."))
 
         view = dict(hunk.context_lines + hunk.added_lines)
         casts = [n for n, t in hunk.added_lines if TS_DOUBLE_CAST_RE.search(t)] if sfx in TS_SUFFIXES else []
@@ -2137,7 +2149,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if diff_file:
         try:
-            diff_text = Path(diff_file).read_text(encoding="utf-8", errors="replace")
+            diff_text = safe_read_text(Path(diff_file), encoding="utf-8", errors="replace")
         except OSError as e:
             print(f"tamper_detector: cannot read --diff-file {diff_file}: {e.strerror or e}", file=sys.stderr)
             return 2
@@ -2160,7 +2172,7 @@ def main(argv: list[str] | None = None) -> int:
     if json_out:
         out_path = Path(json_out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps([f.to_dict() for f in findings], indent=2) + "\n", encoding="utf-8")
+        safe_write_text(out_path, json.dumps([f.to_dict() for f in findings], indent=2) + "\n", encoding="utf-8")
 
     for adv in debt_advisories:
         print(f"notice: {adv}", file=sys.stderr)

@@ -36,7 +36,7 @@ TARGET_WORKSPACE="$(pwd)"
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "help" ]; then
   if command -v python3 >/dev/null 2>&1 && [ -f "${PRUFGATE_DIR}/prufgate/cli.py" ]; then
-    exec python3 "${PRUFGATE_DIR}/prufgate/cli.py" --help
+    exec python3 -I "${PRUFGATE_DIR}/prufgate/cli.py" --help
   fi
   cat <<'HELP_EOF'
 PrufGate — Universal Anti-Fabrication, Anti-Reward-Hacking & BOLA Verification CLI
@@ -87,7 +87,7 @@ if [ "$USE_DOCKER" = false ] && command -v python3 >/dev/null 2>&1 && [ -f "${PR
       exec bash "${PRUFGATE_DIR}/prufgate.sh" "${FILTERED_ARGS[@]}"
       ;;
     *)
-      exec python3 "${PRUFGATE_DIR}/prufgate/cli.py" "${FILTERED_ARGS[@]}"
+      exec python3 -I "${PRUFGATE_DIR}/prufgate/cli.py" "${FILTERED_ARGS[@]}"
       ;;
   esac
 fi

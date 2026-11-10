@@ -6,6 +6,7 @@ Payloads are invented, shaped after each agent's published hook reference."""
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -269,6 +270,16 @@ class Cli(unittest.TestCase):
         env = {"PATH": os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"]), "PYTHONPATH": str(ROOT)}
         cmd = guard_command("hook cursor shell", "blocked")
         with tempfile.TemporaryDirectory() as tmp:
+            # An installed launcher is trusted; PYTHONPATH must never act as an
+            # installation fallback when the command runs inside a workspace.
+            trusted_bin = Path(tmp) / "bin"
+            trusted_bin.mkdir()
+            launcher = trusted_bin / "prufgate"
+            launcher.write_text(
+                "#!/bin/sh\nexec " + shlex.quote(sys.executable) + " -I "
+                + shlex.quote(str(ROOT / "prufgate/cli.py")) + ' "$@"\n')
+            launcher.chmod(0o755)
+            env["PATH"] = str(trusted_bin) + os.pathsep + env["PATH"]
             env["HOME"] = tmp
             r = subprocess.run(["sh", "-c", cmd], cwd=tmp, env=env, capture_output=True, text=True,
                                input=json.dumps({"command": "git commit --no-verify -m x"}))

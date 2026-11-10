@@ -1,4 +1,4 @@
-"""Unit tests for Phase 2: Universal YAML Configuration (`prufgate/config.py`)
+"""Unit tests for YAML configuration (`prufgate/config.py`)
 and Multi-Language Anti-Fabrication Engine (`prufgate/anti_fabrication/detector.py`).
 """
 

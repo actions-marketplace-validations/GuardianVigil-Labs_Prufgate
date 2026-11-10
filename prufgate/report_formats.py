@@ -48,6 +48,8 @@ def _findings(sarif: dict[str, Any]) -> list[dict[str, Any]]:
                 {
                     "rule": str(r.get("ruleId") or "prufgate-finding"),
                     "severity": sev if sev in GITLAB_SEVERITY else "P2",
+                    # Only a real boolean overrides the severity: "false" is not False.
+                    "blocking": props["blocking"] if isinstance(props.get("blocking"), bool) else sev in BLOCKING,
                     "message": str((r.get("message") or {}).get("text", "")),
                     "path": re.sub(r"^(?:\./)+", "", str(loc.get("artifactLocation", {}).get("uri", ""))) or "PRUFGATE_AUDIT_TARGET",
                     "line": max(1, int(loc.get("region", {}).get("startLine", 1) or 1)),
@@ -106,7 +108,7 @@ def junit_xml(sarif: dict[str, Any], errors: dict[str, str] | None = None) -> st
         suite = ET.SubElement(root, "testsuite", name="prufgate", tests="1", failures="0", skipped="0", errors="0")
         ET.SubElement(suite, "testcase", classname="prufgate", name="no findings")
     for rule, items in by_rule.items():
-        failures = sum(f["severity"] in BLOCKING for f in items)
+        failures = sum(f["blocking"] for f in items)
         suite = ET.SubElement(
             root,
             "testsuite",
@@ -125,7 +127,7 @@ def junit_xml(sarif: dict[str, Any], errors: dict[str, str] | None = None) -> st
                 file=_clean(f["path"]),
                 line=str(f["line"]),
             )
-            tag = "failure" if f["severity"] in BLOCKING else "skipped"
+            tag = "failure" if f["blocking"] else "skipped"
             # SARIF messages from `prufgate check` and `review` already start with the severity.
             message = f["message"] if f["message"].startswith(f"[{f['severity']}]") else f"[{f['severity']}] {f['message']}"
             child = ET.SubElement(case, tag, message=_clean(message))
@@ -133,7 +135,7 @@ def junit_xml(sarif: dict[str, Any], errors: dict[str, str] | None = None) -> st
                 child.set("type", f["severity"])
                 child.text = _clean(f"{rule} at {f['path']}:{f['line']}\n{message}")
     total = len(findings) + len(errors) or 1
-    failed = sum(f["severity"] in BLOCKING for f in findings)
+    failed = sum(f["blocking"] for f in findings)
     root.set("tests", str(total))
     root.set("failures", str(failed))
     root.set("skipped", str(len(findings) - failed))

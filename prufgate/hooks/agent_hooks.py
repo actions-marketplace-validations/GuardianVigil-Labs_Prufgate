@@ -127,10 +127,10 @@ _STOP_ACTIVE = "case \"$input\" in *'\"stop_hook_active\": true'*|*'\"stop_hook_
 HOOK_COMMAND = "; ".join([
     "input=$(cat)",
     _STOP_ACTIVE,
-    "if command -v prufgate >/dev/null 2>&1; then printf '%s' \"$input\" | prufgate check --changed --format agent-hook; rc=$?",
-    "elif python3 -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python3 -m prufgate.cli check --changed --format agent-hook; rc=$?",
+    "if command -v prufgate >/dev/null 2>&1; then printf '%s' \"$input\" | PYTHONPATH= prufgate check --changed --format agent-hook; rc=$?",
+    "elif python3 -I -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python3 -I -m prufgate.cli check --changed --format agent-hook; rc=$?",
     # Windows (Git Bash) has `python`, not `python3`.
-    "elif python -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python -m prufgate.cli check --changed --format agent-hook; rc=$?",
+    "elif python -I -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python -I -m prufgate.cli check --changed --format agent-hook; rc=$?",
     "else echo 'prufgate: not installed (no prufgate on PATH, no engine module for python3 or python); this work was not checked' >&2; rc=3; fi",
     "[ \"$rc\" -eq 0 ] && exit 0",
     "[ \"$rc\" -eq 2 ] || echo \"prufgate: the check could not run (exit $rc)\" >&2",
@@ -153,9 +153,9 @@ def guard_command(subcommand: str, blocked: str, deny: str = "", loop_guard: boo
     return "; ".join([
         "input=$(cat)",
         *([_STOP_ACTIVE] if loop_guard else []),
-        f"if command -v prufgate >/dev/null 2>&1; then printf '%s' \"$input\" | prufgate {subcommand}; rc=$?",
-        f"elif python3 -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python3 -m prufgate.cli {subcommand}; rc=$?",
-        f"elif python -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python -m prufgate.cli {subcommand}; rc=$?",
+        f"if command -v prufgate >/dev/null 2>&1; then printf '%s' \"$input\" | PYTHONPATH= prufgate {subcommand}; rc=$?",
+        f"elif python3 -I -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python3 -I -m prufgate.cli {subcommand}; rc=$?",
+        f"elif python -I -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python -I -m prufgate.cli {subcommand}; rc=$?",
         f"else echo {shlex.quote(f'prufgate: not installed (no prufgate on PATH, no engine module for python3 or python); {blocked} until it is')} >&2; rc=3; fi",
         "[ \"$rc\" -eq 0 ] && exit 0",
         f"[ \"$rc\" -eq 2 ] || echo \"prufgate: {subcommand} could not run (exit $rc)\" >&2",

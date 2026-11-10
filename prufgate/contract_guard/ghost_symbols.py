@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from prufgate.contract_guard.dependency_guard import PYTHON_STDLIB, Finding
+from prufgate.safe_fs import safe_read_text
 
 RULE = "ghost-symbol"
 
@@ -105,7 +106,7 @@ def _source_names(spec: Any) -> Optional[set[str]]:
         try:
             if st.st_size > _MAX_MODULE_BYTES:
                 raise ValueError("too large to read")
-            _names_cache[key] = _module_names(ast.parse(src.read_text(encoding="utf-8", errors="ignore")))
+            _names_cache[key] = _module_names(ast.parse(safe_read_text(src, encoding="utf-8", errors="ignore")))
         except (OSError, SyntaxError, ValueError, RecursionError, MemoryError):
             _names_cache[key] = None  # unknown: its names are never reported missing
     return _names_cache[key]
@@ -361,7 +362,7 @@ def _ts_exports(path: Path, workspace: Path, seen: set[Path]) -> Optional[set[st
         return None  # ponytail: a re-export chain this long is not followed
     seen.add(path)
     try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        text = safe_read_text(path, encoding="utf-8", errors="ignore")
     except OSError:
         return None
     if _TS_CJS_RE.search(text):

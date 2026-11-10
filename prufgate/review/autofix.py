@@ -30,6 +30,7 @@ from prufgate.anti_reward_hacking.test_integrity import (
     scan_diff_for_reward_hacking,
 )
 from prufgate.diff_guard import tamper_detector as td
+from prufgate.process import git_command
 from prufgate.review.reviewer import PRComment, format_review_github
 
 ASSERTION_RULE = "diff-assertion-weakening"
@@ -87,7 +88,7 @@ class Plan:
 def _git(root: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess:
     # Repository hooks and fsmonitor are code from the repository: never run them.
     return subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+        git_command(*args),
         cwd=root, capture_output=True, text=text, check=False,
     )
 

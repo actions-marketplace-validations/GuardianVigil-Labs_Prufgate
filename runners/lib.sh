@@ -30,21 +30,12 @@ mkdir -p "${RAW_DIR}"
 # ignore the folder without touching the project's own .gitignore.
 [ -e "${REPORTS_DIR}/.gitignore" ] || [ -L "${REPORTS_DIR}/.gitignore" ] || printf '# Written by PrufGate: reports are never committed.\n*\n' > "${REPORTS_DIR}/.gitignore" 2>/dev/null || true
 
-# gitleaks configuration (PrufGate#16 follow-up): PrufGate's defaults plus the
-# target's own .gitleaks.toml when it has one, so a project's rules are
-# extended, never silently replaced by --config.
+# Gitleaks uses the project policy and local includes as committed at the
+# comparison base, plus the shipped report/build exclusions. A branch cannot
+# add an allowlist that hides its own secrets.
 gitleaks_config() {
-  local base="${TOOL_ROOT}/configs/gitleaks.toml"
-  if [ -f "${WORKSPACE}/.gitleaks.toml" ]; then
-    local merged="${RAW_DIR}/gitleaks.merged.toml"
-    {
-      printf '[extend]\npath = "%s"\n\n' "${WORKSPACE}/.gitleaks.toml"
-      sed -n '/^\[allowlist\]/,$p' "${base}"
-    } > "${merged}"
-    echo "${merged}"
-  else
-    echo "${base}"
-  fi
+  python3 -I "${TOOL_ROOT}/prufgate/gitleaks_policy.py" "${WORKSPACE}" "${RAW_DIR}" \
+    "${TOOL_ROOT}/configs/gitleaks.toml" "${BASE_REF:-HEAD}"
 }
 
 # A git repository gitleaks can read: `git rev-parse`, not `[ -d .git ]`,
@@ -65,7 +56,7 @@ record_tool_status() {
   local duration_s="${5:-0}"
   local note="${6:-}"
 
-  python3 -c '
+  python3 -I -c '
 import json, sys, datetime
 entry = {
     "tool": sys.argv[1],

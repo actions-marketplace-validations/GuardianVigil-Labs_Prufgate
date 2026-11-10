@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from prufgate.config import _diff_base, expand_rule_aliases, git_blob, repo_prefix
+from prufgate.safe_fs import safe_read_bytes, safe_read_text
 
 BASELINE_FILES = (".prufgate/baseline.yaml", ".prufgate/baseline.yml", ".prufgate/baseline.json")
 DEFAULT_FILE = BASELINE_FILES[0]
@@ -78,7 +79,7 @@ def read_baseline(workspace: Path, ref: Optional[str] = None) -> Optional[Tuple[
             p = workspace / rel
             if p.is_file():
                 try:
-                    return rel, p.read_text(encoding="utf-8")
+                    return rel, safe_read_text(p, encoding="utf-8")
                 except (OSError, UnicodeDecodeError):
                     return rel, ""
         return None
@@ -148,7 +149,7 @@ class _Lines:
             try:
                 path = (self.root / file).resolve()
                 if path.is_relative_to(self.root) and path.is_file() and path.stat().st_size <= _MAX_FILE_BYTES:
-                    text = path.read_bytes().decode("utf-8", errors="replace")
+                    text = safe_read_bytes(path).decode("utf-8", errors="replace")
                     self._files[file] = ["".join(ln.split()) for ln in text.splitlines()]
             except (OSError, ValueError):
                 pass

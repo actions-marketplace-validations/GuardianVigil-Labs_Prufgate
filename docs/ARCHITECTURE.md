@@ -1,6 +1,6 @@
 # Architecture
 
-PrufGate is plain Python (3.9+, one dependency: PyYAML) plus a small shell gate. It makes no network calls unless you ask for live BOLA probing or AI review.
+PrufGate is Python 3.9+ plus a shell gate; dependencies are declared and pinned in the package/requirements files. Static core scans need no network. Explicit live probing, AI delegation, registry checks and report publication have separate opt-ins and destinations.
 
 ```text
                  prufgate check / test-audit / bola / review          prufgate.sh fast|full  (GitHub Action, container, API)
@@ -35,6 +35,11 @@ Every engine module runs on its own (`python3 prufgate/<engine>/<module>.py --he
 
 | Module | What it does |
 |---|---|
+| `scan_result.py`, `coverage.py`, `result_validation.py` | Build/validate the common status, coverage, evidence and exit decision; invalid or incomplete execution cannot become a passing empty result. |
+| `workflow.py`, `enforcement.py`, `dismissals.py` | Apply trusted-base adoption policy and reviewed exact-fingerprint exceptions, preserve severity, and record governance/provenance. |
+| `safe_fs.py`, `process.py`, `engine_runner.py` | Keep source/report filesystem operations and Git/scanner execution within shared safety boundaries. |
+| `github_checks.py` | Prepare Check Runs locally and publish only on explicit request with matching scan provenance; changed-line annotations are bounded and batched. |
+| `evaluation.py`, `evaluation_corpus.py`, `python_flow.py`, `change_impact.py` | Measure labeled corpus agreement, reproduce upstream evidence, analyze bounded Python exception flow and provide static cross-file review leads. |
 | `prufgate/baseline.py` | Reads `.prufgate/baseline.yaml` (at the base ref in a changed scan) and leaves out the findings it lists. `prufgate check` and the synthesizer both use it, after the debt ceilings, so a baselined finding still counts toward `known_debt`. `prufgate baseline` writes the file. |
 | `prufgate/pr_summary.py` | `prufgate pr-summary`: the verdict, the first findings and facts about the change, from `reports/prufgate.sarif`. The GitHub Action writes it to the job summary and, when asked, keeps it as one pull request comment. It reports the result and never changes it. |
 | `prufgate/explain.py` | `prufgate explain` and the MCP tool `prufgate_explain`: what each rule catches and how to fix it. A test keeps it in step with `prufgate/rules.py` and `docs/ENGINES.md`. |
@@ -56,5 +61,5 @@ A scanner that crashes and reports nothing looks exactly like a clean scan. Pruf
 ## Trust boundaries
 
 - The repository being scanned is untrusted input. PrufGate reads it and never executes it: `.prufgate/rules/` are declarative ast-grep YAML, and `.prufgate/hooks/` scripts run only with `PRUFGATE_ALLOW_REPO_HOOKS=1`.
-- Live probing and AI review are the only network traffic, and both need explicit options. Tokens and API keys never reach reports or logs.
+- Live probing, AI delegation, opt-in registry lookups and explicitly requested report publication can use the network. Credentials are redacted from reports on a best-effort basis; arbitrary source identifiers and unknown sensitive data can remain. See [privacy](SCAN_RESULTS.md#external-ai-consent-and-destinations).
 - The REST API binds to loopback, needs a bearer token, confines scans to `PRUFGATE_WORKSPACE_ROOT` and verifies webhook signatures.

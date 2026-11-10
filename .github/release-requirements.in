@@ -2,4 +2,4 @@
 # Regenerate: uv pip compile --python-version 3.14 --generate-hashes .github/release-requirements.in -o .github/release-requirements.txt
 build==1.6.1
 twine==7.0.0
-cyclonedx-bom==7.5.0
+cyclonedx-bom==7.6.0

@@ -42,6 +42,8 @@ PrufGate uses pattern and structure heuristics, not a full parser for every lang
 
 PrufGate needs Python 3.9 or newer and Git.
 
+The [documentation home](docs/README.md) covers this checkout. For unreleased options, install/build a reviewed checkout and keep CLI, Action and image implementations aligned; see [installation and upgrading](docs/UPGRADING.md). Published `1.4.0` artifacts retain that release's behavior.
+
 ```bash
 pipx install prufgate     # or: pip install prufgate  (the `prufgate` and `prufgate-mcp` commands)
 prufgate --self-check     # every engine against its built-in fixtures
@@ -64,17 +66,17 @@ The hooks that `prufgate init --hooks` writes call `prufgate` on `PATH`, so for 
 Or run the signed container image, which adds the full gate with ast-grep, gitleaks and zizmor:
 
 ```bash
-docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.3.0          # the fast gate on this repository
-docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.3.0 prufgate check .
+docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.4.0          # the fast gate on this repository
+docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.4.0 prufgate check .
 ```
 
-Or add the GitHub Action to a pull-request workflow, pinned to the commit SHA of the `v1.3.0` tag ([full example](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/docs/CI_INTEGRATION.md)):
+Or add the GitHub Action to a pull-request workflow, pinned to the commit SHA of the `v1.4.0` tag ([full example](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/docs/CI_INTEGRATION.md)):
 
 ```yaml
 - uses: actions/checkout@<commit-sha>
   with: { fetch-depth: 0, persist-credentials: false }
 - run: python3 -m pip install "PyYAML>=6.0"
-- uses: GuardianVigil-Labs/Prufgate@<commit-sha-of-v1.3.0>
+- uses: GuardianVigil-Labs/Prufgate@<commit-sha-of-v1.4.0>
 ```
 
 Every release is signed and carries build provenance and an SBOM: [Verify a release](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/SECURITY.md#verify-a-release).
@@ -84,7 +86,7 @@ Or add it to your [pre-commit](https://pre-commit.com) configuration, `.pre-comm
 ```yaml
 repos:
   - repo: https://github.com/GuardianVigil-Labs/Prufgate
-    rev: v1.3.0
+    rev: v1.4.0
     hooks:
       - id: prufgate          # changed files, on every commit
       - id: prufgate-full     # whole repository, before a push (pre-commit install --hook-type pre-push)
@@ -119,7 +121,7 @@ Exit codes are the same everywhere: **0** clean, **1** blocking findings (P0/P1)
 | Mutation smoke test on the changed lines with an installed mutmut, Stryker, PIT, gremlins, go-mutesting or cargo-mutants (executes repository tests: opt-in) | `prufgate verify --mutation --allow-run-tests` |
 | PrufGate as a Claude Code plugin (hooks plus a `/prufgate:prufgate-check` skill) | `pipx install prufgate`, then in Claude Code `/plugin marketplace add GuardianVigil-Labs/Prufgate` and `/plugin install prufgate@prufgate` ([details](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/docs/AGENT_HOOKS.md#claude-code-plugin)) |
 | Other agents and AI reviewers (Cursor Bugbot, Copilot review) told to use PrufGate's findings | `prufgate init --agents-md` (AGENTS.md) and `--bugbot` (`.cursor/BUGBOT.md`): a marked section, updated in place on rerun ([details](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/docs/AGENT_HOOKS.md#instructions-for-agents-and-reviewers-agentsmd-bugbotmd)) |
-| An AI second opinion on PrufGate's own low-confidence findings only (opt-in, sends a few lines of code to a provider you choose) | `ai_adjudicate: true` in the configuration: see [AI adjudication](#ai-adjudication) |
+| An AI second opinion on PrufGate's own low-confidence findings only (opt-in, sends a few lines of code to a provider you choose) | `ai_adjudicate: true` plus explicit `--ai-adjudicate` consent: see [AI adjudication](#ai-adjudication) |
 | Tools for an agent over MCP | `prufgate mcp`: ten read-only tools, including `prufgate_explain` |
 | A service that scans on webhook | `prufgate api`: bearer token, loopback by default |
 
@@ -149,12 +151,20 @@ In a pull request (any run with a base ref) PrufGate reads this file as it is on
 PrufGate is deterministic by default and sends nothing anywhere. Two opt-in modes use an AI provider you choose (a `claude` CLI, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `OLLAMA_HOST`; `--ai-provider` names another):
 
 - `prufgate review --ai` asks the model to review the whole diff.
-- `ai_adjudicate: true` in the configuration (read at the base ref in a pull request, by `prufgate check` and the `prufgate.sh` gate; `--ai-adjudicate` alone does nothing without it) asks one yes/no question per **low-confidence** finding (`medium` too if configured): is this real? The prompt holds the rule, the finding message and a few redacted lines around it, never whole files.
+- `ai_adjudicate: true` in the trusted configuration plus explicit `check --ai-adjudicate` consent asks one yes/no question per **low-confidence** finding (`medium` too if configured): is this real? A local gate can use `PRUFGATE_ALLOW_EXTERNAL_AI=1`; the Action uses `allow_external_ai: 'true'`. Configuration alone sends no code. The prompt holds the rule, the finding message and a bounded code window; windows with detected credentials are skipped.
 
 An adjudication verdict can only hide noise. A finding judged not real stops blocking and moves to an "AI-dismissed" list with the model's reason: a section of `prufgate check` output and of the Markdown report, and a SARIF `suppressions` entry of kind `external` (`AI-dismissed: <reason>`). High-confidence findings are never sent; nothing is ever added or raised. A provider error, a timeout, a reply that is not exactly `{"real": true|false, "reason": "..."}`, a run over its budget, or code that addresses the judge (a comment naming the AI, LLM, judge, reviewer or PrufGate) keeps the finding as it would be without AI. Verdicts are cached outside the repository. Settings: [docs/CONFIGURATION.md](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/docs/CONFIGURATION.md#ai-adjudication).
 
 ## Documentation
 
+- [Documentation home](docs/README.md): complete user, integration, operation and developer guides
+- [User guide](docs/USER_GUIDE.md): local scans, adoption policies, dismissals, PR review and evaluation
+- [Installation and upgrading](docs/UPGRADING.md): published releases versus checkout features and matching implementation versions
+- [REST API](docs/API.md), [MCP](docs/MCP.md), [developer guide](docs/DEVELOPMENT.md) and [troubleshooting](docs/TROUBLESHOOTING.md)
+- [Developer and PR workflow](docs/REVIEW_WORKFLOW.md): GitHub Checks, reviewed dismissals, gradual enforcement and actionable summaries
+- [Detection quality](docs/EVALUATION.md): evaluation provenance, local accuracy dashboard, syntax analysis and cross-file impact
+- [Support matrix](docs/SUPPORT_MATRIX.md): supported checks, limitations, deployment and complementary tools
+- [Scan results, coverage and privacy](docs/SCAN_RESULTS.md): common clean/findings/incomplete/error states, explanations, matching integration profiles, and AI destinations
 - [Getting started](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/docs/GETTING_STARTED.md): install, commands, reports, exit codes
 - [Configuration reference](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/docs/CONFIGURATION.md): every key, suppressions, environment variables
 - [The engines](https://github.com/GuardianVigil-Labs/Prufgate/blob/main/docs/ENGINES.md): rules, languages and limits

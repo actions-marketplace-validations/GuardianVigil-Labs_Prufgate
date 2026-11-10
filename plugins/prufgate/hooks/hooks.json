@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); if command -v prufgate >/dev/null 2>&1; then printf '%s' \"$input\" | prufgate hook claude pre-tool; rc=$?; elif python3 -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python3 -m prufgate.cli hook claude pre-tool; rc=$?; elif python -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python -m prufgate.cli hook claude pre-tool; rc=$?; else echo 'prufgate: not installed (no prufgate on PATH, no engine module for python3 or python); shell commands and file edits are blocked until it is' >&2; rc=3; fi; [ \"$rc\" -eq 0 ] && exit 0; [ \"$rc\" -eq 2 ] || echo \"prufgate: hook claude pre-tool could not run (exit $rc)\" >&2; exit 2"
+            "command": "input=$(cat); if command -v prufgate >/dev/null 2>&1; then printf '%s' \"$input\" | PYTHONPATH= prufgate hook claude pre-tool; rc=$?; elif python3 -I -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python3 -I -m prufgate.cli hook claude pre-tool; rc=$?; elif python -I -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python -I -m prufgate.cli hook claude pre-tool; rc=$?; else echo 'prufgate: not installed (no prufgate on PATH, no engine module for python3 or python); shell commands and file edits are blocked until it is' >&2; rc=3; fi; [ \"$rc\" -eq 0 ] && exit 0; [ \"$rc\" -eq 2 ] || echo \"prufgate: hook claude pre-tool could not run (exit $rc)\" >&2; exit 2"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); case \"$input\" in *'\"stop_hook_active\": true'*|*'\"stop_hook_active\":true'*) active=1;; *) active=0;; esac; if command -v prufgate >/dev/null 2>&1; then printf '%s' \"$input\" | prufgate hook claude stop; rc=$?; elif python3 -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python3 -m prufgate.cli hook claude stop; rc=$?; elif python -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python -m prufgate.cli hook claude stop; rc=$?; else echo 'prufgate: not installed (no prufgate on PATH, no engine module for python3 or python); this work is not checked until it is' >&2; rc=3; fi; [ \"$rc\" -eq 0 ] && exit 0; [ \"$rc\" -eq 2 ] || echo \"prufgate: hook claude stop could not run (exit $rc)\" >&2; [ \"$active\" -eq 1 ] && exit 0; exit 2",
+            "command": "input=$(cat); case \"$input\" in *'\"stop_hook_active\": true'*|*'\"stop_hook_active\":true'*) active=1;; *) active=0;; esac; if command -v prufgate >/dev/null 2>&1; then printf '%s' \"$input\" | PYTHONPATH= prufgate hook claude stop; rc=$?; elif python3 -I -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python3 -I -m prufgate.cli hook claude stop; rc=$?; elif python -I -c 'import prufgate.cli' >/dev/null 2>&1; then printf '%s' \"$input\" | python -I -m prufgate.cli hook claude stop; rc=$?; else echo 'prufgate: not installed (no prufgate on PATH, no engine module for python3 or python); this work is not checked until it is' >&2; rc=3; fi; [ \"$rc\" -eq 0 ] && exit 0; [ \"$rc\" -eq 2 ] || echo \"prufgate: hook claude stop could not run (exit $rc)\" >&2; [ \"$active\" -eq 1 ] && exit 0; exit 2",
             "timeout": 600
           }
         ]

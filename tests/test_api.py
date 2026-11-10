@@ -87,6 +87,26 @@ class ApiTest(unittest.TestCase):
         status, _, _ = self.request("GET", "/api/v1/health")
         self.assertEqual(status, 200)
 
+    def test_docs_page_loads_only_pinned_integrity_checked_assets(self):
+        import base64
+        import re
+
+        status, headers, body = self.request("GET", "/docs")
+        self.assertEqual(status, 200)
+        page = body.decode()
+        assets = re.findall(r'<(?:script|link)[^>]*(?:src|href)="(https://[^"]+)"[^>]*>', page)
+        self.assertEqual(len(assets), 2)
+        for tag in re.findall(r'<(?:script|link)[^>]*(?:src|href)="https://[^>]*>', page):
+            self.assertRegex(tag, r"swagger-ui-dist@\d+\.\d+\.\d+/")
+            self.assertRegex(tag, r'integrity="sha384-[A-Za-z0-9+/=]{64}"')
+            self.assertIn('crossorigin="anonymous"', tag)
+        csp = headers["Content-Security-Policy"]
+        inline = page.split("<script>", 1)[1].split("</script>", 1)[0]
+        digest = base64.b64encode(hashlib.sha256(inline.encode()).digest()).decode()
+        self.assertIn(f"'sha256-{digest}'", csp)
+        self.assertIn("default-src 'none'", csp)
+        self.assertNotIn("'unsafe-inline'", csp.split("script-src", 1)[1].split(";", 1)[0])
+
     def test_scan_requires_token(self):
         self.assertEqual(self.scan({"battery": "fast"}, token=None)[0], 401)
         self.assertEqual(self.scan({"battery": "fast"}, token="wrong")[0], 401)
@@ -240,7 +260,7 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(scan["verdict"], "ERROR")
 
     def test_report_is_counted(self):
-        sarif = {"runs": [{"results": [{"properties": {"severity": "P0"}}, {"properties": {"severity": "P2"}}]}]}
+        sarif = {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "fixture"}}, "results": [{"message": {"text": "blocker"}, "properties": {"severity": "P0"}}, {"message": {"text": "advisory"}, "properties": {"severity": "P2"}}]}]}
         scan = self.run_worker(json.dumps(sarif), exit_code=1)
         self.assertEqual(scan["blockers"], 1)
         self.assertEqual(scan["advisories"], 1)
@@ -283,7 +303,9 @@ class WorkerTest(unittest.TestCase):
             cmd, on_stdout = server.scan_command("fast", Path("/ws"))
         self.assertTrue(on_stdout)
         # The workspace as the OS spells it (`\\ws` on Windows).
-        self.assertEqual(cmd[1:5], ["-m", "prufgate.cli", "check", str(Path("/ws"))])
+        self.assertEqual(cmd[1], "-I")
+        self.assertTrue(cmd[2].endswith("cli.py"))
+        self.assertEqual(cmd[3:5], ["check", str(Path("/ws"))])
         self.assertIn("--changed", cmd)
         self.assertEqual(cmd[-2:], ["--format", "sarif"])
 

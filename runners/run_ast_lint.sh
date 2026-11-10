@@ -43,7 +43,7 @@ if [ -n "${SG_BIN}" ]; then
   if [ ${#ACTIVE_RULES[@]} -gt 0 ]; then
     # A rule that ast-grep cannot run, or output that is not JSON, is an
     # error recorded in the manifest, never an empty (passing) result.
-    python3 -c '
+    python3 -I -c '
 import os, subprocess, json, sys
 sg_bin, out_path, active_rules = sys.argv[1], sys.argv[2], sys.argv[3:]
 # A changed-files run scans only the changed files (PRUFGATE_CHANGED_FILES lists them).

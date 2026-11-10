@@ -1,0 +1,20 @@
+-- label.yaml --
+category: fabrication
+description: Syntax and control flow example conditional-success
+must_fire: [canned-error-fallback]
+must_not_fire: []
+evaluation:
+  origin: synthetic
+  language: python
+  framework: none
+  author: maintainer-role
+  reviewers: []
+  split: regression
+-- head/app.py --
+def run(condition):
+    try:
+        return calculate()
+    except ValueError:
+        if condition:
+            return {"ok": True}
+        raise

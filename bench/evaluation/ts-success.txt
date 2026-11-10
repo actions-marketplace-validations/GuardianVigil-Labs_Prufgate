@@ -1,0 +1,16 @@
+-- label.yaml --
+category: fabrication
+description: Syntax and control flow example ts-success
+must_fire: [canned-error-fallback]
+must_not_fire: []
+evaluation:
+  origin: synthetic
+  language: typescript
+  framework: none
+  author: maintainer-role
+  reviewers: []
+  split: regression
+-- head/app.ts --
+export function run(): object {
+  try { return calculate(); } catch (err) { return {success: true}; }
+}

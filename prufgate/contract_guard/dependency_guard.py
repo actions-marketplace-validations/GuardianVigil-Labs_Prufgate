@@ -25,6 +25,8 @@ if str(_THIS_DIR.parent.parent) not in sys.path:
 
 from prufgate import inline_ignore  # noqa: E402
 from prufgate.config import PrufGateConfig  # noqa: E402
+from prufgate.privacy import redact  # noqa: E402
+from prufgate.safe_fs import safe_read_text  # noqa: E402
 
 
 @dataclass
@@ -39,7 +41,8 @@ class Finding:
     message: str = ""
 
     def __post_init__(self) -> None:
-        self.text = self.text.strip()[:140]
+        self.text = redact(self.text.strip())[:140]
+        self.message = redact(self.message)
         if not self.message:
             self.message = f"Contract guard violation ({self.rule}): {self.text}"
 
@@ -428,7 +431,7 @@ def load_declared_dependencies(workspace: Path) -> WorkspaceManifests:
     # 1. Node package.json files
     for pkg_json in manifest_files["package.json"]:
         try:
-            data = json.loads(pkg_json.read_text(encoding="utf-8", errors="ignore"))
+            data = json.loads(safe_read_text(pkg_json, encoding="utf-8", errors="ignore"))
         except ValueError:
             continue
         if not isinstance(data, dict):
@@ -451,19 +454,19 @@ def load_declared_dependencies(workspace: Path) -> WorkspaceManifests:
     # 2. Python pyproject.toml & requirements*.txt
     for pyproj in manifest_files["pyproject.toml"]:
         manifests.has_python_manifest = True
-        for name in _pyproject_dependency_names(pyproj.read_text(encoding="utf-8", errors="ignore")):
+        for name in _pyproject_dependency_names(safe_read_text(pyproj, encoding="utf-8", errors="ignore")):
             _add_python_dep(manifests, name)
 
     for req_file in manifest_files["req"]:
         manifests.has_python_manifest = True
-        for line in req_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+        for line in safe_read_text(req_file, encoding="utf-8", errors="ignore").splitlines():
             egg = re.search(r"#egg=([A-Za-z0-9_.-]+)", line)
             _add_python_dep(manifests, egg.group(1) if egg else line)
 
     # 3. Go go.mod files
     for gomod in manifest_files["go.mod"]:
         manifests.has_go_manifest = True
-        text = gomod.read_text(encoding="utf-8", errors="ignore")
+        text = safe_read_text(gomod, encoding="utf-8", errors="ignore")
         for m_mod in re.finditer(r"^\s*module\s+(\S+)", text, re.MULTILINE):
             manifests.go_modules.add(m_mod.group(1).strip())
         for m_req in GO_REQUIRE_RE.finditer(text):
@@ -472,7 +475,7 @@ def load_declared_dependencies(workspace: Path) -> WorkspaceManifests:
     # 4. Rust Cargo.toml files
     for cargo in manifest_files["Cargo.toml"]:
         manifests.has_rust_manifest = True
-        own, deps = cargo_dependencies(cargo.read_text(encoding="utf-8", errors="ignore"))
+        own, deps = cargo_dependencies(safe_read_text(cargo, encoding="utf-8", errors="ignore"))
         manifests.rust_crates |= {n.replace("-", "_") for n in own}
         for key, val in deps.items():
             manifests.rust_crates.add(key.replace("-", "_"))

@@ -21,6 +21,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from prufgate.process import git_command
+from prufgate.safe_fs import safe_read_text
+
 try:
     import yaml
 except ImportError:  # pragma: no cover
@@ -69,6 +72,7 @@ CONFIG_KEYS = {
     "enable_low_confidence",
     "bola",
     "ai_adjudicate",
+    "enforcement",
 }
 BOLA_KEYS = {"global_tables"}
 REGISTRY_CHECK_KEYS = {"offline_ok", "max_age_days", "max_lookups"}
@@ -172,7 +176,7 @@ EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 def _git(args: list[str], cwd: Path | str | None) -> str:
     try:
         res = subprocess.run(
-            ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+            git_command(*args),
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -444,6 +448,7 @@ class PrufGateConfig:
     enable_low_confidence: bool = False
     bola_global_tables: list[str] = field(default_factory=list)
     ai_adjudicate: AiAdjudicate = field(default_factory=AiAdjudicate)
+    enforcement: dict[str, Any] = field(default_factory=lambda: {"mode": "strict", "blocking_rules": [], "minimum_confidence": "low"})
     source_path: Path | None = None
 
     def is_excluded(self, rel_path: str) -> bool:
@@ -552,7 +557,7 @@ class PrufGateConfig:
                 return cls()
             p = found
 
-        raw = cls._read_raw_file(p)
+        raw = cls._read_raw_file(p, root=root if explicit_path is None else p.parent)
         if not isinstance(raw, dict):
             raise ConfigError(f"{p}: expected a top-level mapping/object")
         if not all(isinstance(k, str) for k in raw):
@@ -607,6 +612,19 @@ class PrufGateConfig:
             )
 
         ai_adjudicate = _parse_ai_adjudicate(raw.get("ai_adjudicate"))
+        enforcement = raw.get("enforcement", {})
+        if not isinstance(enforcement, dict) or set(enforcement) - {"mode", "blocking_rules", "minimum_confidence"}:
+            raise ConfigError("enforcement must contain only mode, blocking_rules and minimum_confidence")
+        mode = enforcement.get("mode", "strict")
+        if mode not in ("strict", "advisory", "selected"):
+            raise ConfigError("enforcement.mode must be strict, advisory or selected")
+        blocking_rules = _parse_str_list(enforcement.get("blocking_rules"), "enforcement.blocking_rules")
+        if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", rule) for rule in blocking_rules):
+            raise ConfigError("enforcement.blocking_rules requires exact rule IDs, without wildcards")
+        minimum = enforcement.get("minimum_confidence", "high" if mode == "selected" else "low")
+        if minimum not in ("high", "medium", "low"):
+            raise ConfigError("enforcement.minimum_confidence must be high, medium or low")
+        enforcement = {"mode": mode, "blocking_rules": blocking_rules, "minimum_confidence": minimum}
         exempt = _parse_exempt(raw.get("exempt"))
         bola_global_tables = _parse_bola(raw.get("bola"))
         registry_check, registry_offline_ok, registry_max_age_days, registry_max_lookups = _parse_registry_check(
@@ -648,6 +666,7 @@ class PrufGateConfig:
             enable_low_confidence=enable_low_confidence,
             bola_global_tables=bola_global_tables,
             ai_adjudicate=ai_adjudicate,
+            enforcement=enforcement,
             source_path=p,
         )
 
@@ -706,9 +725,9 @@ class PrufGateConfig:
         return replace(self, source_path=None) == replace(other, source_path=None)
 
     @staticmethod
-    def _read_raw_file(p: Path) -> Any:
+    def _read_raw_file(p: Path, root: Path | None = None) -> Any:
         try:
-            content = p.read_text(encoding="utf-8")
+            content = safe_read_text(p, encoding="utf-8", root=root)
         except (OSError, UnicodeDecodeError) as e:
             raise ConfigError(f"{p}: cannot be read as UTF-8 text: {e}") from e
         if p.suffix.lower() in {".yaml", ".yml"}:

@@ -233,6 +233,20 @@ It also folds in the diff findings of engines 1 to 4. Output formats: `markdown`
 
 `--ai` (optional) sends the changed hunks to a provider you choose: an API (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OLLAMA_HOST`, model in `PRUFGATE_AI_MODEL`) or a local agent CLI. The model's output is treated as untrusted: a comment must point at a line the diff adds, and suggestions are validated like the deterministic ones. API keys are never printed, and provider errors are redacted. Sending code to a provider is your decision; the default mode sends nothing anywhere. The diff can carry prompt injection, so local agent CLIs get it on stdin and run one-shot with the least tool access each offers: `auto` picks only `claude`, run with every tool and MCP server off. `codex` (`exec`, read-only sandbox), `gemini` (`-p`, plan mode) and `opencode` (`run`) can still read files on your machine, so they run only when you name them with `--ai-provider`.
 
+Review compares the current workspace with the merge base, including committed,
+staged, unstaged and untracked changes. This is the same comparison used to select
+files in changed-file scans. Inline ignores must be in actual comment tokens;
+quoted examples cannot suppress findings. Frontend route checks ignore commented
+calls and quoted examples while preserving the locations of executable calls.
+
+An explicitly requested AI review that cannot run is an error (exit 2). Its output
+must be a valid findings array with correctly typed fields; an empty array means
+clean, while malformed output, findings outside the changed lines, and provider
+truncation are errors. Diffs over 24,000 characters are rejected with an explicit
+incomplete-review diagnostic before contacting a provider. No suffix is silently
+discarded. This applies to `review --ai`; adjudication retains its existing rule
+that an unavailable judge keeps the deterministic finding.
+
 ## Differential test verification (opt-in, runs repository code)
 
 `prufgate verify --differential` is the strongest evidence of test tampering: it runs the base branch's tests on the head code. A test that was deleted or weakened so the change would pass fails again in its base version.
@@ -307,7 +321,14 @@ Each finding names the transcript line and, when the transcript has one, the tim
 `prufgate.sh` also runs these when they are installed. Each is skipped (and says so) when it is not.
 
 - **ast-grep**: the built-in rule `configs/ast-grep/rules/action-authorization-guard.yml` and your own rules in `.prufgate/rules/`. See [CUSTOM_RULES.md](CUSTOM_RULES.md).
-- **gitleaks**: secret scanning with PrufGate's defaults (`configs/gitleaks.toml`) extended by your `.gitleaks.toml`.
+- **gitleaks**: secret scanning with the project's `.gitleaks.toml` and local includes read from the comparison base, plus PrufGate's report/build exclusions. Branch policy changes require maintainer review and take effect after merge. Includes must remain inside the workspace and within Gitleaks' supported inheritance depth; directory-only scans use the current policy because there is no Git base. The pinned Gitleaks 8.30.1 is used for integration checks. Python 3.9/3.10 use the conditional `tomli` dependency to parse policy; newer Python versions use `tomllib`.
 - **zizmor**: GitHub Actions workflow security. Severity follows zizmor's own severity and confidence: High is blocking (P1; a High-confidence `template-injection` is P0), Medium is P2 (P3 with Low confidence), Low and Informational are P3, and `unpinned-uses` is always P2. The reported line is the finding's primary location.
+
+Executed scanners must produce structurally valid output and an accepted exit
+code. Gitleaks and ast-grep use 0/1; zizmor uses 0 or its finding codes 10–14.
+Other codes, missing output, invalid JSON, duplicate fields, malformed findings,
+and a finding exit code with no findings make the gate an ERROR. The REST API
+validates SARIF run/result metadata and refuses to label blocking findings PASSED
+when a scanner incorrectly exits clean.
 
 In a changed-files run each tool sees only the change: see [A changed scan judges only the changed lines](GETTING_STARTED.md#a-changed-scan-judges-only-the-changed-lines).

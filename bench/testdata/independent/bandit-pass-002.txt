@@ -1,0 +1,38 @@
+# Extracted/modified for PrufGate evaluation; upstream notices and licenses are retained beside this corpus.
+-- label.yaml --
+category: fabrication
+description: Bandit B110 fixture comments; typed exceptions follow its check_typed_exception=True interpretation. Case-rule presence, not finding counts.
+must_fire:
+- unhandled-empty-catch
+must_not_fire: []
+evaluation:
+  language: python
+  framework: none
+  profile: core
+  origin: open-source
+  split: holdout
+  author: PrufGate corpus adapter
+  reviewers: []
+  label_basis: upstream-fixture
+  label_scope: explicit
+  upstream_labels:
+    manifest: manifest.json
+    case: bandit-pass-002
+    selector: 'example block 2: bad'
+    source_id: bandit-pass
+  source:
+    url: https://github.com/PyCQA/bandit
+    revision: 48ef27bd1bbc32f4e585c92310f7a574e87f6b04
+    path: examples/try_except_pass.py
+    license: Apache-2.0
+    permission: Pinned upstream license; retained in licenses/bandit_license.txt
+    modifications:
+    - Extracted standalone example into an added-file diff; labels mapped to PrufGate rule IDs.
+    archive_sha256: 2393538e58c1e2d5e69d8fc52196f7c8688c1609f248e2a86b1fe8a850a52ff0
+    license_sha256: 09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b
+    upstream_sha256: 2393538e58c1e2d5e69d8fc52196f7c8688c1609f248e2a86b1fe8a850a52ff0
+-- head/src/example.py --
+try:
+    a = 1
+except Exception:
+    pass

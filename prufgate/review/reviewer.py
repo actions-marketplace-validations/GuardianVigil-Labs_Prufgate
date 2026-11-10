@@ -33,12 +33,19 @@ if str(_THIS_DIR.parent.parent) not in sys.path:
 
 from prufgate import __version__, inline_ignore  # noqa: E402
 from prufgate.anti_fabrication.literals import search_code  # noqa: E402
-from prufgate.bola.bola_engine import INTERNAL_SCANNER_PATHS, is_self_scan, is_test_path  # noqa: E402
+from prufgate.bola.bola_engine import (  # noqa: E402
+    INTERNAL_SCANNER_PATHS,
+    is_self_scan,
+    is_test_path,
+)
 from prufgate.config import ConfigError  # noqa: E402
 from prufgate.diff_guard.tamper_detector import scan_diff_for_tampering  # noqa: E402
+from prufgate.privacy import redact, redact_data  # noqa: E402
+from prufgate.process import git_command  # noqa: E402
 from prufgate.report_formats import gitlab_code_quality, junit_xml  # noqa: E402
 from prufgate.review.ai_adapter import review_diff_with_ai  # noqa: E402
 from prufgate.rules import low_confidence_enabled, review_rule_id, visible  # noqa: E402
+from prufgate.safe_fs import safe_read_text, safe_write_text  # noqa: E402
 from prufgate.sarif import add_partial_fingerprints  # noqa: E402
 
 
@@ -109,7 +116,7 @@ class DiffUnavailableError(RuntimeError):
 
 
 def _git_diff(args: list[str], cwd: str | None) -> str | None:
-    res = subprocess.run(["git", "diff", "--text", "--no-ext-diff", "--no-textconv", *args], capture_output=True, text=True, errors="replace", check=False, cwd=cwd)
+    res = subprocess.run(git_command("diff", "--text", "--no-ext-diff", "--no-textconv", *args), capture_output=True, text=True, errors="replace", check=False, cwd=cwd)
     return res.stdout if res.returncode == 0 else None
 
 
@@ -127,24 +134,26 @@ def get_git_diff(base_ref: str = DEFAULT_BASE, cwd: Path | None = None, strict: 
         raise DiffUnavailableError(f"invalid base ref: {base_ref!r}")
     run_cwd = str(cwd) if cwd else None
     probe = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", "HEAD"], capture_output=True, text=True, check=False, cwd=run_cwd
+        git_command("rev-parse", "--verify", "--quiet", "HEAD"), capture_output=True, text=True, check=False, cwd=run_cwd
     )
     if probe.returncode != 0:
         raise DiffUnavailableError("not a git repository with commits; pass --diff-file to review a diff")
-    candidates = [base_ref] if base_ref.startswith("origin/") else [base_ref, f"origin/{base_ref}"]
-    resolved = False
-    for ref in candidates:
-        out = _git_diff(["--end-of-options", f"{ref}...HEAD"], run_cwd)
-        if out is not None:
-            resolved = True
-            if out.strip():
-                return out
-    if strict and not resolved:
-        raise DiffUnavailableError(f"base ref {base_ref!r} does not resolve in this repository")
-    out = _git_diff(["HEAD"], run_cwd)
+    from prufgate.anti_reward_hacking.test_integrity import _untracked_as_diff
+    from prufgate.config import GitDiffError, _diff_base
+
+    try:
+        commit = _diff_base(base_ref, cwd)
+    except GitDiffError as exc:
+        if strict:
+            raise DiffUnavailableError(f"base ref {base_ref!r} does not resolve in this repository") from exc
+        commit = "HEAD"
+    out = _git_diff(["--end-of-options", commit], run_cwd)
     if out is None:
-        raise DiffUnavailableError("git diff HEAD failed")
-    return out
+        raise DiffUnavailableError("git diff failed")
+    try:
+        return out + _untracked_as_diff(cwd)
+    except GitDiffError as exc:
+        raise DiffUnavailableError("cannot read untracked changes") from exc
 
 
 def parse_diff_hunks(diff_text: str) -> list[dict[str, Any]]:
@@ -469,10 +478,11 @@ def run_hybrid_review(
         if ai_res.status != "executed":
             # --ai was asked for: say plainly when it did not run, never look like a clean AI pass.
             print(f"prufgate review: AI review {ai_res.status} ({ai_res.provider}): {ai_res.note}", file=sys.stderr)
+            raise DiffUnavailableError(f"requested AI review incomplete: {ai_res.note}")
         for item in ai_res.comments:
-            # Keep only comments pinned to a line this diff adds; drop anything else the model invents.
+            # Invented locations make the requested review incomplete.
             if (item.get("file"), item.get("line")) not in added:
-                continue
+                raise DiffUnavailableError("AI response contains findings outside the reviewed changed lines")
             suggestion = item.get("suggestion")
             comments.append(
                 PRComment(
@@ -640,7 +650,7 @@ def run_self_check() -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     if "--self-check" in raw_args:
         return run_self_check()
@@ -671,7 +681,7 @@ def main(argv: list[str] | None = None) -> int:
     # findings off. The default base may be absent; its diff falls back to HEAD.
     cfg_ref = None if args.diff_file else args.base
     if cfg_ref == DEFAULT_BASE and subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", "--end-of-options", f"{DEFAULT_BASE}^{{commit}}"],
+        git_command("rev-parse", "--verify", "--quiet", "--end-of-options", f"{DEFAULT_BASE}^{{commit}}"),
         cwd=ws_path if ws_path.exists() else None, capture_output=True, check=False,
     ).returncode != 0:
         cfg_ref = "HEAD"
@@ -686,7 +696,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.diff_file:
-            diff_text = Path(args.diff_file).read_text(encoding="utf-8", errors="replace")
+            diff_text = safe_read_text(Path(args.diff_file), encoding="utf-8", errors="replace")
         else:
             # The default base may be absent (a local-only repository); any other base must resolve.
             diff_text = get_git_diff(
@@ -699,10 +709,8 @@ def main(argv: list[str] | None = None) -> int:
     if not diff_text:
         if not args.format:
             print("  [PR Reviewer] No git diff found. Clean branch or uncommitted changes.")
-        Path(output_json).parent.mkdir(parents=True, exist_ok=True)
-        Path(output_json).write_text("[]", encoding="utf-8")
-        Path(output_md).parent.mkdir(parents=True, exist_ok=True)
-        Path(output_md).write_text("# PR Review\n\nNo changed lines to review.\n", encoding="utf-8")
+        safe_write_text(Path(output_json), "[]", encoding="utf-8")
+        safe_write_text(Path(output_md), "# PR Review\n\nNo changed lines to review.\n", encoding="utf-8")
         if args.format == "json":
             print("[]")
         elif args.format == "sarif":
@@ -727,16 +735,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"reviewer: error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     comments = visible(comments, enable_low)
+    for comment in comments:
+        comment.message = redact(comment.message)
+        comment.title = redact(comment.title)
+        comment.file_path = redact(comment.file_path)
+        if comment.suggestion:
+            comment.suggestion = redact(comment.suggestion)
 
-    Path(output_json).parent.mkdir(parents=True, exist_ok=True)
-    Path(output_json).write_text(json.dumps([c.to_dict() for c in comments], indent=2), encoding="utf-8")
+    safe_write_text(Path(output_json), json.dumps(redact_data([c.to_dict() for c in comments]), indent=2), encoding="utf-8")
 
     md_text = format_review_markdown(comments)
-    Path(output_md).parent.mkdir(parents=True, exist_ok=True)
-    Path(output_md).write_text(md_text, encoding="utf-8")
+    safe_write_text(Path(output_md), md_text, encoding="utf-8")
 
     if args.format == "json":
-        print(json.dumps([c.to_dict() for c in comments], indent=2))
+        print(json.dumps(redact_data([c.to_dict() for c in comments]), indent=2))
     elif args.format == "sarif":
         print(format_review_sarif(comments, ws_path))
     elif args.format == "github":
@@ -752,6 +764,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # Exit 0: no P0/P1. 1: a P0/P1 comment. 2: the diff could not be read.
     return 1 if any(c.severity in ("P0", "P1") for c in comments) else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except OSError as exc:
+        print(f"reviewer: report or input access refused: {exc.__class__.__name__}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

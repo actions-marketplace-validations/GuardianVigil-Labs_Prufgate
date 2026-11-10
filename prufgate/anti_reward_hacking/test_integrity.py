@@ -65,7 +65,9 @@ from prufgate.config import (  # noqa: E402, F401 -- git helpers re-exported for
     _diff_base,
     _git,
 )
+from prufgate.privacy import redact  # noqa: E402
 from prufgate.rules import visible  # noqa: E402
+from prufgate.safe_fs import safe_read_bytes, safe_read_text, safe_write_text  # noqa: E402
 
 
 @dataclass
@@ -81,7 +83,8 @@ class Finding:
     end_line: int = 0
 
     def __post_init__(self) -> None:
-        self.text = self.text.strip()[:140]
+        self.text = redact(self.text.strip())[:140]
+        self.message = redact(self.message)
         if not self.message:
             self.message = f"Test integrity violation ({self.rule}): {self.text}"
 
@@ -1092,7 +1095,7 @@ def _assertion_helpers(path: Path, content: str, lang: str) -> set[str]:
             if sib.name == path.name:
                 continue
             try:
-                for name, body in _function_bodies(sib.read_text(encoding="utf-8", errors="ignore"), lang).items():
+                for name, body in _function_bodies(safe_read_text(sib, encoding="utf-8", errors="ignore"), lang).items():
                     bodies.setdefault(name, body)
             except OSError:
                 continue
@@ -1224,7 +1227,7 @@ def _load_tsconfig_paths(start_dir: Path | None) -> list[tuple[str, list[str]]]:
             if not cfg_file.is_file():
                 continue
             try:
-                raw = cfg_file.read_text(encoding="utf-8", errors="ignore")
+                raw = safe_read_text(cfg_file, encoding="utf-8", errors="ignore")
                 cleaned = re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", raw)
                 cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
                 data = json.loads(cleaned)
@@ -1951,7 +1954,7 @@ def _unchanged_production_text(
             try:
                 sz = (root / rel).stat().st_size
                 if sz <= limit:
-                    parts.append((root / rel).read_text(encoding="utf-8", errors="ignore"))
+                    parts.append(safe_read_text(root / rel, encoding="utf-8", errors="ignore"))
                     total += sz
                     if total >= max_total:
                         return "\n".join(parts)
@@ -2440,7 +2443,7 @@ def _removed_test_findings(
         still_in_p: set[str] = set()
         if repo_root is not None:
             try:
-                still_in_p = _defined((Path(repo_root) / p).read_text(encoding="utf-8", errors="ignore").splitlines())
+                still_in_p = _defined(safe_read_text(Path(repo_root) / p, encoding="utf-8", errors="ignore").splitlines())
             except OSError:
                 pass
         lost_defs[p] = _defined(r) - added_defs - still_in_p
@@ -2451,7 +2454,7 @@ def _removed_test_findings(
         content = None
         if repo_root is not None:
             try:
-                content = (Path(repo_root) / new).read_text(encoding="utf-8", errors="replace")
+                content = safe_read_text(Path(repo_root) / new, encoding="utf-8", errors="replace")
             except OSError:
                 content = None
         for h in hunks:
@@ -2481,7 +2484,7 @@ def _removed_test_findings(
         if path in deleted or any(h.is_new_file for h in file_hunks):
             continue
         try:
-            head = (Path(repo_root) / path).read_text(encoding="utf-8", errors="replace").splitlines()
+            head = safe_read_text(Path(repo_root) / path, encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
         base = _base_from_head(head, file_hunks)
@@ -2615,7 +2618,7 @@ def scan_diff_for_reward_hacking(
         if root_dir is None:
             return None
         try:
-            return (root_dir / rel).read_text(encoding="utf-8", errors="ignore").splitlines()
+            return safe_read_text(root_dir / rel, encoding="utf-8", errors="ignore").splitlines()
         except OSError:
             return None
 
@@ -2748,7 +2751,7 @@ def scan_diff_for_reward_hacking(
                                 try:
                                     c_lines = list(
                                         enumerate(
-                                            candidate.read_text(encoding="utf-8", errors="ignore").splitlines(),
+                                            safe_read_text(candidate, encoding="utf-8", errors="ignore").splitlines(),
                                             start=1,
                                         )
                                     )
@@ -3720,7 +3723,7 @@ def _untracked_as_diff(cwd: Path | str | None) -> str:
     parts: list[str] = []
     for rel in _untracked_files(cwd):
         try:
-            data = (top / rel).read_bytes()
+            data = safe_read_bytes(top / rel)
         except OSError:
             continue
         if b"\0" in data[:8192]:
@@ -3809,7 +3812,7 @@ def _iter_test_files(roots: list[Path]) -> list[Path]:
             if _skipped_dir(p.relative_to(r).parts):
                 continue
             try:
-                content_peek = p.read_text(encoding="utf-8", errors="ignore") if p.suffix == ".rs" else ""
+                content_peek = safe_read_text(p, encoding="utf-8", errors="ignore") if p.suffix == ".rs" else ""
             except OSError:
                 content_peek = ""
             if is_test_file(p, content_peek):
@@ -3862,7 +3865,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if diff_file:
             try:
-                diff_text = Path(diff_file).read_text(encoding="utf-8", errors="replace")
+                diff_text = safe_read_text(Path(diff_file), encoding="utf-8", errors="replace")
             except OSError as e:
                 print(f"test_integrity: cannot read --diff-file {diff_file}: {e.strerror or e}", file=sys.stderr)
                 return 2
@@ -3897,7 +3900,7 @@ def main(argv: list[str] | None = None) -> int:
         if not include_self and is_internal_path(tf):
             continue
         try:
-            content = tf.read_text(encoding="utf-8", errors="replace")
+            content = safe_read_text(tf, encoding="utf-8", errors="replace")
         except OSError as e:
             print(f"test_integrity: cannot read {tf}: {e.strerror or e}", file=sys.stderr)
             return 2
@@ -3922,7 +3925,7 @@ def main(argv: list[str] | None = None) -> int:
     if json_out:
         out_path = Path(json_out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps([f.to_dict() for f in deduped], indent=2) + "\n", encoding="utf-8")
+        safe_write_text(out_path, json.dumps([f.to_dict() for f in deduped], indent=2) + "\n", encoding="utf-8")
 
     for adv in debt_advisories:
         print(f"notice: {adv}", file=sys.stderr)

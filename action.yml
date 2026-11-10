@@ -6,6 +6,14 @@ branding:
   color: 'blue'
 
 inputs:
+  profile:
+    description: 'core runs Engines 1-5 and matches CLI check, MCP fast_scan and editor scans; battery adds diff review and external scanners.'
+    required: false
+    default: 'battery'
+  allow_external_ai:
+    description: 'Explicitly permit AI adjudication when the trusted configuration enables it. Sends finding messages and bounded source windows to the configured provider.'
+    required: false
+    default: 'false'
   battery:
     description: 'Verification mode: fast (changed files), review/full (entire workspace), bola, test-audit'
     required: false
@@ -22,10 +30,14 @@ inputs:
     description: 'Fail the workflow step when P0/P1 blocker findings are detected'
     required: false
     default: 'true'
-  image:
-    description: 'Container image to run when the runner has no python3 (container mode). The default is the signed release image of this version.'
+  execution:
+    description: 'Execution mode: auto (native when all dependencies are installed, otherwise container), native, or container. Container mode always honors image.'
     required: false
-    default: 'ghcr.io/guardianvigil-labs/prufgate:1.3.0'
+    default: 'auto'
+  image:
+    description: 'Container image used in container mode. The default is the signed release image of this version; an action pinned to an unreleased commit needs an image built from that commit.'
+    required: false
+    default: 'ghcr.io/guardianvigil-labs/prufgate:1.4.0'
   base_ref:
     description: 'Git ref that changed files are compared with in fast mode. Defaults to the pull request base branch (origin/<base>). Check out with fetch-depth: 0 so that ref exists.'
     required: false
@@ -38,12 +50,26 @@ inputs:
     description: 'Keep the same summary as one pull request comment, updated on every run. Needs permissions: pull-requests: write. A pull request from a fork gets a read-only token, so no comment is posted there (a warning, not a failure).'
     required: false
     default: 'false'
+  github_checks:
+    description: 'Publish a separate Check Run with changed-line annotations and coverage. Requires checks: write. Off by default; fork pull requests are skipped.'
+    required: false
+    default: 'false'
+  checks_token:
+    description: 'Token for the optional Check Run step only. Read only when github_checks is true.'
+    required: false
+    default: ${{ github.token }}
   github_token:
     description: 'Token used to post the pull request comment. Read only when pr_comment is true.'
     required: false
     default: ${{ github.token }}
 
 outputs:
+  scan_status:
+    description: 'Canonical scan status: clean, findings, incomplete, or error'
+    value: ${{ steps.run-prufgate.outputs.scan_status }}
+  result_path:
+    description: 'Versioned JSON result including coverage, explanations and privacy metadata'
+    value: ${{ steps.run-prufgate.outputs.result_path }}
   sarif_path:
     description: 'Absolute path to the synthesized SARIF 2.1.0 report'
     value: ${{ steps.run-prufgate.outputs.sarif_path }}
@@ -51,21 +77,18 @@ outputs:
     description: 'Absolute path to the synthesized Markdown report'
     value: ${{ steps.run-prufgate.outputs.markdown_path }}
   verdict:
-    description: 'Overall audit verdict: PASSED or FAILED'
+    description: 'Overall audit verdict: PASSED, FAILED (blockers), or ERROR (execution incomplete)'
     value: ${{ steps.run-prufgate.outputs.verdict }}
   exit_code:
     description: 'Exit code of the gate: 0 clean, 1 blocking findings, 2 PrufGate could not run'
     value: ${{ steps.run-prufgate.outputs.exit_code }}
+  execution_mode:
+    description: 'Selected execution mode: native or container'
+    value: ${{ steps.run-prufgate.outputs.execution_mode }}
 
 runs:
   using: 'composite'
   steps:
-    - name: Ensure reports directory
-      shell: bash
-      env:
-        GITHUB_WORKSPACE: ${{ github.workspace }}
-      run: mkdir -p "${GITHUB_WORKSPACE}/reports"
-
     - name: Run PrufGate Verification
       id: run-prufgate
       shell: bash
@@ -76,43 +99,12 @@ runs:
         GITHUB_WORKSPACE: ${{ github.workspace }}
         PRUFGATE_BATTERY: ${{ inputs.battery }}
         FAIL_ON_BLOCKER: ${{ inputs.fail_on_blocker }}
+        PRUFGATE_EXECUTION: ${{ inputs.execution }}
+        PRUFGATE_PROFILE: ${{ inputs.profile }}
+        ALLOW_EXTERNAL_AI: ${{ inputs.allow_external_ai }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
-        set +e
-        if [ -f "${ACTION_PATH}/prufgate.sh" ] && command -v python3 >/dev/null 2>&1; then
-          WORKSPACE="${GITHUB_WORKSPACE}" bash "${ACTION_PATH}/prufgate.sh" "${PRUFGATE_BATTERY}"
-          EXIT_CODE=$?
-        else
-          if [ -z "${PRUFGATE_IMAGE}" ]; then
-            echo "::error::python3 is not available and no image input was given."
-            exit 2
-          fi
-          IMAGE_TO_RUN="${PRUFGATE_IMAGE}"
-          echo "Using PrufGate container image: ${IMAGE_TO_RUN} (mode: ${PRUFGATE_BATTERY})"
-          docker run --rm \
-            --network host \
-            -e PRUFGATE_UID="$(id -u)" \
-            -e PRUFGATE_GID="$(id -g)" \
-            -e TARGET_URL="${TARGET_URL}" \
-            -e PRUFGATE_BASE_REF="${PRUFGATE_BASE_REF}" \
-            -e GITHUB_BASE_REF="${GITHUB_BASE_REF:-}" \
-            -e CI="true" \
-            -v "${GITHUB_WORKSPACE}:/workspace" \
-            "${IMAGE_TO_RUN}" "${PRUFGATE_BATTERY}"
-          EXIT_CODE=$?
-        fi
-
-        echo "sarif_path=${GITHUB_WORKSPACE}/reports/prufgate.sarif" >> "${GITHUB_OUTPUT}"
-        echo "markdown_path=${GITHUB_WORKSPACE}/reports/prufgate-review.md" >> "${GITHUB_OUTPUT}"
-        echo "exit_code=${EXIT_CODE}" >> "${GITHUB_OUTPUT}"
-        if [ $EXIT_CODE -eq 0 ]; then
-          echo "verdict=PASSED" >> "${GITHUB_OUTPUT}"
-        else
-          echo "verdict=FAILED" >> "${GITHUB_OUTPUT}"
-          if [ "${FAIL_ON_BLOCKER}" = "true" ]; then
-            exit $EXIT_CODE
-          fi
-        fi
+        bash "${ACTION_PATH}/scripts/run_action.sh"
 
     - name: Write the PrufGate summary
       if: always() && (inputs.job_summary == 'true' || inputs.pr_comment == 'true') && hashFiles('reports/prufgate.sarif') != ''
@@ -121,6 +113,7 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
         GITHUB_WORKSPACE: ${{ github.workspace }}
         PRUFGATE_IMAGE: ${{ inputs.image }}
+        EXECUTION_MODE: ${{ steps.run-prufgate.outputs.execution_mode }}
         PRUFGATE_BASE_REF: ${{ inputs.base_ref }}
         GATE_EXIT_CODE: ${{ steps.run-prufgate.outputs.exit_code }}
         JOB_SUMMARY: ${{ inputs.job_summary }}
@@ -141,8 +134,8 @@ runs:
           fi
         fi
         SUMMARY_FILE="${RUNNER_TEMP:-/tmp}/prufgate-summary.md"
-        if [ -f "${ACTION_PATH}/prufgate.sh" ] && command -v python3 >/dev/null 2>&1; then
-          python3 "${ACTION_PATH}/prufgate/cli.py" "${ARGS[@]}" "${GITHUB_WORKSPACE}" > "${SUMMARY_FILE}"
+        if [ "${EXECUTION_MODE}" = native ]; then
+          python3 -I "${ACTION_PATH}/prufgate/cli.py" "${ARGS[@]}" "${GITHUB_WORKSPACE}" > "${SUMMARY_FILE}"
           RC=$?
         else
           docker run --rm \
@@ -154,7 +147,7 @@ runs:
             -e GITHUB_API_URL \
             -e PRUFGATE_GITHUB_TOKEN \
             -v "${GITHUB_WORKSPACE}:/workspace" \
-            "${PRUFGATE_IMAGE}" python3 /tools/prufgate/prufgate/cli.py "${ARGS[@]}" /workspace > "${SUMMARY_FILE}"
+            "${PRUFGATE_IMAGE}" python3 -I /tools/prufgate/prufgate/cli.py "${ARGS[@]}" /workspace > "${SUMMARY_FILE}"
           RC=$?
         fi
         if [ "${JOB_SUMMARY}" = "true" ] && [ -s "${SUMMARY_FILE}" ]; then
@@ -162,6 +155,38 @@ runs:
         fi
         if [ "${RC}" -ne 0 ]; then
           echo "::warning::PrufGate could not write or post its summary (exit ${RC}); the gate result is unchanged. See the log above."
+        fi
+
+    - name: Publish PrufGate Check Run
+      if: always() && inputs.github_checks == 'true' && hashFiles('reports/prufgate-result.json') != ''
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        GITHUB_WORKSPACE: ${{ github.workspace }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_API_URL: ${{ github.api_url }}
+        PRUFGATE_IMAGE: ${{ inputs.image }}
+        EXECUTION_MODE: ${{ steps.run-prufgate.outputs.execution_mode }}
+        PRUFGATE_BASE_REF: ${{ inputs.base_ref }}
+        PRUFGATE_CHECKS_TOKEN: ${{ inputs.github_checks == 'true' && inputs.checks_token || '' }}
+        EVENT_NAME: ${{ github.event_name }}
+        HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+      run: |
+        if [ "${EVENT_NAME}" = pull_request ] && [ "${HEAD_REPOSITORY}" != "${GITHUB_REPOSITORY}" ]; then
+          echo '::notice::Check publication skipped for a fork pull request. The local scan result remains available.'
+          exit 0
+        fi
+        ARGS=(github-check --post-check --repo "${GITHUB_REPOSITORY}")
+        [ -n "${PRUFGATE_BASE_REF}" ] && ARGS+=(--base "${PRUFGATE_BASE_REF}")
+        if [ -z "${PRUFGATE_BASE_REF}" ] && [ -n "${GITHUB_BASE_REF:-}" ]; then ARGS+=(--base "origin/${GITHUB_BASE_REF}"); fi
+        if [ "${EXECUTION_MODE}" = native ]; then
+          python3 -I "${ACTION_PATH}/prufgate/cli.py" "${ARGS[@]}" --workspace "${GITHUB_WORKSPACE}" --result "${GITHUB_WORKSPACE}/reports/prufgate-result.json"
+        else
+          docker run --rm \
+            -e PRUFGATE_UID="$(id -u)" -e PRUFGATE_GID="$(id -g)" \
+            -e GITHUB_API_URL -e PRUFGATE_CHECKS_TOKEN \
+            -v "${GITHUB_WORKSPACE}:/workspace" "${PRUFGATE_IMAGE}" \
+            python3 -I /tools/prufgate/prufgate/cli.py "${ARGS[@]}" --workspace /workspace --result /workspace/reports/prufgate-result.json
         fi
 
     - name: Upload SARIF to GitHub Code Scanning

@@ -343,8 +343,8 @@ class TestCheckCommand(AdjudicateBase):
         self.assertNotIn("AI: ", md)
         self.assertEqual(self.provider.prompts, [])
 
-    def test_config_runs_it_in_the_gate(self) -> None:
-        with tempfile.TemporaryDirectory() as reports:
+    def test_config_and_explicit_consent_run_it_in_the_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as reports, patch.dict(os.environ, {"PRUFGATE_ALLOW_EXTERNAL_AI": "1"}):
             synth_rc, md = _synthesize(self.root, Path(reports), [MOCK_FINDING])
         self.assertEqual(synth_rc, 0)
         self.assertIn("AI: seed data for a demo page", md)
@@ -371,9 +371,10 @@ class TestCheckCommand(AdjudicateBase):
         rc, _, _ = _quiet(["check", str(self.root), "--ai-adjudicate"])
         self.assertEqual(rc, 1)
 
-    def test_config_turns_it_on_without_the_flag(self) -> None:
+    def test_config_alone_does_not_transmit_code(self) -> None:
         rc, _, _ = _quiet(["check", str(self.root)])
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.provider.prompts, [])
 
     def test_agent_hooks_mcp_and_api_never_call_it(self) -> None:
         with patch("sys.stdin", io.StringIO("{}")):

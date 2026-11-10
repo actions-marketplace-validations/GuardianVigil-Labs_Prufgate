@@ -27,3 +27,15 @@ By opening a pull request you agree that your contribution is licensed under the
 ## Maintainers
 
 PrufGate is maintained by the GuardianVigil team, listed as the `@GuardianVigil-Labs/prufgate-maintainers` code owners. Maintainers review and merge pull requests, triage issues, and cut releases by pushing a `v*` tag, which only admins can create (`SECURITY.md` says how releases are built and verified). Decisions are made in public issues and pull requests; security reports stay private until fixed.
+
+### Releasing the VS Code extension
+
+The same `v*` tag publishes the VS Code extension (`editors/vscode`): the release workflow builds and tests it, refuses a tag that differs from the version in `editors/vscode/package.json` (kept equal to `prufgate.__version__` by `tests/test_vscode_extension.py`), attaches the `.vsix` to the GitHub release with its provenance, and publishes that same file to the Visual Studio Marketplace. Pre-release tags (`1.4.0-rc.1`) are not published to the Marketplace, which does not accept them. Bump `package.json` and `package-lock.json` with the other version files.
+
+One-time setup, done by an admin:
+
+1. In Azure DevOps, signed in with an account that manages the `GuardianVigil` Marketplace publisher, create a personal access token with organization **All accessible organizations** and the scope **Marketplace > Manage**. Give it the shortest expiry you are willing to renew.
+2. In the repository settings, **Environments > New environment**, create `vscode-marketplace`. Add required reviewers (recommended) and limit deployment to `v*` tags.
+3. In that environment, add the secret `VSCE_PAT` with the token. Store it nowhere else.
+
+If the secret is missing or expired, the Marketplace job fails with a message and nothing is published; the GitHub release still carries the `.vsix`. Fix the secret and re-run the failed job.

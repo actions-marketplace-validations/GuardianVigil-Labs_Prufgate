@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "sampling": "Exception cases: all Bandit B110 example blocks; all ESLint default-option no-empty catch examples; all PMD default-property EmptyCatchBlock tests. TLS: all calls in Bandit's B501 fixture, labeled by its published verification predicate. Selection precedes first PrufGate evaluation; duplicates excluded by exact normalized code and conflicting labels rejected.",
+  "sources": [
+    {
+      "id": "bandit-pass",
+      "url": "https://github.com/PyCQA/bandit",
+      "revision": "48ef27bd1bbc32f4e585c92310f7a574e87f6b04",
+      "path": "examples/try_except_pass.py",
+      "license": "Apache-2.0",
+      "archive": "upstream/bandit-pass.txt",
+      "license_file": "licenses/bandit_license.txt",
+      "modifications": [],
+      "archive_sha256": "2393538e58c1e2d5e69d8fc52196f7c8688c1609f248e2a86b1fe8a850a52ff0",
+      "license_sha256": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
+      "upstream_sha256": "2393538e58c1e2d5e69d8fc52196f7c8688c1609f248e2a86b1fe8a850a52ff0",
+      "license_upstream_path": "LICENSE",
+      "label_source_ids": [
+        "bandit-pass"
+      ]
+    },
+    {
+      "id": "bandit-tls",
+      "url": "https://github.com/PyCQA/bandit",
+      "revision": "48ef27bd1bbc32f4e585c92310f7a574e87f6b04",
+      "path": "examples/requests-ssl-verify-disabled.py",
+      "license": "Apache-2.0",
+      "archive": "upstream/bandit-tls.txt",
+      "license_file": "licenses/bandit_license.txt",
+      "modifications": [
+        "Replaced public example URL destination with https://example.com; no verification settings changed."
+      ],
+      "archive_sha256": "bbd4d95ab9eb458da22859538247dc9641652d3e33b0c24563472ae78f8f32ba",
+      "license_sha256": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
+      "upstream_sha256": "7da634f602141c1331242a7d681ebf2ac128dd9d23973d4b7268845a63848e21",
+      "license_upstream_path": "LICENSE",
+      "label_source_ids": [
+        "bandit-tls-spec"
+      ]
+    },
+    {
+      "id": "bandit-tls-spec",
+      "url": "https://github.com/PyCQA/bandit",
+      "revision": "48ef27bd1bbc32f4e585c92310f7a574e87f6b04",
+      "path": "bandit/plugins/crypto_request_no_cert_validation.py",
+      "license": "Apache-2.0",
+      "archive": "upstream/bandit-tls-spec.txt",
+      "license_file": "licenses/bandit_license.txt",
+      "modifications": [
+        "Replaced public example URL destination with https://example.com; no verification settings changed."
+      ],
+      "archive_sha256": "1bcfc1c0efbc4998b874c2fbc7b77ad6d09b029785e1695bfcd74e5a25982d4a",
+      "license_sha256": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
+      "upstream_sha256": "03211280167b26dce279e2539d15eed249277fba20d41e4623eeae03790b6e5b",
+      "license_upstream_path": "LICENSE",
+      "label_source_ids": [
+        "bandit-tls-spec"
+      ]
+    },
+    {
+      "id": "eslint-empty",
+      "url": "https://github.com/eslint/eslint",
+      "revision": "b11bcb3675871ebffbac2088f85650718f4cf481",
+      "path": "tests/lib/rules/no-empty.js",
+      "license": "MIT",
+      "archive": "upstream/eslint-empty.txt",
+      "license_file": "licenses/eslint_license.txt",
+      "modifications": [],
+      "archive_sha256": "55675ffc787a3765039d015f5edd6832acc466cb159011e9d510692a5f5cd525",
+      "license_sha256": "3b6be04f862a077a4b97929dbf247299360824d9365f8603c263769303ace18c",
+      "upstream_sha256": "55675ffc787a3765039d015f5edd6832acc466cb159011e9d510692a5f5cd525",
+      "license_upstream_path": "LICENSE",
+      "label_source_ids": [
+        "eslint-empty"
+      ]
+    },
+    {
+      "id": "pmd-empty",
+      "url": "https://github.com/pmd/pmd",
+      "revision": "d3e2ec70efec82bb3365ba1cb67a1b25e15a146f",
+      "path": "pmd-java/src/test/resources/net/sourceforge/pmd/lang/java/rule/errorprone/xml/EmptyCatchBlock.xml",
+      "license": "LicenseRef-PMD-BSD-and-Apache",
+      "archive": "upstream/pmd-empty.txt",
+      "license_file": "licenses/pmd_license.txt",
+      "modifications": [],
+      "archive_sha256": "04acbcfdf0ccb3feaf4f10d916fc795827f449d3154c44788827d69248da96dd",
+      "license_sha256": "296dae48eae5658f449a89cf512b8e05386c9c5adfb23d74cfb24efa145625db",
+      "upstream_sha256": "04acbcfdf0ccb3feaf4f10d916fc795827f449d3154c44788827d69248da96dd",
+      "license_upstream_path": "LICENSE",
+      "label_source_ids": [
+        "pmd-empty"
+      ]
+    }
+  ]
+}

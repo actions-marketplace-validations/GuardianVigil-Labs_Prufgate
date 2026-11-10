@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,7 @@ if str(_THIS_DIR.parent) not in sys.path:
 import prufgate.contract_guard as cg_engine  # noqa: E402
 from prufgate import PROJECT_URL, __version__, diff_scope, inline_ignore  # noqa: E402
 from prufgate import baseline as baseline_file  # noqa: E402
+from prufgate import coverage as scan_coverage  # noqa: E402
 from prufgate.anti_fabrication import detector as af_detector  # noqa: E402
 from prufgate.anti_reward_hacking import test_integrity as ti_engine  # noqa: E402
 from prufgate.bola import bola_engine  # noqa: E402
@@ -60,12 +62,20 @@ from prufgate.console import utf8_output  # noqa: E402
 from prufgate.diff_guard import tamper_detector as dg_engine  # noqa: E402
 from prufgate.hooks.adapters import AGENTS, EVENTS  # noqa: E402
 from prufgate.hooks.agent_hooks import AGENT_CHOICES, HookConfigError, init_workspace  # noqa: E402
+from prufgate.process import git_command  # noqa: E402
 from prufgate.report_formats import gitlab_code_quality, junit_xml  # noqa: E402
 from prufgate.review import reviewer as rev_engine  # noqa: E402
 from prufgate.review.adjudicate import adjudicate as ai_adjudicate  # noqa: E402
 from prufgate.rules import SARIF_RANK, visible  # noqa: E402
 from prufgate.rules import confidence as rule_confidence  # noqa: E402
+from prufgate.safe_fs import output_path, safe_read_text, safe_write_text  # noqa: E402
 from prufgate.sarif import add_partial_fingerprints  # noqa: E402
+from prufgate.scan_result import (  # noqa: E402
+    ai_privacy,
+    attach_sarif,
+    make_result,
+    markdown_summary,
+)
 
 
 def run_all_self_checks() -> int:
@@ -147,7 +157,7 @@ def _is_internal(engine: Any, path: str) -> bool:
 def _git_ok(*args: str) -> str | None:
     try:
         # Repository hooks and fsmonitor are commands from the repository under review: never run them.
-        res = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+        res = subprocess.run(git_command(*args),
                              capture_output=True, text=True, check=True)
     except (OSError, subprocess.CalledProcessError):
         return None
@@ -227,10 +237,19 @@ def _collect_in_workspace(
     # uncommitted configuration edit does not apply to it either.
     cfg_ref = base_ref or ("HEAD" if changed_only else None)
     cfg = PrufGateConfig.load(workspace, config_path, ref=cfg_ref) if cfg_ref else head_cfg
+    trace = scan_coverage.current()
+    if trace is not None:
+        trace.base, trace.ranges = cfg_ref, ranges
+        trace.exclusions = [{"pattern": pattern, "reason": "Configured exclusion"} for pattern in cfg.exclude]
+        for engine, names in (("test-integrity", ti_engine.SKIP_DIRS | ti_engine.ROOT_ONLY_SKIP_DIRS), ("bola/contract-guard", bola_engine.SKIP_DIRS)):
+            trace.exclusions += [{"pattern": name + "/", "engine": engine, "reason": "Built-in traversal exclusion"} for name in sorted(names)]
+        trace.exclusions += [{"pattern": "hidden paths, tests, unsupported file types and disabled languages", "engine": "anti-fabrication",
+                              "reason": "Production-source selection rules; other engines may still read these inputs."}]
 
     unified: list[dict[str, Any]] = []
 
     # 1. Engine 1: Anti-Fabrication Detector
+    scan_coverage.step("anti-fabrication")
     af_settings = cfg.to_detector_settings()
     af_detector.apply_settings(af_settings)
     if changed_only:
@@ -242,6 +261,8 @@ def _collect_in_workspace(
     for fpath in af_files:
         rel_f = os.path.normpath(str(fpath)).replace("\\", "/")
         if cfg.is_excluded(rel_f):
+            if trace is not None:
+                trace.exclusions.append({"path": rel_f, "reason": "Configured exclusion"})
             continue
         for f in af_detector.scan_file(Path(rel_f)):
             if cfg.is_exempt(rel_f, f.rule):
@@ -260,6 +281,7 @@ def _collect_in_workspace(
             )
 
     # 2. Engine 2: Anti-Reward-Hacking & Test Integrity
+    scan_coverage.step("test-integrity")
     if changed_only:
         diff_text = ti_engine._get_git_diff(base_ref, cwd=workspace)
         if diff_text:
@@ -296,7 +318,7 @@ def _collect_in_workspace(
         if _is_internal(ti_engine, rel_tf):
             continue
         try:
-            content = tf.read_text(encoding="utf-8", errors="ignore")
+            content = safe_read_text(tf, encoding="utf-8", errors="ignore")
         except OSError:
             continue
         for tf_finding in ti_engine.scan_test_file(tf, content, cfg):
@@ -314,7 +336,11 @@ def _collect_in_workspace(
             )
 
     # 3. Engine 3: Diff-Scoped Tampering Guard (when git diff is available)
+    scan_coverage.step("diff-guard")
     diff_for_dg = dg_engine._get_git_diff(base_ref, cwd=workspace)
+    if not diff_for_dg:
+        if trace is not None:
+            trace.engines[-1].update(status="skipped", reason="No diff input; workspace checks still run.")
     dg_findings = dg_engine.scan_diff_for_tampering(diff_for_dg, config=cfg) if diff_for_dg else []
     # Linter configs and the PrufGate configuration, compared by value with the base.
     dg_findings = dg_engine.with_linter_drift(dg_findings, diff_for_dg, workspace, base_ref, cfg)
@@ -335,6 +361,7 @@ def _collect_in_workspace(
                 )
 
     # 4. Engine 4: Ghost Dependency, API Contract & Env Drift Guard
+    scan_coverage.step("contract-guard", "Single-file scans do not run workspace contract checks." if target_path.is_file() else "", target_path.is_file())
     if target_path.is_dir():
         for cgf in cg_engine.scan_contract_guard(workspace, changed_only=changed_only, config=cfg, base=base_ref or None):
             unified.append(
@@ -350,6 +377,7 @@ def _collect_in_workspace(
             )
 
     # 5. Engine 5: Static Multi-Tenant BOLA Verification
+    scan_coverage.step("bola", "Single-file scans do not run workspace route discovery." if target_path.is_file() else "", target_path.is_file())
     if target_path.is_dir():
         with redirect_stdout(io.StringIO()):
             bola_findings = bola_engine.run_static_matrix_audit(
@@ -369,6 +397,7 @@ def _collect_in_workspace(
                 }
             )
 
+    scan_coverage.step("report-policy")
     if ranges is not None:
         unified = [
             f for f in unified
@@ -430,6 +459,8 @@ def _collect_in_workspace(
             changed_ref=base_ref if changed_only else None,
         )
 
+    if trace is not None:
+        trace.inline_audit = list(records or ())
     for e in records or ():
         if ranges is not None and not diff_scope.in_scope(
             ranges, str(e.get("engine") or ""), str(e.get("rule") or ""), str(e.get("file") or ""),
@@ -449,19 +480,22 @@ def _collect_in_workspace(
                     "confidence": rule_confidence(inline_ignore.MISSING_REASON_RULE),
                 }
             )
-        elif honoured is not None:
+        elif e["kind"] == "honoured" and honoured is not None:
             honoured.append(e)
     # After the debt ratchet, so a dismissal never lowers a known_debt count.
     # AI adjudication only loosens the gate, so only the configuration in effect (read at
     # the base ref) turns it on; `--ai-adjudicate` alone is a request, never enough.
     adj = _trusted_adjudication(workspace, config_path, cfg, cfg_ref) if ai_dismissed is not None else cfg.ai_adjudicate
+    if trace is not None:
+        allowed = bool(ai_dismissed is not None and adj.enabled and (ai_provider is not None or os.environ.get("PRUFGATE_ALLOW_EXTERNAL_AI") == "1"))
+        trace.privacy = ai_privacy(allowed, ai_provider or os.environ.get("PRUFGATE_AI_PROVIDER"))
     if ai_dismissed is not None and ai_provider is not None and not adj.enabled:
         print(
             "notice: --ai-adjudicate ignored: the configuration in effect does not enable `ai_adjudicate`; "
             "running without AI.",
             file=sys.stderr,
         )
-    elif ai_dismissed is not None and adj.enabled:
+    elif ai_dismissed is not None and adj.enabled and (ai_provider is not None or os.environ.get("PRUFGATE_ALLOW_EXTERNAL_AI") == "1"):
         provider = ai_provider or os.environ.get("PRUFGATE_AI_PROVIDER") or "auto"
         verdicts, note = ai_adjudicate(
             [(str(f["rule"]), str(f["file"]), int(f["line"]), str(f["message"]), str(f.get("engine") or ""))
@@ -471,6 +505,8 @@ def _collect_in_workspace(
             provider=provider,
         )
         print(f"notice: {note}", file=sys.stderr)
+        if trace is not None:
+            trace.privacy["external_ai"]["outcome"] = note
         for i, reason in verdicts.items():
             ai_dismissed.append({**deduped[i], "kind": "ai-dismissed", "reason": reason})
         deduped = [f for i, f in enumerate(deduped) if i not in verdicts]
@@ -626,50 +662,94 @@ def _stop_hook_active() -> bool:
     return isinstance(data, dict) and data.get("stop_hook_active") is True
 
 
+def _write_result_out(path: str | None, result: dict, workspace: Path) -> bool:
+    """Write --result-out and its .status file. False, and exit 2, when it cannot."""
+    if not path:
+        return True
+    try:
+        out = output_path(Path(path), workspace)
+        status = output_path(Path(path).with_suffix(".status"), workspace)
+        safe_write_text(out, json.dumps(result, indent=2))
+        safe_write_text(status, result["scan_status"] + "\n")
+    except OSError as exc:
+        print(f"prufgate: cannot write the result file ({exc.__class__.__name__}: {exc.strerror or exc})", file=sys.stderr)
+        return False
+    return True
+
+
 def _cmd_check(args: argparse.Namespace) -> int:
     target = Path(args.path).resolve()
-    if not target.exists():
-        print(f"prufgate check: path does not exist: {args.path}", file=sys.stderr)
+    trace = scan_coverage.Coverage(target if target.is_dir() else target.parent, "changed" if args.changed else "workspace", args.base)
+    def write_result(result: dict) -> bool:
+        written = _write_result_out(getattr(args, "result_out", None), result, trace.root)
+        # A result that could not be saved must not print as a pass.
+        if args.format == "result" and written:
+            print(json.dumps(result, indent=2))
+        return written
+    def failure(message: str) -> int:
+        result = make_result([], coverage=trace.to_dict(), errors=[message])
+        from prufgate.workflow import revision
+        result["revision"] = revision(trace.root)
+        write_result(result)
+        print(f"prufgate check: {message}", file=sys.stderr)
         return 2
+    if not target.exists():
+        return failure("Scan path does not exist.")
 
     honoured: list[dict[str, Any]] = []
     dismissed: list[dict[str, Any]] = []
     baselined: list[dict[str, Any]] = []
     try:
-        findings = _collect_unified_findings(
-            target,
-            changed_only=args.changed,
-            base_ref=args.base,
-            config_path=args.config,
-            honoured=honoured,
-            baselined=baselined,
-            # The agent hooks (and the MCP server and REST API, which set the variable)
-            # never call AI adjudication: an agent must not get a judge to iterate against.
-            ai_dismissed=None if args.format == "agent-hook" or os.environ.get("PRUFGATE_NO_AI_ADJUDICATE") else dismissed,
-            ai_provider=(args.ai_provider or os.environ.get("PRUFGATE_AI_PROVIDER") or "auto") if args.ai_adjudicate else None,
-        )
+        with scan_coverage.recording(trace):
+            findings = _collect_unified_findings(
+                target,
+                changed_only=args.changed,
+                base_ref=args.base,
+                config_path=args.config,
+                honoured=honoured,
+                baselined=baselined,
+                # Agent hooks, MCP and REST never call AI adjudication.
+                ai_dismissed=None if args.format == "agent-hook" or os.environ.get("PRUFGATE_NO_AI_ADJUDICATE") else dismissed,
+                ai_provider=(args.ai_provider or os.environ.get("PRUFGATE_AI_PROVIDER") or "auto") if args.ai_adjudicate else None,
+            )
     except (ConfigError, af_detector.SettingsError) as exc:
-        print(f"prufgate check: {exc}", file=sys.stderr)
-        return 2
+        return failure(str(exc))
     except SystemExit as exc:
         # An engine gave up (for example --changed outside a git repository).
-        print(f"prufgate check: an engine stopped the scan (exit {exc.code})", file=sys.stderr)
-        return 2
+        return failure(f"An engine stopped the scan (exit {exc.code}).")
     except Exception as exc:  # an engine crash must never read as a pass
-        print(f"prufgate check: engine error: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+        return failure(f"Engine error: {exc.__class__.__name__}: {exc}")
+
+    trace.step("pr-reviewer", "Use prufgate review or the battery profile for Engine 6.", skipped=True)
+    for tool in ("gitleaks", "ast-grep", "zizmor"):
+        trace.step(tool, "Not requested in the core profile; available through the shell battery.", skipped=True)
+    result = make_result(findings, root=trace.root, coverage=trace.to_dict(), config_path=args.config,
+                         privacy=getattr(trace, "privacy", ai_privacy()), include_code=not getattr(args, "no_code", False))
+    result["governance"]["baselined_findings"] = len(baselined)
+    result["governance"]["inline_suppressions"] = honoured
+    result["governance"]["inline_audit"] = getattr(trace, "inline_audit", [])
+    result["governance"]["ai_dismissed_findings"] = len(dismissed)
+    if not write_result(result):
         return 2
+    findings = result["findings"]
+    blockers = [f for f in findings if f["blocking"]]
 
-    blockers = [f for f in findings if f["severity"] in ("P0", "P1")]
-
-    if args.format == "json":
-        print(json.dumps(findings, indent=2))
+    if args.format == "result":
+        pass  # The versioned report was emitted above, including errors.
+    elif args.format == "json":
+        print(json.dumps(result["findings"], indent=2))
     elif args.format == "sarif":
         # Finding paths are relative to the scanned directory, or to the file's directory for one file.
-        print(_format_sarif_findings(findings, target if target.is_dir() else target.parent, honoured + dismissed + baselined))
+        doc = _sarif_findings_doc(findings, trace.root, honoured + dismissed + baselined)
+        print(json.dumps(attach_sarif(doc, result), indent=2))
     elif args.format in ("gitlab", "junit"):
         doc = _sarif_findings_doc(findings, target if target.is_dir() else target.parent, honoured + dismissed + baselined)
+        attach_sarif(doc, result)
         print(gitlab_code_quality(doc) if args.format == "gitlab" else junit_xml(doc))
     elif args.format == "agent-hook":
+        if result["scan_status"] in ("error", "incomplete"):
+            print("PrufGate could not complete: " + "; ".join(result["errors"] + result["incomplete_reasons"]), file=sys.stderr)
+            return 2
         if blockers:
             print(
                 f"PrufGate Agent Guardrail blocked completion ({len(blockers)} blocker finding(s)):",
@@ -688,6 +768,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
             return 2
         return 0
     else:
+        print(markdown_summary({**result, "findings": []}).strip())
         if honoured:
             print(f"{len(honoured)} finding(s) suppressed by an inline prufgate-ignore:")
             for e in honoured:
@@ -699,14 +780,14 @@ def _cmd_check(args: argparse.Namespace) -> int:
             for e in dismissed:
                 print(f"  [{e['severity']}] [{e['engine']}:{e['rule']}] {e['file']}:{e['line']} — AI: {e['reason']}")
         if not findings:
-            print("✔ PrufGate check passed: 0 findings across Engines 1-5.")
-            return 0
+            print("✔ PrufGate check completed: 0 active findings within the requested scope.")
+            return result["exit_code"]
         print(f"✖ PrufGate check detected {len(findings)} finding(s) ({len(blockers)} blocker(s)):")
         for f in findings:
             print(f"  [{f['severity']}] [{f['engine']}:{f['rule']}] {f['file']}:{f['line']} — {f['message']}")
         print(f"`prufgate explain {findings[0]['rule']}` (or any rule above) says what it catches and how to fix it.")
 
-    return 1 if blockers else 0
+    return result["exit_code"]
 
 
 def _cmd_baseline(args: argparse.Namespace) -> int:
@@ -802,6 +883,7 @@ def _cmd_bola(args: argparse.Namespace) -> int:
             finally:
                 os.chdir(prev_cwd)
         cfg_ref = base_ref or ("HEAD" if args.changed else None)
+        args._effective_base = cfg_ref
         cfg = PrufGateConfig.load(ws, args.config, ref=cfg_ref)
         findings: list[bola_engine.BolaFinding] = []
         extra_paths: list[str] = []
@@ -839,6 +921,17 @@ def _cmd_bola(args: argparse.Namespace) -> int:
             if len(roles_matrix[1]) > args.max_routes:
                 print(f"prufgate bola: {args.roles} lists {len(roles_matrix[1])} routes, over --max-routes {args.max_routes}", file=sys.stderr)
                 return 2
+        if ws.exists():
+            with redirect_stdout(io.StringIO()):
+                ranges = diff_scope.changed_lines(base_ref, ws) if args.changed else None
+                changed = set(ranges) if ranges is not None else None
+                static_findings = bola_engine.run_static_matrix_audit(ws, config=cfg, changed_files=changed)
+                if ranges is not None:
+                    static_findings = [
+                        f for f in static_findings
+                        if diff_scope.in_scope(ranges, "bola", f.rule_id, f.endpoint_or_file, [(f.line, f.end_line)], ws)
+                    ]
+                findings.extend(static_findings)
         if not args.static_only and args.url:
             from prufgate.netguard import target_url_error
 
@@ -847,8 +940,7 @@ def _cmd_bola(args: argparse.Namespace) -> int:
                 print(f"prufgate bola: {url_error}", file=sys.stderr)
                 return 2
             if not bola_engine.check_server_active(args.url):
-                print(f"prufgate bola: {args.url} is not reachable; the live probe did not run.", file=sys.stderr)
-                return 2
+                raise bola_engine.ProbeIncomplete("Target is not reachable; live verification did not run.", findings, {"attempted": 1, "completed": 0, "failed": 1, "verified_cross_tenant": 0, "missing_controls": 0})
             if roles_matrix:
                 from prufgate.bola.role_matrix import RoleMatrixError, run_role_matrix
 
@@ -862,17 +954,6 @@ def _cmd_bola(args: argparse.Namespace) -> int:
                     findings.extend(bola_engine.run_dynamic_matrix(
                         args.url, workspace=ws, config=cfg, extra_paths=extra_paths, max_extra_paths=args.max_routes,
                     ))
-        if ws.exists():
-            with redirect_stdout(io.StringIO()):
-                ranges = diff_scope.changed_lines(base_ref, ws) if args.changed else None
-                changed = set(ranges) if ranges is not None else None
-                static_findings = bola_engine.run_static_matrix_audit(ws, config=cfg, changed_files=changed)
-                if ranges is not None:
-                    static_findings = [
-                        f for f in static_findings
-                        if diff_scope.in_scope(ranges, "bola", f.rule_id, f.endpoint_or_file, [(f.line, f.end_line)], ws)
-                    ]
-                findings.extend(static_findings)
         findings = visible(findings, cfg.enable_low_confidence)
 
         if args.format == "json":
@@ -885,6 +966,13 @@ def _cmd_bola(args: argparse.Namespace) -> int:
                 for f in findings:
                     print(f"  [{f.severity}] [{f.rule_id}] {f.endpoint_or_file}:{f.line} — {f.message}")
         return 1 if any(f.severity in ("P0", "P1") for f in findings) else 0
+    except bola_engine.ProbeIncomplete as exc:
+        if exc.findings is not findings:
+            exc.findings = [*findings, *exc.findings]
+        if args.format == "json":
+            print(json.dumps(exc.to_dict(), indent=2))
+        print(f"prufgate bola: live verification incomplete: {exc}", file=sys.stderr)
+        return 2
     except (ConfigError, GitDiffError) as exc:
         print(f"prufgate bola: {exc}", file=sys.stderr)
         return 2
@@ -897,7 +985,7 @@ def _cmd_bola(args: argparse.Namespace) -> int:
 
 
 def _cmd_review(args: argparse.Namespace) -> int:
-    rev_args = [f"--workspace={args.workspace}", f"--format={args.format}"]
+    rev_args = [f"--workspace={args.workspace}", "--format=json"]
     if args.base:
         rev_args.append(f"--base={args.base}")
     if args.diff_file:
@@ -905,7 +993,155 @@ def _cmd_review(args: argparse.Namespace) -> int:
     if args.ai:
         rev_args.append("--ai")
         rev_args.append(f"--ai-provider={args.ai_provider}")
-    return rev_engine.main(rev_args)
+    output = io.StringIO()
+    with redirect_stdout(output):
+        code = rev_engine.main(rev_args)
+    try:
+        items = json.loads(output.getvalue())
+        if not isinstance(items, list):
+            raise ValueError("expected review findings")
+    except ValueError:
+        items = []
+        code = 2
+    root = Path(args.workspace).resolve()
+    policy_base = args.base
+    if policy_base is None and not args.diff_file:
+        try:
+            from prufgate.config import _diff_base
+            policy_base = _diff_base(rev_engine.DEFAULT_BASE, root)
+        except GitDiffError:
+            policy_base = None
+    result = make_result(items, root=root, profile="review", coverage={"scope": "changed", "base_ref": policy_base},
+                         errors=["Diff review could not complete; see the diagnostic output."] if code not in (0, 1) else [],
+                         privacy=ai_privacy(args.ai, args.ai_provider, "review"))
+    comments = [rev_engine.PRComment(item["file"], item["line"], item["severity"], item.get("title", item["rule"]),
+                                     item.get("message", ""), item.get("suggestion"), item.get("ai", False)) for item in result["findings"]]
+    if args.format == "result":
+        print(json.dumps(result, indent=2))
+    elif args.format == "json":
+        print(json.dumps(result["findings"], indent=2))
+    elif args.format == "sarif":
+        print(json.dumps(attach_sarif(json.loads(rev_engine.format_review_sarif(comments, root)), result), indent=2))
+    elif args.format == "markdown":
+        print(rev_engine.format_review_markdown(comments))
+    elif args.format == "github":
+        print(rev_engine.format_review_github(comments))
+    elif args.format == "reviewdog":
+        print(rev_engine.format_review_reviewdog(comments))
+    else:
+        doc = attach_sarif(json.loads(rev_engine.format_review_sarif(comments, root)), result)
+        print(gitlab_code_quality(doc) if args.format == "gitlab" else junit_xml(doc))
+    return result["exit_code"]
+
+
+def _cmd_dismiss(args: argparse.Namespace) -> int:
+    from prufgate import dismissals
+    from prufgate.result_validation import read_json
+    from prufgate.scan_result import validate_result
+    try:
+        root = Path(args.workspace).resolve()
+        if args.action == "list":
+            events, states = dismissals.load(root)
+            print(json.dumps({"events": events, "states": list(states.values())}, indent=2))
+            return 0
+        if not args.actor or not args.reason:
+            raise dismissals.DismissalError("--actor and --reason are required; identities are explicit review labels")
+        finding = None
+        if args.action == "request":
+            if not args.result or args.finding < 1 or not args.owner:
+                raise dismissals.DismissalError("request requires --result, --finding (1-based), and --owner")
+            result = validate_result(read_json(safe_read_text(Path(args.result))))
+            if args.finding > len(result["findings"]):
+                raise dismissals.DismissalError("finding index is outside the result")
+            finding = result["findings"][args.finding - 1]
+            if not finding.get("fingerprint"):
+                raise dismissals.DismissalError("finding has no stable dismissal fingerprint; regenerate the result")
+        elif not args.dismissal_id:
+            raise dismissals.DismissalError("a dismissal ID is required for review or revocation")
+        action = {"request": "requested", "approve": "approved", "reject": "rejected", "revoke": "revoked"}[args.action]
+        event = dismissals.append(root, action, args.actor, args.reason, dismissal_id=args.dismissal_id,
+                                  finding=finding, owner=args.owner, expires=args.expires)
+        print(json.dumps(event, indent=2))
+        return 0
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"prufgate dismiss: {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_github_check(args: argparse.Namespace) -> int:
+    from prufgate.github_checks import CheckError, prepare, publish
+    from prufgate.result_validation import read_json
+    from prufgate.scan_result import validate_result
+    try:
+        root = Path(args.workspace).resolve()
+        result = validate_result(read_json(safe_read_text(Path(args.result))))
+        payload = prepare(result, root, args.base, args.head_sha)
+        if args.output:
+            safe_write_text(Path(args.output), json.dumps(payload, indent=2))
+        if args.post_check:
+            reply = publish(payload, result, root, args.repo or os.environ.get("GITHUB_REPOSITORY", ""),
+                            os.environ.get("PRUFGATE_CHECKS_TOKEN", ""), os.environ.get("GITHUB_API_URL", "https://api.github.com"))
+            print(json.dumps(reply, indent=2))
+        else:
+            print(json.dumps(payload, indent=2))
+        return 0
+    except (CheckError, OSError, ValueError, RuntimeError) as exc:
+        print(f"prufgate github-check: {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_bola_result(args: argparse.Namespace) -> int:
+    args.format = "json"
+    output = io.StringIO()
+    with redirect_stdout(output):
+        try:
+            code = _cmd_bola(args)
+        except Exception as exc:
+            print(f"BOLA checks failed ({exc.__class__.__name__}).", file=sys.stderr)
+            code = 2
+    incomplete = []
+    probe = None
+    try:
+        data = json.loads(output.getvalue())
+        if isinstance(data, dict) and data.get("status") == "incomplete":
+            incomplete, probe = [str(data.get("error", "Live verification incomplete."))], data.get("coverage")
+            data = data["findings"]
+        if not isinstance(data, list):
+            raise ValueError("expected BOLA findings")
+    except (ValueError, KeyError):
+        data, code = [], 2
+    result = make_result(data, root=Path(args.path).resolve(), profile="bola", incomplete=incomplete, coverage={"base_ref": getattr(args, "_effective_base", args.base)},
+                         errors=["BOLA checks could not complete; see diagnostics."] if code not in (0, 1) and not incomplete else [],
+                         config_path=args.config)
+    if probe is not None:
+        result["coverage"]["live_probe"] = probe
+    if not _write_result_out(getattr(args, "result_out", None), result, Path(args.path).resolve()):
+        return 2
+    print(json.dumps(result, indent=2))
+    return result["exit_code"]
+
+
+def _cmd_test_result(args: argparse.Namespace) -> int:
+    root = Path(args.path or ".").resolve()
+    trace = scan_coverage.Coverage(root if root.is_dir() else root.parent, "changed" if args.changed else "workspace", args.base)
+    error = []
+    with tempfile.TemporaryDirectory(prefix="prufgate-test-result-") as tmp:
+        args.json_out = str(Path(tmp) / "findings.json")
+        try:
+            with scan_coverage.recording(trace), redirect_stdout(io.StringIO()):
+                trace.step("test-integrity")
+                code = _cmd_test_audit(args)
+            items = json.loads(safe_read_text(Path(args.json_out)))
+            if code not in (0, 1) or not isinstance(items, list):
+                raise ValueError("Test audit did not complete.")
+        except (Exception, SystemExit) as exc:
+            items, error = [], [f"Test audit could not complete ({exc.__class__.__name__})."]
+    result = make_result(items, root=trace.root, coverage=trace.to_dict(), profile="test-audit", errors=error,
+                         config_path=args.config)
+    if not _write_result_out(args.result_out, result, trace.root):
+        return 2
+    print(json.dumps(result, indent=2))
+    return result["exit_code"]
 
 
 def _cmd_fix(args: argparse.Namespace) -> int:
@@ -1119,10 +1355,12 @@ def main(argv: list[str] | None = None) -> int:
     p_check.add_argument("--config", default=None, help="Path to .prufgate/config.yaml")
     p_check.add_argument(
         "--format",
-        choices=("text", "json", "sarif", "gitlab", "junit", "agent-hook"),
+        choices=("text", "json", "result", "sarif", "gitlab", "junit", "agent-hook"),
         default="text",
         help="Output format (default: text)",
     )
+    p_check.add_argument("--result-out", help="Write the versioned result envelope to this local file")
+    p_check.add_argument("--no-code", action="store_true", help="Omit source excerpts from the versioned result")
     p_check.add_argument(
         "--ai-adjudicate",
         action="store_true",
@@ -1143,6 +1381,8 @@ def main(argv: list[str] | None = None) -> int:
     p_test.add_argument("--base", default=None, help="Base git ref when using --changed")
     p_test.add_argument("--config", default=None, help="Path to .prufgate/config.yaml")
     p_test.add_argument("--json-out", default=None, help="Write JSON findings to file")
+    p_test.add_argument("--format", choices=("text", "result"), default="text")
+    p_test.add_argument("--result-out", help="Write the versioned result to a local file")
 
     # 3. prufgate bola
     p_bola = subparsers.add_parser("bola", help="Run static + optional live 2-token BOLA verification (Engine 5)")
@@ -1157,7 +1397,8 @@ def main(argv: list[str] | None = None) -> int:
     p_bola.add_argument("--base", default=None, help="Read the PrufGate configuration as it is at this base ref (changed-files runs)")
     p_bola.add_argument("--changed", action="store_true",
                         help="Static checks report only files changed against --base (else HEAD), untracked files included")
-    p_bola.add_argument("--format", choices=("text", "json"), default="text")
+    p_bola.add_argument("--format", choices=("text", "json", "result"), default="text")
+    p_bola.add_argument("--result-out", help="Write the versioned result to a local file (with --format result)")
     p_bola.add_argument(
         "--routes-from", action="append", default=[], metavar="FILE",
         help="Extra GET/HEAD route paths from an OpenAPI/Swagger, Postman v2.1 or HAR file (repeatable); probed on --url only",
@@ -1175,7 +1416,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rev.add_argument("--diff-file", default=None, help="Explicit unified diff file to review")
     p_rev.add_argument(
         "--format",
-        choices=("markdown", "json", "sarif", "github", "reviewdog", "gitlab", "junit"),
+        choices=("markdown", "json", "result", "sarif", "github", "reviewdog", "gitlab", "junit"),
         default="markdown",
         help="Review output format",
     )
@@ -1250,6 +1491,15 @@ def main(argv: list[str] | None = None) -> int:
     p_tr.add_argument("--format-in", choices=("claude", "codex", "text"), default=None, help="Transcript format (default: detect)")
 
     # 5d. prufgate bench
+    p_eval = subparsers.add_parser("evaluate", help="Offline accuracy dashboard with provenance and reviewed-label strata")
+    p_eval.add_argument("--cases", default="bench/cases")
+    p_eval.add_argument("--format", choices=("json", "markdown", "html"), default="json")
+    p_eval.add_argument("--output", help="Write a local report; never publishes")
+    p_eval.add_argument("--independent-only", action="store_true", help="Require reviewed or reproducible upstream holdout labels")
+    p_impact = subparsers.add_parser("impact", help="Map Python callers, tests, routes, schemas and configuration affected by a change")
+    p_impact.add_argument("--workspace", default=".")
+    p_impact.add_argument("--base", default="HEAD")
+
     p_bench = subparsers.add_parser("bench", help="Measure precision and recall of `check --changed` on a labelled corpus")
     p_bench.add_argument("--cases", default=None, help="Corpus directory (default: bench/cases, from a checkout)")
     p_bench.add_argument("--format", choices=("text", "json", "markdown"), default="text")
@@ -1282,6 +1532,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_sum.add_argument("--repo", default=None, help="owner/name (default: GITHUB_REPOSITORY)")
     p_sum.add_argument("--pr", type=int, default=None, help="Pull request number (default: from GITHUB_EVENT_PATH)")
+    p_sum.add_argument("--previous-sarif", help="Compare finding fingerprints with this previous SARIF report")
+
+    p_check_run = subparsers.add_parser("github-check", help="Prepare a Check Run locally; publish only with --post-check")
+    p_check_run.add_argument("--workspace", default=".")
+    p_check_run.add_argument("--result", default="reports/prufgate-result.json")
+    p_check_run.add_argument("--base", help="Comparison base for changed-line annotations")
+    p_check_run.add_argument("--head-sha", help="Require this scanned commit for Check attachment")
+    p_check_run.add_argument("--output", help="Save the reviewable Check payload locally")
+    p_check_run.add_argument("--post-check", action="store_true", help="Publish using PRUFGATE_CHECKS_TOKEN (checks: write)")
+    p_check_run.add_argument("--repo", help="owner/name; default GITHUB_REPOSITORY")
+
+    p_dismiss = subparsers.add_parser("dismiss", help="Request, review, revoke or inspect local versioned dismissals")
+    p_dismiss.add_argument("action", choices=("request", "approve", "reject", "revoke", "list"))
+    p_dismiss.add_argument("dismissal_id", nargs="?")
+    p_dismiss.add_argument("--workspace", default=".")
+    p_dismiss.add_argument("--result", help="Versioned scan result containing the finding")
+    p_dismiss.add_argument("--finding", type=int, default=1, help="1-based finding index in --result")
+    p_dismiss.add_argument("--owner", help="Explicit owning team or role label")
+    p_dismiss.add_argument("--actor", help="Explicit requester/reviewer identity label; never inferred from this machine")
+    p_dismiss.add_argument("--reason")
+    p_dismiss.add_argument("--expires", help="Optional expiration date YYYY-MM-DD, valid through that UTC date")
 
     # 5g. prufgate baseline
     p_base = subparsers.add_parser(
@@ -1328,8 +1599,25 @@ def main(argv: list[str] | None = None) -> int:
             print("prufgate: stop_hook_active is set; reporting without blocking a second time.", file=sys.stderr)
             return 0
         return 2
+    if args.subcommand == "github-check":
+        return _cmd_github_check(args)
+    if args.subcommand == "evaluate":
+        from prufgate.evaluation import main as evaluate_main
+        return evaluate_main(args)
+    if args.subcommand == "impact":
+        from prufgate.change_impact import analyze
+        from prufgate.privacy import redact_data
+        try:
+            report = analyze(Path(args.workspace), args.base)
+            print(json.dumps(redact_data(report), indent=2))
+            return 2 if report["analysis_status"] == "incomplete" else 0
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"prufgate impact: analysis failed ({type(exc).__name__})", file=sys.stderr)
+            return 2
+    if args.subcommand == "dismiss":
+        return _cmd_dismiss(args)
     if args.subcommand == "test-audit":
-        return _cmd_test_audit(args)
+        return _cmd_test_result(args) if args.format == "result" else _cmd_test_audit(args)
     if args.subcommand == "baseline":
         return _cmd_baseline(args)
     if args.subcommand == "explain":
@@ -1337,7 +1625,7 @@ def main(argv: list[str] | None = None) -> int:
 
         return explain_main(args.rule, args.list, args.format)
     if args.subcommand == "bola":
-        return _cmd_bola(args)
+        return _cmd_bola_result(args) if args.format == "result" else _cmd_bola(args)
     if args.subcommand == "review":
         return _cmd_review(args)
     if args.subcommand == "fix":
@@ -1368,7 +1656,7 @@ def main(argv: list[str] | None = None) -> int:
         from prufgate.pr_summary import main as summary_main
 
         return summary_main(args.path, args.sarif, args.base, args.exit_code, args.max_findings,
-                            args.post_comment, args.repo, args.pr)
+                            args.post_comment, args.repo, args.pr, previous_sarif=args.previous_sarif)
     if args.subcommand == "mcp":
         from prufgate.mcp.prufgate_mcp_server import main as mcp_main
 

@@ -27,8 +27,12 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
+
+from prufgate.privacy import redact, redact_data
+from prufgate.result_validation import read_json
 
 AI_REVIEW_SYSTEM_PROMPT = (
     "You are PrufGate, a high-precision security and software engineering diff reviewer.\n"
@@ -79,42 +83,41 @@ def _extract_json_array(raw_text: str) -> list[dict[str, Any]]:
     """Extract and validate a JSON array of review comment dicts from LLM text output."""
     text = raw_text.strip()
     if not text:
-        return []
+        raise ValueError("empty AI response")
 
     # Strip markdown code fences if present
     fence_match = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
     if fence_match:
         text = fence_match.group(1)
-    else:
-        bracket_match = re.search(r"(\[[\s\S]*\])", text)
-        if bracket_match:
-            text = bracket_match.group(1)
 
     try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return []
+        parsed = read_json(text)
+    except ValueError as exc:
+        raise ValueError("AI response is not a JSON array") from exc
 
     if not isinstance(parsed, list):
-        return []
+        raise ValueError("AI response is not an array")
 
     valid_items: list[dict[str, Any]] = []
     for item in parsed:
         if not isinstance(item, dict):
-            continue
-        file_path = str(item.get("file") or "").strip()
+            raise ValueError("AI response contains a non-object finding")
+        if not all(isinstance(item.get(k), str) and item[k].strip() for k in ("file", "title", "message")):
+            raise ValueError("AI finding is missing required string fields")
+        file_path = item["file"].strip()
         title = str(item.get("title") or "").strip()
         message = str(item.get("message") or "").strip()
         if not file_path or not title or not message:
-            continue
-        try:
-            line = max(1, int(item.get("line", 1)))
-        except (TypeError, ValueError):
-            line = 1
-        sev = str(item.get("severity") or "P2").upper()
+            raise ValueError("AI finding has empty fields")
+        line = item.get("line")
+        if type(line) is not int or line < 1:
+            raise ValueError("AI finding has an invalid line")
+        sev = item.get("severity")
         if sev not in ("P0", "P1", "P2", "P3"):
-            sev = "P2"
+            raise ValueError("AI finding has an invalid severity")
         suggestion = item.get("suggestion")
+        if suggestion is not None and not isinstance(suggestion, str):
+            raise ValueError("AI finding has an invalid suggestion")
         if not isinstance(suggestion, str) or not suggestion.strip():
             suggestion = None
         valid_items.append(
@@ -130,33 +133,6 @@ def _extract_json_array(raw_text: str) -> list[dict[str, Any]]:
     return valid_items
 
 
-_SECRET_ENV_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
-
-
-def _redact(text: str) -> str:
-    """Remove the values of credential-like environment variables from a diagnostic string."""
-    for name, value in os.environ.items():
-        if len(value) >= 8 and any(h in name.upper() for h in _SECRET_ENV_HINTS):
-            text = text.replace(value, "[redacted]")
-    for pat, keep in _SECRET_SHAPES:
-        text = pat.sub(keep + "[redacted]", text)
-    return text
-
-
-# (pattern, replacement prefix): the value after the kept groups is removed.
-_SECRET_SHAPES = (
-    (re.compile(r"(?i)(bearer\s+|x-api-key['\"]?\s*[:=]\s*['\"]?)[^\s'\",}]+"), r"\1"),
-    # `PGPASSWORD=x cmd`, `DB_PASS=x`: an unquoted value of an upper-case secret-named variable.
-    (re.compile(r"\b([A-Z0-9_]*(?:PASS|PWD|TOKEN|SECRET|KEY|AUTH|COOKIE|CREDENTIAL)[A-Z0-9_]*=)(?![\"'$\[])[^\s;&|()<>]+"), r"\1"),
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^/\s:@]+:)[^/\s@]+(?=@)"), r"\1"),  # URL userinfo
-    (re.compile(r"(?<!\S)(-u\s*|--user[=\s]\s*)([^\s:]+:)(?!\[redacted\])\S+"), r"\1\2"),  # curl -u user:pass
-    (re.compile(r"(?i)(?<!\S)(--(?:passw(?:or)?d|token|api-key|secret)(?:=|\s+))(?!\[redacted\])\S+"), r"\1"),
-    (re.compile(r"(\blogin\b[^\n;&|]*?\s-p\s+)\S+"), r"\1"),  # docker login -p x
-    (re.compile(r"(\b(?:mysql|mysqldump|mysqladmin|mariadb)\b[^\n;&|]*?\s-p)(?=[^\s\[])\S+"), r"\1"),  # mysql -px
-    (re.compile(r"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie)(\s*:\s*)[^\n'\"]+"), r"\1\2"),
-)
-
-
 def _private_tmp_parent() -> str | None:
     """A parent for the CLI working directory that other users cannot write to:
     the user's cache directory, so no shared ancestor (like /tmp) can hold a
@@ -167,6 +143,26 @@ def _private_tmp_parent() -> str | None:
         return cache
     except OSError:
         return None
+
+
+@contextmanager
+def _private_cli_directory():
+    """Fall back when an existing cache directory cannot actually be written."""
+    parent = _private_tmp_parent()
+    temporary = None
+    if parent is not None:
+        try:
+            temporary = tempfile.TemporaryDirectory(prefix="prufgate-ai-", dir=parent)
+        except OSError:
+            pass
+    if temporary is not None:
+        with temporary as cwd:
+            yield cwd
+        return
+    # A private parent keeps the CLI away from files placed directly in the shared temp directory.
+    with tempfile.TemporaryDirectory(prefix="prufgate-private-") as parent:
+        with tempfile.TemporaryDirectory(prefix="prufgate-ai-", dir=parent) as cwd:
+            yield cwd
 
 
 def _invoke_cli_agent(cli_name: str, prompt: str, timeout: int = 45) -> tuple[bool, str]:
@@ -197,7 +193,7 @@ def _invoke_cli_agent(cli_name: str, prompt: str, timeout: int = 45) -> tuple[bo
         # Agent CLIs read project settings, hooks and instruction files from their
         # working directory and its parents. Run them in a fresh private directory,
         # never the scanned repository or a shared one such as /tmp itself.
-        with tempfile.TemporaryDirectory(prefix="prufgate-ai-", dir=_private_tmp_parent()) as cwd:
+        with _private_cli_directory() as cwd:
             proc = subprocess.run(
                 cmd,
                 input=stdin,
@@ -209,10 +205,10 @@ def _invoke_cli_agent(cli_name: str, prompt: str, timeout: int = 45) -> tuple[bo
                 check=False,
             )
         if proc.returncode != 0:
-            return False, _redact((proc.stderr or proc.stdout or f"{cli_name} exited with {proc.returncode}").strip())[:200]
+            return False, redact((proc.stderr or proc.stdout or f"{cli_name} exited with {proc.returncode}").strip())[:200]
         return True, proc.stdout
     except Exception as exc:
-        return False, _redact(str(exc))[:200]
+        return False, redact(str(exc))[:200]
 
 
 def _invoke_http_llm(provider: str, prompt: str, timeout: int = 30, system: str = AI_REVIEW_SYSTEM_PROMPT) -> tuple[bool, str]:
@@ -242,7 +238,10 @@ def _invoke_http_llm(provider: str, prompt: str, timeout: int = 30, system: str 
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+                choice = body.get("choices", [{}])[0]
+                if choice.get("finish_reason") not in (None, "stop"):
+                    return False, "Provider returned an incomplete review"
+                content = choice.get("message", {}).get("content", "")
                 return True, str(content)
 
         if provider == "anthropic":
@@ -269,6 +268,8 @@ def _invoke_http_llm(provider: str, prompt: str, timeout: int = 30, system: str 
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                if body.get("stop_reason") not in (None, "end_turn", "stop_sequence"):
+                    return False, "Provider returned an incomplete review"
                 blocks = body.get("content", [])
                 text = "\n".join(b.get("text", "") for b in blocks if isinstance(b, dict))
                 return True, text
@@ -296,14 +297,16 @@ def _invoke_http_llm(provider: str, prompt: str, timeout: int = 30, system: str 
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                if body.get("done") is False or body.get("done_reason") == "length":
+                    return False, "Provider returned an incomplete review"
                 content = body.get("message", {}).get("content", "")
                 return True, str(content)
 
         return False, f"Unsupported AI provider: {provider}"
     except urllib.error.URLError as exc:
-        return False, _redact(f"Network/HTTP error from {provider}: {exc}")[:300]
+        return False, redact(f"Network/HTTP error from {provider}: {exc}")[:300]
     except Exception as exc:
-        return False, _redact(str(exc))[:200]
+        return False, redact(str(exc))[:200]
 
 
 def review_diff_with_ai(
@@ -324,7 +327,9 @@ def review_diff_with_ai(
             note="No claude CLI or API key (OPENAI_API_KEY, ANTHROPIC_API_KEY, OLLAMA_HOST) detected.",
         )
 
-    truncated_diff = diff_text[:24000]
+    if len(diff_text) > 24000:
+        return AIReviewResult(resolved, "error", [], "Diff exceeds the 24000-character AI review limit; no AI review was run.")
+    truncated_diff = redact(diff_text)
     full_prompt = f"{AI_REVIEW_SYSTEM_PROMPT}\n\n```diff\n{truncated_diff}\n```"
 
     if resolved in ("claude", "opencode", "codex", "gemini"):
@@ -335,7 +340,10 @@ def review_diff_with_ai(
     if not ok:
         return AIReviewResult(provider=resolved, status="error", comments=[], note=raw_out)
 
-    comments = _extract_json_array(raw_out)
+    try:
+        comments = redact_data(_extract_json_array(raw_out))
+    except ValueError as exc:
+        return AIReviewResult(resolved, "error", [], str(exc))
     return AIReviewResult(
         provider=resolved,
         status="executed",

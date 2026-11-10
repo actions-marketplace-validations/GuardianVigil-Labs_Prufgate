@@ -1,5 +1,7 @@
 # Getting started
 
+For a complete walkthrough, see the [user guide](USER_GUIDE.md) and [documentation index](README.md). This checkout includes unreleased options: [installation and upgrading](UPGRADING.md) explains how to select a matching implementation instead of assuming the published 1.4.0 artifact contains them.
+
 ## Requirements
 
 - Python 3.9 or newer, with PyYAML (installed automatically).
@@ -12,7 +14,7 @@
 | Method | What you get |
 |---|---|
 | `pipx install prufgate` or `pip install prufgate` | The `prufgate` and `prufgate-mcp` commands from PyPI: every engine, the CLI, the MCP server and the API. The `prufgate.sh` shell gate is not part of the wheel. |
-| `docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.3.0` | The signed release image (amd64 and arm64): the `prufgate` command plus the full `prufgate.sh` gate with ast-grep, gitleaks and zizmor. With no arguments it runs `fast` on the mounted repository; `... prufgate:1.3.0 prufgate check .` runs the CLI. |
+| `docker run --rm -v "$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:1.4.0` | The signed release image (amd64 and arm64): the `prufgate` command plus the full `prufgate.sh` gate with ast-grep, gitleaks and zizmor. With no arguments it runs `fast` on the mounted repository; `... prufgate:1.4.0 prufgate check .` runs the CLI. |
 | `pip install .` (in a checkout) | The same commands from a checkout. |
 | `./install.sh` | A `prufgate` launcher in `~/.local/bin` (or `/usr/local/bin`) that runs this checkout. Keep the checkout where it is. |
 | `make build`, then `bin/prufgate --docker ...` | A container image built from your checkout, the same as the release image. It is about 460 MB uncompressed (about 100 MB gzipped): the Python base and git, plus the three scanners (ast-grep about 55 MB, zizmor 27 MB, gitleaks 22 MB). The pip install and the GitHub Action need none of that. |
@@ -30,12 +32,12 @@ prufgate --self-check      # runs every engine against its built-in positive and
 ## Commands
 
 ```text
-prufgate check [PATH] [--changed] [--base REF] [--config FILE] [--format text|json|sarif|gitlab|junit|agent-hook] [--ai-adjudicate [--ai-provider NAME]]
+prufgate check [PATH] [--changed] [--base REF] [--config FILE] [--format text|json|result|sarif|gitlab|junit|agent-hook] [--result-out FILE] [--no-code] [--ai-adjudicate [--ai-provider NAME]]
 prufgate fast                     same as: prufgate check --changed
 prufgate full                     same as: prufgate check
 prufgate test-audit [PATH] [--changed] [--base REF] [--config FILE] [--json-out FILE]
 prufgate bola [PATH] [--static-only] [--url URL --token-a T --token-b T --tenant-a ID --tenant-b ID] [--base REF] [--format text|json]
-prufgate review [--workspace PATH] [--base REF] [--diff-file FILE] [--format markdown|json|sarif|github|reviewdog|gitlab|junit] [--ai --ai-provider NAME]
+prufgate review [--workspace PATH] [--base REF] [--diff-file FILE] [--format markdown|json|result|sarif|github|reviewdog|gitlab|junit] [--ai --ai-provider NAME]
 prufgate fix [PATH] [--base REF] [--format patch|github-suggestions] [--apply [--force]]
 prufgate verify --differential [PATH] --allow-run-tests [--base REF] [--test-cmd CMD] [--timeout SECONDS] [--pass-env NAME] [--format text|json|sarif]
 prufgate verify --mutation [PATH] --allow-run-tests [--base REF] [--tool NAME] [--max-mutants N] [--timeout SECONDS] [--pass-env NAME] [--format text|json|sarif]
@@ -62,8 +64,13 @@ prufgate --self-check | --version | --help
 - **`prufgate init`** writes a starter `.prufgate/config.yaml`. With `--hooks` it also writes the coding-agent hooks described in [CI_INTEGRATION.md](CI_INTEGRATION.md#coding-agent-hooks).
 - **`prufgate shell-guard`** is the shell-command guard those hooks run before an agent's shell command: see [the shell guard](CI_INTEGRATION.md#shell-command-guard).
 - **`prufgate pr-summary`** prints a short Markdown summary of a gate run from `reports/prufgate.sarif`: the verdict, the first findings and facts about the change against the base ref the gate used. `--exit-code` passes the gate's exit code so a failed run never reads as a pass. With `--post-comment` it creates or updates one pull request comment, using a token from `PRUFGATE_GITHUB_TOKEN` or `GITHUB_TOKEN` (never a command-line argument). The GitHub Action runs it for you: see [the run summary](CI_INTEGRATION.md#the-run-summary-and-pull-request-comment). It exits 2 when the report cannot be read or the comment cannot be posted.
+- **`prufgate github-check`** previews changed-line annotations and a Check summary locally; publication needs explicit `--post-check`, permissions and matching clean scan provenance. See [review workflows](REVIEW_WORKFLOW.md).
+- **`prufgate dismiss request|approve|reject|revoke|list`** manages the local reviewed-exception ledger. Reasons and declared actors are explicit; ownership/expiry and protected maintainer review apply.
+- **`prufgate evaluate`** generates local JSON/Markdown/HTML corpus reports with source/label provenance. **`prufgate impact`** produces bounded Python cross-file review leads. See [evaluation](EVALUATION.md).
 
 ### Which changes "changed" means
+
+For integrations, use `prufgate check --format result` for the versioned result envelope, or add `--result-out reports/prufgate-result.json`. It includes `scan_status`, coverage, explanations and privacy metadata. Legacy JSON finding arrays remain supported. See [scan results](SCAN_RESULTS.md) for matching CLI, Action, MCP, API and editor profiles and the difference between findings, incomplete verification and execution errors.
 
 With `--changed`, PrufGate compares against a base ref and includes uncommitted and untracked files. The base is chosen in this order (first match wins):
 
@@ -108,10 +115,10 @@ Everything else is listed on stderr as `no safe fix`. Each fix must match the ex
 | Code | Meaning |
 |---|---|
 | 0 | No blocking findings. |
-| 1 | At least one P0 or P1 finding. |
+| 1 | At least one effective policy blocker. Strict mode blocks P0/P1 by default. |
 | 2 | PrufGate could not do its job: a bad option or config, a base ref that does not exist, an unreadable file, an engine crash, missing engine output. |
 
-Severities: **P0** fabricated or broken behaviour that must not merge, **P1** a likely problem that blocks by default, **P2** an advisory, **P3** information.
+Severities describe risk: **P0** fabricated or broken behaviour, **P1** a likely problem that blocks by default, **P2** an advisory, **P3** information. Adoption policy controls effective blocking independently. Errors and incomplete verification always exit 2.
 
 ## The full gate: `prufgate.sh`
 
@@ -124,6 +131,7 @@ From a checkout (or the container), `prufgate.sh` runs all six engines plus the 
 
 | Output | Where |
 |---|---|
+| Versioned result, coverage, privacy and enforcement | `reports/prufgate-result.json` |
 | SARIF 2.1.0 for code scanning | `reports/prufgate.sarif` |
 | Human summary | `reports/prufgate-review.md` |
 | GitLab Code Quality | `reports/gl-code-quality-report.json` |
@@ -147,6 +155,23 @@ prufgate bola . --url http://127.0.0.1:3000 \
 ```
 
 The tokens can also come from `PRUFGATE_TEST_PROBE_TOKEN_A` / `PRUFGATE_TEST_PROBE_TOKEN_B` (and the tenant IDs from `PRUFGATE_TEST_PROBE_TENANT_A_ID` / `_B_ID`). PrufGate compares an unauthenticated request, each user's own resources, and each user's access to the other's, and reports cross-tenant reads. Reports show `$PRUFGATE_TOKEN_A` / `$PRUFGATE_TOKEN_B` in the `curl` reproductions, never the real tokens. An unreachable URL is an error (exit 2).
+
+Live two-token verification requires two distinct tokens and IDs for resources
+owned by those callers. Set `PRUFGATE_CROSS_TENANT_PATHS` to known resource paths
+using `{tenant_id}` when the discovered or default paths do not match your API.
+Both owner requests must return meaningful structured data. A cross response is
+confirmed as a leak only when it matches the other owner's data and differs from
+the caller's own data and the unauthenticated response. An API that always returns
+the caller's own resource is not reported as cross-tenant access.
+
+Missing credentials, failed requests, unsuccessful owner controls, responses whose
+ownership cannot be established, and routes omitted by the route cap make the
+live scan **incomplete**, with exit 2. JSON output is then an object containing
+`status: "incomplete"`, `error`, request `coverage` counts, and any confirmed
+`findings`. A complete scan keeps the usual findings-array format. Static findings
+and confirmed live findings remain available when another part of the scan fails.
+Volatile response fields can prevent an exact owner-data comparison; such a result
+is inconclusive and must not be treated as a clean authorization check.
 
 ## Next steps
 

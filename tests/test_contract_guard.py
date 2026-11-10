@@ -154,6 +154,27 @@ class TestContractGuard(unittest.TestCase):
             self.assertIn("DELETE /api/projects/${projectId}", msgs)
             self.assertIn("/api/nonexistent/route", msgs)
 
+    def test_jsx_apostrophe_does_not_hide_route_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            route_dir = ws / "app" / "api" / "projects"
+            route_dir.mkdir(parents=True)
+            (route_dir / "route.ts").write_text(
+                "export async function GET() { return Response.json({}); }\n", encoding="utf-8"
+            )
+            (ws / "Page.tsx").write_text(
+                "export function Page() {\n"
+                "  return <p>Don't worry</p>;\n"
+                "}\n"
+                "export async function load() {\n"
+                "  await fetch('/api/nonexistent/route');\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            findings = [f for f in scan_contract_guard(ws) if f.rule == "frontend-backend-route-mismatch"]
+            self.assertEqual(len(findings), 1)
+            self.assertIn("/api/nonexistent/route", findings[0].message)
+
     def test_config_exemption_and_cli_json_out(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ws = Path(tmp)

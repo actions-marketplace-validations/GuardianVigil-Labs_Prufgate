@@ -65,7 +65,9 @@ class BolaRedirects(unittest.TestCase):
         }
         err = io.StringIO()
         with patch.dict(os.environ, env), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            findings = bola_engine.run_dynamic_matrix(self.target_url)
+            with self.assertRaises(bola_engine.ProbeIncomplete) as caught:
+                bola_engine.run_dynamic_matrix(self.target_url)
+            findings = caught.exception.findings
         self.assertEqual(self.sink_hits, [], "a redirected probe reached another host")
         self.assertEqual([f.rule_id for f in findings], ["BOLA-PROBE-REDIRECT-REFUSED"])
         self.assertEqual(findings[0].severity, "P1")
@@ -96,9 +98,11 @@ class BolaSameOriginRedirect(unittest.TestCase):
 
         srv = _serve(Slash)
         try:
-            with patch.dict(os.environ, {"PRUFGATE_BOLA_PATHS": "/api/v1/projects"}), \
+            with patch.dict(os.environ, {"PRUFGATE_BOLA_PATHS": "/api/v1/projects", "PRUFGATE_TEST_PROBE_TOKEN_A": "fixture-alpha", "PRUFGATE_TEST_PROBE_TOKEN_B": "fixture-bravo"}), \
                     contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-                findings = bola_engine.run_dynamic_matrix(f"http://127.0.0.1:{srv.server_address[1]}")
+                with self.assertRaises(bola_engine.ProbeIncomplete) as caught:
+                    bola_engine.run_dynamic_matrix(f"http://127.0.0.1:{srv.server_address[1]}")
+                findings = caught.exception.findings
         finally:
             srv.shutdown()
             srv.server_close()

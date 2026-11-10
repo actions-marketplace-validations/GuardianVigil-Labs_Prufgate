@@ -52,7 +52,9 @@ from prufgate.anti_reward_hacking.test_integrity import (  # noqa: E402
 )
 from prufgate.config import ConfigError, PrufGateConfig, rules_match  # noqa: E402
 from prufgate.netguard import target_url_error  # noqa: E402
+from prufgate.privacy import redact  # noqa: E402
 from prufgate.rules import visible  # noqa: E402
+from prufgate.safe_fs import safe_read_text, safe_write_text  # noqa: E402
 
 
 class BolaFinding:
@@ -71,11 +73,11 @@ class BolaFinding:
     ):
         self.rule_id = rule_id
         self.severity = severity
-        self.message = message
-        self.endpoint_or_file = endpoint_or_file
+        self.message = redact(message)
+        self.endpoint_or_file = redact(endpoint_or_file)
         self.line = line
-        self.curl_poc = curl_poc
-        self.details = details
+        self.curl_poc = redact(curl_poc)
+        self.details = redact(details)
         # Last line of the handler or table: a changed-files scan keeps the finding
         # when the change touched any line of it.
         self.end_line = max(line, end_line or line)
@@ -467,7 +469,7 @@ def discover_all_routes(workspace: Path | None) -> list[DiscoveredRoute]:
         if not spec_path.is_file():
             continue
         try:
-            raw_text = spec_path.read_text(encoding="utf-8", errors="ignore")
+            raw_text = safe_read_text(spec_path, encoding="utf-8", errors="ignore")
             if spec_path.suffix.lower() in (".yaml", ".yml"):
                 spec_data = yaml.safe_load(raw_text) if yaml is not None else {}
             else:
@@ -506,7 +508,7 @@ def discover_all_routes(workspace: Path | None) -> list[DiscoveredRoute]:
         sfx = src_file.suffix.lower()
 
         try:
-            content = src_file.read_text(encoding="utf-8", errors="ignore")
+            content = safe_read_text(src_file, encoding="utf-8", errors="ignore")
         except OSError:
             continue
         lines = content.splitlines()
@@ -874,7 +876,7 @@ def _fastapi_guard_aliases(workspace: Path) -> list[str]:
     names: set[str] = set()
     for p in iter_workspace_files(workspace, {".py"}):
         try:
-            text = p.read_text(encoding="utf-8", errors="ignore")
+            text = safe_read_text(p, encoding="utf-8", errors="ignore")
         except OSError:
             continue
         if "Annotated" in text and "Depends" in text:
@@ -1230,7 +1232,7 @@ def _wrapper_body(name: str, file_content: str, file_path: str, workspace: Path)
             target = _resolve_js_import(src, m.group(2), workspace) if m.group(2).startswith((".", "@/", "~/")) else None
             if target is not None:
                 with contextlib.suppress(OSError):
-                    return _definition_body(target.read_text(encoding="utf-8", errors="ignore"), original)
+                    return _definition_body(safe_read_text(target, encoding="utf-8", errors="ignore"), original)
             return ""
     for m in _PY_IMPORT_NAMES_RE.finditer(file_content):
         if name in {part.split(" as ")[-1].strip() for part in m.group(2).split(",")}:
@@ -1240,13 +1242,13 @@ def _wrapper_body(name: str, file_content: str, file_path: str, workspace: Path)
             for cand in (base / f"{rel}.py", base / rel / "__init__.py"):
                 if cand.is_file() and cand.resolve().is_relative_to(workspace.resolve()):
                     with contextlib.suppress(OSError):
-                        return _definition_body(cand.read_text(encoding="utf-8", errors="ignore"), name)
+                        return _definition_body(safe_read_text(cand, encoding="utf-8", errors="ignore"), name)
             return ""
     if file_path.endswith(".go"):
         for sib in sorted(src.parent.glob("*.go")):
             if sib != src and not sib.name.endswith("_test.go"):
                 with contextlib.suppress(OSError):
-                    body = _definition_body(sib.read_text(encoding="utf-8", errors="ignore"), name)
+                    body = _definition_body(safe_read_text(sib, encoding="utf-8", errors="ignore"), name)
                     if body:
                         return body
     return ""
@@ -1307,7 +1309,7 @@ def _middleware_auth_files(workspace: Path) -> set[str]:
         if is_test_path(rel):
             continue
         try:
-            raw = f.read_text(encoding="utf-8", errors="ignore")
+            raw = safe_read_text(f, encoding="utf-8", errors="ignore")
         except OSError:
             continue
         text = _mask(raw, keep_strings=True)
@@ -1325,7 +1327,7 @@ def _middleware_auth_files(workspace: Path) -> set[str]:
         routers: dict[str, Path] = {}
         for name, spec in imports.items():
             target = _resolve_js_import(f, spec, workspace)
-            if target is not None and _EXPRESS_ROUTE_RE.search(target.read_text(encoding="utf-8", errors="ignore")):
+            if target is not None and _EXPRESS_ROUTE_RE.search(safe_read_text(target, encoding="utf-8", errors="ignore")):
                 routers[name] = target
         if not routers:
             continue
@@ -1367,7 +1369,7 @@ def _global_auth_context(workspace: Path) -> dict[str, Any]:
         if is_test_path(rel):
             continue
         try:
-            text = f.read_text(encoding="utf-8", errors="ignore")
+            text = safe_read_text(f, encoding="utf-8", errors="ignore")
         except OSError:
             continue
         if f.suffix == ".py":
@@ -1471,7 +1473,7 @@ def _django_cbv_routes(workspace: Path, tenant_re: re.Pattern[str]) -> list[Disc
     for f in iter_workspace_files(workspace, {".py"}):
         rel = str(f.relative_to(workspace)).replace("\\", "/")
         if not is_test_path(rel):
-            files.append((rel, f.read_text(encoding="utf-8", errors="ignore")))
+            files.append((rel, safe_read_text(f, encoding="utf-8", errors="ignore")))
     object_perms: set[str] = set()
     for _, text in files:
         if "has_object_permission" in text:
@@ -1553,7 +1555,7 @@ def _server_action_findings(workspace: Path, cfg: PrufGateConfig, auth_re: re.Pa
         if is_test_path(rel_path) or cfg.is_excluded(rel_path) or cfg.is_exempt(rel_path, "BOLA-UNGUARDED-SERVER-ACTION"):
             continue
         try:
-            text = af.read_text(encoding="utf-8", errors="ignore")
+            text = safe_read_text(af, encoding="utf-8", errors="ignore")
         except OSError:
             continue
         if not _starts_with_use_server(text):
@@ -1679,14 +1681,14 @@ def _controller_routes(workspace: Path) -> list[DiscoveredRoute]:
     rails_app_auth = ""
     app_ctrl = workspace / "app" / "controllers" / "application_controller.rb"
     if app_ctrl.is_file():
-        rails_app_auth = app_ctrl.read_text(encoding="utf-8", errors="ignore")
+        rails_app_auth = safe_read_text(app_ctrl, encoding="utf-8", errors="ignore")
     routes_rb = workspace / "config" / "routes.rb"
-    rails_members = _rails_member_actions(routes_rb.read_text(encoding="utf-8", errors="ignore")) if routes_rb.is_file() else {}
+    rails_members = _rails_member_actions(safe_read_text(routes_rb, encoding="utf-8", errors="ignore")) if routes_rb.is_file() else {}
     laravel_routes = ""
     routes_dir = workspace / "routes"
     if routes_dir.is_dir():
         laravel_routes = "\n".join(
-            _mask(p.read_text(encoding="utf-8", errors="ignore"), keep_strings=True) for p in sorted(routes_dir.glob("*.php"))
+            _mask(safe_read_text(p, encoding="utf-8", errors="ignore"), keep_strings=True) for p in sorted(routes_dir.glob("*.php"))
         )
 
     for f in iter_workspace_files(workspace, {".rb", ".php"}):
@@ -1695,7 +1697,7 @@ def _controller_routes(workspace: Path) -> list[DiscoveredRoute]:
         is_laravel = rel.endswith("Controller.php") and "/Controllers/" in f"/{rel}"
         if not (is_rails or is_laravel) or is_test_path(rel):
             continue
-        content = f.read_text(encoding="utf-8", errors="ignore")
+        content = safe_read_text(f, encoding="utf-8", errors="ignore")
         lines = content.splitlines()
         # Auth inherited from ApplicationController, or applied to the controller in routes/*.php.
         inherited = ""
@@ -1789,7 +1791,7 @@ def _static_matrix_audit(workspace: Path, config: PrufGateConfig | None) -> list
         if cfg.is_excluded(rel_path) or cfg.is_exempt(rel_path, "BOLA-TABLE-MISSING-TENANT-COLUMN"):
             continue
         try:
-            text = sf.read_text(encoding="utf-8", errors="ignore")
+            text = safe_read_text(sf, encoding="utf-8", errors="ignore")
             for match in re.finditer(
                 r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)\s*\((.*?)\);",
                 text,
@@ -1903,6 +1905,19 @@ def _probe_url(target_url: str, path: str) -> str:
     return f"{target_url.rstrip('/')}{path}"
 
 
+class ProbeIncomplete(RuntimeError):
+    """The live matrix could not establish all requested authorization checks."""
+
+    def __init__(self, message: str, findings: list[BolaFinding], coverage: dict[str, int]):
+        super().__init__(message)
+        self.findings = findings
+        self.coverage = coverage
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"status": "incomplete", "error": str(self), "coverage": self.coverage,
+                "findings": [finding.to_dict() for finding in self.findings]}
+
+
 def run_dynamic_matrix(
     target_url: str,
     workspace: Path | None = None,
@@ -1910,208 +1925,127 @@ def run_dynamic_matrix(
     extra_paths: list[str] | None = None,
     max_extra_paths: int = 200,
 ) -> list[BolaFinding]:
-    """Execute the 4-request two-token differential BOLA probe matrix against a live target.
+    """Verify both directions against valid owner controls, or report incomplete.
 
-    `extra_paths` (from `--routes-from`) are added after dedupe, capped at `max_extra_paths`;
-    a path holding `{tenant_id}` joins the cross-tenant probes, like a discovered route."""
-    # Every entry point (CLI, batteries, MCP, API, this module's main) reaches the probe
-    # here, so the metadata/link-local guard is enforced here, not only by the callers.
+    A 200 alone is not evidence of BOLA: the cross response must match the other
+    owner's structured data and differ from the caller's own data and the
+    unauthenticated baseline. Bodies are compared in memory and never reported.
+    """
     url_error = target_url_error(target_url)
     if url_error:
         raise ValueError(url_error)
     findings: list[BolaFinding] = []
-    print(f"  [BOLA Dynamic Matrix] Probing cross-tenant authorization boundaries on {target_url}...")
+    coverage = {"attempted": 0, "completed": 0, "failed": 0, "verified_cross_tenant": 0, "missing_controls": 0}
+    problems: list[str] = []
+    token_a = os.environ.get("PRUFGATE_TEST_PROBE_TOKEN_A") or os.environ.get("PRUFGATE_TENANT_A_TOKEN") or ""
+    token_b = os.environ.get("PRUFGATE_TEST_PROBE_TOKEN_B") or os.environ.get("PRUFGATE_TENANT_B_TOKEN") or ""
+    tenant_a = os.environ.get("PRUFGATE_TEST_PROBE_TENANT_A_ID", os.environ.get("PRUFGATE_TENANT_A_ID", "tenant-a-1111"))
+    tenant_b = os.environ.get("PRUFGATE_TEST_PROBE_TENANT_B_ID", os.environ.get("PRUFGATE_TENANT_B_ID", "tenant-b-2222"))
+    if not token_a or not token_b or token_a == token_b or not tenant_a or not tenant_b or tenant_a == tenant_b:
+        raise ProbeIncomplete("Two distinct tenant tokens and tenant IDs are required for live cross-tenant verification.", findings, coverage)
 
     refused: list[str] = []
     opener = urllib.request.build_opener(SameOriginRedirectHandler(target_url, refused))
-    discovered_routes = discover_workspace_api_routes(workspace)
+    routes = discover_workspace_api_routes(workspace)
+    defaults = ["/api/v1/tenant/profile", "/api/v1/workspaces/current", "/api/v1/users/me", "/api/v1/projects",
+                "/api/v1/settings", "/api/v1/billing/subscription", "/api/v1/audit-logs"]
+    paths = [p.strip() for p in os.environ.get("PRUFGATE_BOLA_PATHS", "").split(",") if p.strip()]
+    if not paths:
+        paths = [r for r in routes if "{tenant_id}" not in r] or defaults
+    cross = [p.strip() for p in os.environ.get("PRUFGATE_CROSS_TENANT_PATHS", "").split(",") if p.strip()]
+    if not cross:
+        cross = [r for r in routes if "{tenant_id}" in r] or [
+            "/api/v1/workspaces/{tenant_id}", "/api/v1/tenants/{tenant_id}", "/api/v1/users?tenant_id={tenant_id}",
+            "/api/v1/projects?organization_id={tenant_id}", "/api/v1/billing/subscription?tenant_id={tenant_id}"]
+    known = set(paths + cross)
+    additions = [p for p in dict.fromkeys(extra_paths or []) if p not in known]
+    if len(additions) > max_extra_paths:
+        problems.append("route input exceeded --max-routes; some routes were not tested")
+    for path in additions[:max_extra_paths]:
+        (cross if "{tenant_id}" in path else paths).append(path)
+    paths, cross = list(dict.fromkeys(paths)), list(dict.fromkeys(cross))
 
-    env_paths = os.environ.get("PRUFGATE_BOLA_PATHS")
-    if env_paths:
-        test_paths = [p.strip() for p in env_paths.split(",") if p.strip()]
-    else:
-        default_paths = [
-            "/api/v1/tenant/profile",
-            "/api/v1/workspaces/current",
-            "/api/v1/users/me",
-            "/api/v1/projects",
-            "/api/v1/settings",
-            "/api/v1/billing/subscription",
-            "/api/v1/audit-logs",
-        ]
-        static_discovered = [r for r in discovered_routes if "{tenant_id}" not in r]
-        test_paths = list(dict.fromkeys(static_discovered + default_paths))
-
-    extra_cross: list[str] = []
-    if extra_paths:
-        known = set(test_paths)
-        new_paths = [p for p in dict.fromkeys(extra_paths) if p not in known]
-        added = new_paths[:max_extra_paths]
-        print(
-            f"  [BOLA Dynamic Matrix] Route files: {len(added)} new path(s) added, "
-            f"{len(extra_paths) - len(new_paths)} already known, {len(new_paths) - len(added)} over the --max-routes cap."
-        )
-        test_paths += [p for p in added if "{tenant_id}" not in p]
-        extra_cross = [p for p in added if "{tenant_id}" in p]
-
-    # Real tokens for two tenants are required for the cross-tenant probes: a made-up
-    # token only measures the 401 path. Tokens never appear in findings or reports.
-    token_a = os.environ.get("PRUFGATE_TEST_PROBE_TOKEN_A") or os.environ.get("PRUFGATE_TENANT_A_TOKEN") or ""
-    token_b = os.environ.get("PRUFGATE_TEST_PROBE_TOKEN_B") or os.environ.get("PRUFGATE_TENANT_B_TOKEN") or ""
-    tenant_a_id = os.environ.get("PRUFGATE_TEST_PROBE_TENANT_A_ID", os.environ.get("PRUFGATE_TENANT_A_ID", "tenant-a-1111"))
-    tenant_b_id = os.environ.get("PRUFGATE_TEST_PROBE_TENANT_B_ID", os.environ.get("PRUFGATE_TENANT_B_ID", "tenant-b-2222"))
-
-    # 1. Unauthenticated request check across protected paths
-    for path in test_paths:
-        full_url = _probe_url(target_url, path)
+    def request(path: str, token: str = "", tenant: str = "") -> tuple[int, str, str] | None:
+        coverage["attempted"] += 1
+        headers = {"User-Agent": f"PrufGate-BOLA-Probe/{__version__}", "Accept": "application/json"}
+        if token:
+            headers.update({"Authorization": f"Bearer {token}", "X-Tenant-ID": tenant,
+                            "Cookie": f"session={token}; auth_token={token}"})
         try:
-            req = urllib.request.Request(
-                full_url,
-                headers={"User-Agent": f"PrufGate-BOLA-Probe/{__version__}", "Accept": "application/json"},
-            )
-            with opener.open(req, timeout=3) as resp:
-                body = resp.read().decode("utf-8", errors="ignore")
-                content_type = resp.headers.get("Content-Type", "")
-                if resp.status == 200 and _is_meaningful_api_payload(content_type, body):
-                    findings.append(
-                        BolaFinding(
-                            rule_id="BOLA-UNAUTHENTICATED-ACCESS",
-                            severity="P0",
-                            message=f"Endpoint {path} accessible without authentication token",
-                            endpoint_or_file=path,
-                            curl_poc=f"curl -s -i '{full_url}'",
-                            details="Expected 401 Unauthorized, received HTTP 200 with structured JSON payload.",
-                        )
-                    )
-        except urllib.error.HTTPError:
-            pass
-        except Exception:
-            pass
+            req = urllib.request.Request(_probe_url(target_url, path), headers=headers)
+            with opener.open(req, timeout=3) as response:
+                result = response.status, response.headers.get("Content-Type", ""), response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            result = exc.code, "", ""
+            if exc.fp is not None:  # Python 3.9 cannot close an HTTPError built without a body
+                exc.close()
+        except Exception as exc:
+            coverage["failed"] += 1
+            problems.append(f"request failed ({exc.__class__.__name__})")
+            return None
+        coverage["completed"] += 1
+        if result[0] not in (200, 401, 403, 404):
+            coverage["failed"] += 1
+            problems.append(f"unexpected HTTP status {result[0]}")
+            return None
+        return result
 
-    # 2. Cross-Tenant Two-Token Matrix Probes
-    if not (token_a and token_b):
-        print(
-            "  [BOLA Dynamic Matrix] Cross-tenant probes skipped: set PRUFGATE_TEST_PROBE_TOKEN_A and "
-            "PRUFGATE_TEST_PROBE_TOKEN_B (or --token-a/--token-b) to two real tenant tokens."
-        )
-        return _with_refused_redirects(findings, refused, target_url)
-    env_cross = os.environ.get("PRUFGATE_CROSS_TENANT_PATHS")
-    if env_cross:
-        cross_tenant_paths = [p.strip().replace("{tenant_id}", tenant_b_id) for p in env_cross.split(",") if p.strip()]
-    else:
-        param_discovered = [r.replace("{tenant_id}", tenant_b_id) for r in discovered_routes if "{tenant_id}" in r]
-        default_cross = [
-            f"/api/v1/workspaces/{tenant_b_id}",
-            f"/api/v1/tenants/{tenant_b_id}",
-            f"/api/v1/users?tenant_id={tenant_b_id}",
-            f"/api/v1/projects?organization_id={tenant_b_id}",
-            f"/api/v1/billing/subscription?tenant_id={tenant_b_id}",
-        ]
-        cross_tenant_paths = list(dict.fromkeys(param_discovered + default_cross))
-    cross_tenant_paths = list(dict.fromkeys(cross_tenant_paths + [p.replace("{tenant_id}", tenant_b_id) for p in extra_cross]))
-
-    for path in cross_tenant_paths:
-        full_url = _probe_url(target_url, path)
-        url_for_a = full_url.replace(tenant_b_id, tenant_a_id)
-
-        unauth_baseline = None
+    def payload(response: tuple[int, str, str] | None) -> Any:
+        if response is None or response[0] != 200 or not _is_meaningful_api_payload(response[1], response[2]):
+            return None
         try:
-            req_unauth = urllib.request.Request(
-                full_url,
-                headers={"User-Agent": f"PrufGate-BOLA-Probe/{__version__}", "Accept": "application/json"},
-            )
-            with opener.open(req_unauth, timeout=3) as resp_u:
-                if resp_u.status == 200:
-                    unauth_baseline = resp_u.read().decode("utf-8", errors="ignore").strip()
-        except Exception:
-            pass
+            return json.loads(response[2])
+        except ValueError:
+            return None
 
-        self_a_body = None
-        try:
-            req_self_a = urllib.request.Request(
-                url_for_a,
-                headers={
-                    "User-Agent": f"PrufGate-BOLA-Probe/{__version__}",
-                    "Accept": "application/json",
-                    "Authorization": f"Bearer {token_a}",
-                    "X-Tenant-ID": tenant_a_id,
-                    "Cookie": f"session={token_a}; auth_token={token_a}",
-                },
-            )
-            with opener.open(req_self_a, timeout=3) as resp_self_a:
-                if resp_self_a.status == 200:
-                    self_a_body = resp_self_a.read().decode("utf-8", errors="ignore").strip()
-        except Exception:
-            pass
+    for path in paths:
+        if payload(request(path)) is not None:
+            findings.append(BolaFinding(
+                rule_id="BOLA-UNAUTHENTICATED-ACCESS", severity="P0",
+                message=f"Endpoint {path} accessible without authentication token", endpoint_or_file=path,
+                curl_poc=f"curl -s -i '{_probe_url(target_url, path)}'",
+                details="Expected authentication; received HTTP 200 with structured JSON data."))
 
-        headers_a = {
-            "User-Agent": f"PrufGate-BOLA-Probe/{__version__}",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token_a}",
-            "X-Tenant-ID": tenant_b_id,
-            "Cookie": f"session={token_a}; auth_token={token_a}",
-        }
-        try:
-            req_a = urllib.request.Request(full_url, headers=headers_a)
-            with opener.open(req_a, timeout=3) as resp_a:
-                body = resp_a.read().decode("utf-8", errors="ignore")
-                ct_a = resp_a.headers.get("Content-Type", "")
-                if resp_a.status == 200 and _is_meaningful_api_payload(ct_a, body):
-                    stripped_body = body.strip()
-                    is_actually_tenant_a_only = (
-                        self_a_body is not None
-                        and stripped_body == self_a_body
-                        and tenant_a_id in stripped_body
-                        and tenant_b_id not in stripped_body
-                    )
-                    if stripped_body != unauth_baseline and not is_actually_tenant_a_only:
-                        findings.append(
-                            BolaFinding(
-                                rule_id="BOLA-CROSS-TENANT-ACCESS",
-                                severity="P0",
-                                message=f"BOLA / IDOR: Tenant A token accessed Tenant B private resource at {path}",
-                                endpoint_or_file=path,
-                                curl_poc=f"curl -s -i -H \"Authorization: Bearer $PRUFGATE_TOKEN_A\" -H 'X-Tenant-ID: {tenant_b_id}' '{full_url}'",
-                                details=f"Expected 403 Forbidden or 404 Not Found, received HTTP 200 with response payload: {stripped_body[:120]}...",
-                            )
-                        )
-        except urllib.error.HTTPError:
-            pass
-        except Exception:
-            pass
-
-        headers_b = {
-            "User-Agent": f"PrufGate-BOLA-Probe/{__version__}",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token_b}",
-            "X-Tenant-ID": tenant_a_id,
-            "Cookie": f"session={token_b}; auth_token={token_b}",
-        }
-        try:
-            req_b = urllib.request.Request(url_for_a, headers=headers_b)
-            with opener.open(req_b, timeout=3) as resp_b:
-                body_b = resp_b.read().decode("utf-8", errors="ignore")
-                ct_b = resp_b.headers.get("Content-Type", "")
-                if resp_b.status == 200 and _is_meaningful_api_payload(ct_b, body_b):
-                    stripped_b = body_b.strip()
-                    if stripped_b != unauth_baseline:
-                        findings.append(
-                            BolaFinding(
-                                rule_id="BOLA-CROSS-TENANT-ACCESS",
-                                severity="P0",
-                                message=f"BOLA / IDOR: Tenant B token accessed Tenant A private resource at {path.replace(tenant_b_id, tenant_a_id)}",
-                                endpoint_or_file=path.replace(tenant_b_id, tenant_a_id),
-                                curl_poc=f"curl -s -i -H \"Authorization: Bearer $PRUFGATE_TOKEN_B\" -H 'X-Tenant-ID: {tenant_a_id}' '{url_for_a}'",
-                                details=f"Expected 403 Forbidden or 404 Not Found, received HTTP 200 with response payload: {stripped_b[:120]}...",
-                            )
-                        )
-        except urllib.error.HTTPError:
-            pass
-        except Exception:
-            pass
-
-    return _with_refused_redirects(findings, refused, target_url)
-
+    for template in cross:
+        path_b = template.replace("{tenant_id}", tenant_b)
+        path_a = template.replace("{tenant_id}", tenant_a)
+        public_a, public_b = request(path_a), request(path_b)
+        own_a, own_b = request(path_a, token_a, tenant_a), request(path_b, token_b, tenant_b)
+        own_data_a, own_data_b = payload(own_a), payload(own_b)
+        if own_data_a is None or own_data_b is None:
+            coverage["missing_controls"] += 1
+            problems.append("owner controls did not return valid structured resources")
+            continue
+        for label, path, token, tenant, own, other, public, variable in (
+            ("A", path_b, token_a, tenant_b, own_data_a, own_data_b, public_b, "A"),
+            ("B", path_a, token_b, tenant_a, own_data_b, own_data_a, public_a, "B"),
+        ):
+            response = request(path, token, tenant)
+            if response is None or public is None:
+                continue
+            if response[0] in (401, 403, 404):
+                coverage["verified_cross_tenant"] += 1
+                continue
+            data = payload(response)
+            if data is not None and data == other and data != own and data != payload(public):
+                findings.append(BolaFinding(
+                    rule_id="BOLA-CROSS-TENANT-ACCESS", severity="P0",
+                    message=f"BOLA / IDOR: Tenant {label} token accessed the other tenant's resource at {path}",
+                    endpoint_or_file=path,
+                    curl_poc=f'curl -s -i -H "Authorization: Bearer $PRUFGATE_TOKEN_{variable}" -H "X-Tenant-ID: {tenant}" \'{_probe_url(target_url, path)}\'',
+                    details="Cross response matched the other owner's data, differed from the caller's own data, and was not the unauthenticated response. Response body omitted for privacy."))
+                coverage["verified_cross_tenant"] += 1
+            elif data is not None and data == own and own != other:
+                # The server consistently returns the caller's own resource.
+                coverage["verified_cross_tenant"] += 1
+            else:
+                problems.append("cross-tenant response was inconclusive; ownership or authentication could not be established")
+    findings = _with_refused_redirects(findings, refused, target_url)
+    if refused:
+        problems.append("redirected routes were not tested")
+    if problems or not coverage["verified_cross_tenant"]:
+        raise ProbeIncomplete("; ".join(dict.fromkeys(problems)) or "No cross-tenant resource could be verified.", findings, coverage)
+    return findings
 
 _U = "static-bola-unscoped-access"
 _T = "BOLA-TABLE-MISSING-TENANT-COLUMN"
@@ -2426,15 +2360,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tenant-b", "--id-b", dest="tenant_b", default=None, help="Resource/tenant ID owned by tenant B")
     args = parser.parse_args(raw_args)
 
-    for env_key, val in (
-        ("PRUFGATE_TEST_PROBE_TOKEN_A", args.token_a),
-        ("PRUFGATE_TEST_PROBE_TOKEN_B", args.token_b),
-        ("PRUFGATE_TEST_PROBE_TENANT_A_ID", args.tenant_a),
-        ("PRUFGATE_TEST_PROBE_TENANT_B_ID", args.tenant_b),
-    ):
-        if val:
-            os.environ[env_key] = val
-
     workspace = Path(args.workspace)
     if not workspace.is_dir():
         print(f"bola_engine: workspace not found: {workspace}", file=sys.stderr)
@@ -2446,24 +2371,46 @@ def main(argv: list[str] | None = None) -> int:
             print(f"bola_engine: {url_error}", file=sys.stderr)
             return 2
 
+    overrides = dict((key, value) for key, value in (
+        ("PRUFGATE_TEST_PROBE_TOKEN_A", args.token_a),
+        ("PRUFGATE_TEST_PROBE_TOKEN_B", args.token_b),
+        ("PRUFGATE_TEST_PROBE_TENANT_A_ID", args.tenant_a),
+        ("PRUFGATE_TEST_PROBE_TENANT_B_ID", args.tenant_b),
+    ) if value is not None)
+    previous = {key: os.environ.get(key) for key in overrides}
+
     try:
+        os.environ.update(overrides)
         cfg = PrufGateConfig.load(workspace, args.config, ref=args.base)
-        findings: list[BolaFinding] = []
+        findings = run_static_matrix_audit(workspace, config=cfg)
         if args.target and not args.static_only:
             if check_server_active(args.target):
                 findings.extend(run_dynamic_matrix(args.target, workspace=workspace, config=cfg))
             else:
-                print(f"  [BOLA Dynamic Matrix] Target {args.target} not reachable. Skipping dynamic network probes.")
-        findings.extend(run_static_matrix_audit(workspace, config=cfg))
+                raise ProbeIncomplete("Target is not reachable; live verification did not run.", findings, {"attempted": 1, "completed": 0, "failed": 1, "verified_cross_tenant": 0, "missing_controls": 0})
         findings = visible(findings, cfg.enable_low_confidence)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps([f.to_dict() for f in findings], indent=2), encoding="utf-8")
+        safe_write_text(output_path, json.dumps([f.to_dict() for f in findings], indent=2), encoding="utf-8")
+    except ProbeIncomplete as exc:
+        if exc.findings is not findings:
+            exc.findings = [*findings, *exc.findings]
+        try:
+            safe_write_text(output_path, json.dumps(exc.to_dict(), indent=2))
+        except OSError:
+            print("bola_engine: could not write incomplete verification output", file=sys.stderr)
+        print(f"bola_engine: live verification incomplete: {exc}", file=sys.stderr)
+        return 2
     except ConfigError as e:
         print(f"bola_engine: {e}", file=sys.stderr)
         return 2
     except Exception as e:  # fail closed: a crash is never a pass
         print(f"bola_engine: error: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     print(f"✔ BOLA / Cross-Tenant Matrix complete: {len(findings)} finding(s) written to {output_path}")
     return 1 if any(f.severity in ("P0", "P1") for f in findings) else 0

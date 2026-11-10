@@ -25,6 +25,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from prufgate.process import git_command
+
 OPT_IN_ENV = "PRUFGATE_ALLOW_RUN_TESTS"
 # The command gets these variables and nothing else unless `--pass-env` names more:
 # no tokens, keys or cloud credentials from the operator's environment.
@@ -59,7 +61,7 @@ def git(cwd: Path, *args: str, binary: bool = False) -> Any:
     """git with repository hooks and fsmonitor off, and without the operator's tokens in its environment."""
     try:
         res = subprocess.run(
-            ["git", *GIT_SAFE, *args], cwd=cwd, capture_output=True, text=not binary, check=True, env=env([]),
+            git_command(*args), cwd=cwd, capture_output=True, text=not binary, check=True, env=env([]),
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", "") or exc
@@ -70,7 +72,7 @@ def git(cwd: Path, *args: str, binary: bool = False) -> Any:
 
 
 def _git_quiet(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", *GIT_SAFE, *args], cwd=cwd, capture_output=True, env=env([]))
+    subprocess.run(git_command(*args), cwd=cwd, capture_output=True, env=env([]))
 
 
 # Linux: PR_SET_CHILD_SUBREAPER makes every orphaned descendant of the command (a
@@ -93,7 +95,22 @@ def _children(pid: int) -> set[int]:
             with open(f"/proc/{pid}/task/{task}/children", encoding="ascii") as fh:
                 out.update(int(c) for c in fh.read().split())
     except (OSError, ValueError):
-        pass
+        # Some procfs implementations expose status/PPid but omit task/children.
+        # Subreaper adoption still works there; an empty result would leak detached
+        # descendants. Fall back to the kernel's parent IDs, never process names.
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdecimal():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/status", encoding="ascii") as fh:
+                        parent = next((line.split()[1] for line in fh if line.startswith("PPid:")), None)
+                    if parent == str(pid):
+                        out.add(int(entry))
+                except (OSError, ValueError, IndexError):
+                    continue  # A process may exit while procfs is being read.
+        except OSError:
+            pass
     return out
 
 

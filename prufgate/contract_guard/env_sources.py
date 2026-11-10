@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover
 
 from prufgate.bola.bola_engine import is_test_path, iter_workspace_files
 from prufgate.config import PrufGateConfig
+from prufgate.safe_fs import safe_read_text
 
 MAX_SOURCE_BYTES = 1_000_000
 
@@ -62,7 +63,7 @@ def _read(path: Path, rel: str) -> str | None:
         if path.stat().st_size > MAX_SOURCE_BYTES:
             _warn(rel, f"larger than {MAX_SOURCE_BYTES} bytes")
             return None
-        return path.read_text(encoding="utf-8", errors="ignore")
+        return safe_read_text(path, encoding="utf-8", errors="ignore")
     except OSError as e:
         _warn(rel, str(e))
         return None

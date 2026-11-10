@@ -4,6 +4,32 @@ All notable changes to PrufGate. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-10
+
+### Added
+- Versioned scan results with consistent clean/findings/incomplete/error states, coverage, explainable findings, privacy metadata and effective blocking decisions across equivalent integration profiles.
+- Advisory and selected-rule enforcement, reviewed dismissal requests/approval/revocation with ownership, optional expiry and an auditable ledger, and owner/expiry metadata for reasoned inline ignores.
+- Opt-in GitHub Check Runs with changed-line annotations, coverage and next actions; PR summaries distinguish debt, incomplete checks and compatible previous-report comparisons.
+- Offline evaluation dashboards with explicit label denominators and provenance, a licensed 58-case upstream-derived corpus, Python reachable-return analysis and bounded cross-file impact review leads.
+- Public documentation index, user and developer guides, API/MCP references, upgrade guidance, support matrix and troubleshooting.
+
+### Changed
+- The GitHub Action supports explicit native/container selection, dependency validation and comparable core profiles. Execution errors remain fatal when findings are allowed.
+- External AI requires explicit operator consent in addition to trusted configuration. API, MCP, hooks and editor scans disable AI adjudication.
+- Editor diagnostics preserve scan-error and stale-result states; CI compiles, typechecks and tests the extension and its real-CLI integration.
+- Version tags also build, attest and attach the VS Code extension `.vsix` to the GitHub release and publish it to the Visual Studio Marketplace (environment `vscode-marketplace`), only after the GitHub release has attested that exact file.
+- The VS Code extension is listed under the Linters, Testing and AI Marketplace categories, with search keywords.
+- Dependencies: the container's Debian base image digest, ruff 0.17.3 and cyclonedx-bom 7.6.0 for CI and release checks, and tomli on Python 3.9 and 3.10.
+
+### Fixed
+- Invalid/missing engine output, unreadable inputs and incomplete verification cannot be interpreted as a clean pass. Scans use safe filesystem operations and isolated Git/process execution.
+- API cancellation/timeout lifecycle, process-registration races, connection deadlines, concurrency limits and bounded artifact retention/cleanup.
+- Read-only cache fallback, report privacy/redaction, integration response consistency, and process cleanup on procfs implementations without per-thread children files.
+- Source-literal handling, changed-line scope and contract/authorization analysis cases covered by regression fixtures.
+- Output and reports paths: report and result files stay inside their intended location, a scan result is applied once, and failures are reported. `PRUFGATE_REPORTS_DIR` is decided on its resolved location: inside the workspace only the default `reports` folder, as a real directory, is accepted, and folders reached through workspace symlinks are refused (known limit in `docs/CONFIGURATION.md`).
+- Review fixes: source lexing, symlinked paths, the Action's default container image, result counts and the tests that cover them.
+- Platform fixes: deep file paths on macOS and CI checkouts are no longer redacted as keys, Python 3.9 no longer fails closing an HTTP error without a body, and the editor's CLI tests pass on Windows.
+
 ## [1.3.0]
 
 ### Added

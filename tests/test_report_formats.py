@@ -97,6 +97,13 @@ class ReportFormats(unittest.TestCase):
         # Input order does not change the output.
         self.assertEqual(junit_xml(self._doc(findings[::-1])), junit_xml(self._doc(findings)))
 
+    def test_junit_ignores_a_non_boolean_blocking_flag(self):
+        doc = self._doc([_finding("r1", "P0"), _finding("r2", "P3")])
+        for result in doc["runs"][0]["results"]:
+            result.setdefault("properties", {})["blocking"] = "false"
+        tree = _xml(junit_xml(doc))
+        self.assertEqual((tree.get("failures"), tree.get("skipped")), ("1", "1"))
+
     def test_junit_escapes_special_characters(self):
         nasty = 'a <tag> & "quote" \'apos\' \x1b[31m \x00 end'
         tree = _xml(junit_xml(self._doc([_finding("r1", "P1", message=nasty, file="dir/<x>&.py")])))

@@ -8,6 +8,7 @@ retrieving SARIF / Markdown reports, receiving CI webhooks, and browsing OpenAPI
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import hashlib
 import hmac
@@ -17,6 +18,7 @@ import os
 import re
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -34,8 +36,17 @@ if str(PRUFGATE_ROOT) not in sys.path:
 from prufgate import __version__  # noqa: E402
 from prufgate.config import ConfigError  # noqa: E402
 from prufgate.netguard import target_url_error  # noqa: E402
+from prufgate.privacy import redact  # noqa: E402
+from prufgate.process import cli_command  # noqa: E402
+from prufgate.result_validation import read_json, validate_sarif  # noqa: E402
 from prufgate.rules import low_confidence_enabled, visible  # noqa: E402
-from prufgate.synthesizer.parse_results import safe_write_text  # noqa: E402
+from prufgate.safe_fs import safe_read_text, safe_remove_tree, safe_write_text  # noqa: E402
+from prufgate.scan_result import (  # noqa: E402
+    make_result,
+    metadata_from_sarif,
+    redact_result,
+    validate_result,
+)
 
 # In-memory scan store and active subprocess map
 SCANS: Dict[str, Dict[str, Any]] = {}
@@ -48,6 +59,10 @@ BATTERIES = ("fast", "check", "review", "full")
 SCAN_TIMEOUT = int(os.environ.get("PRUFGATE_API_SCAN_TIMEOUT", "600"))
 MAX_BODY_BYTES = 1 << 20
 MAX_SCAN_HISTORY = 200
+REPORT_RETENTION_SECONDS = 24 * 60 * 60
+HTTP_TIMEOUT = 30
+MAX_CONNECTIONS = 16
+PROCESS_GRACE_SECONDS = 1
 
 # Set by run_server; module-level so the handler and the tests share them.
 API_TOKEN = ""
@@ -125,20 +140,87 @@ def webhook_signature_ok(headers: Any, body: bytes) -> bool:
 
 
 def _terminate_scan_process(scan_id: str) -> None:
-    """Terminate an active scan subprocess group if running."""
+    """Terminate, escalate and reap; the runner owns registration until cleanup."""
     with SCANS_LOCK:
-        proc = SCAN_PROCESSES.pop(scan_id, None)
-    if proc is not None and proc.poll() is None:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except Exception:
+        proc = SCAN_PROCESSES.get(scan_id)
+    if proc is None:
+        return
+    _stop_process(proc)
+
+
+def _signal_process(proc: subprocess.Popen[str], force: bool = False) -> None:
+    try:
+        if os.name == "posix":
+            # The group ID is fixed at startup, even after the leader exits.
+            os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+        elif proc.poll() is None:
+            proc.kill() if force else proc.terminate()
+    except ProcessLookupError:
+        pass
+
+
+def _stop_process(proc: subprocess.Popen[str]) -> None:
+    _signal_process(proc)
+    try:
+        proc.wait(timeout=PROCESS_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        # Descendants can survive after the group leader handles SIGTERM.
+        _signal_process(proc, force=True)
+        proc.wait()
+
+
+def _remove_scan_artifacts(scan: Dict[str, Any]) -> None:
+    scan_id, workspace = scan.get("scan_id"), scan.get("workspace")
+    if not isinstance(scan_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]+", scan_id) or not workspace:
+        return
+    try:
+        safe_remove_tree(Path(workspace) / "reports" / "scans" / scan_id)
+    except OSError:
+        # Never follow links or broaden cleanup after a refusal.
+        print("prufgate api: could not safely remove scan artifacts", file=sys.stderr)
+
+
+def prune_scan_history(workspace: Optional[Path] = None) -> None:
+    """Bound finished history and artifacts, including orphaned reports after restart."""
+    now = time.time()
+    evicted = []
+    with SCANS_LOCK:
+        finished = [(sid, scan) for sid, scan in SCANS.items()
+                    if scan.get("status") not in ("queued", "running") and sid not in SCAN_PROCESSES]
+        for index, (sid, scan) in enumerate(reversed(finished)):
             try:
-                proc.terminate()
-            except Exception:
-                pass
+                stamp = datetime.datetime.fromisoformat(scan.get("completed_at", scan.get("created_at", ""))).timestamp()
+            except (TypeError, ValueError):
+                stamp = now
+            if index >= MAX_SCAN_HISTORY or now - stamp > REPORT_RETENTION_SECONDS:
+                evicted.append(SCANS.pop(sid))
+        active = set(SCANS) | set(SCAN_PROCESSES)
+        retained = sum(1 for scan in SCANS.values() if scan.get("workspace") == str(workspace)
+                       and scan.get("status") not in ("queued", "running")) if workspace is not None else 0
+    for scan in evicted:
+        _remove_scan_artifacts(scan)
+    if workspace is None:
+        return
+    parent = workspace / "reports" / "scans"
+    # Refuse linked parents before listing. Each deletion is checked again.
+    if any(p.is_symlink() for p in (workspace / "reports", parent)) or not parent.is_dir():
+        return
+    candidates = []
+    try:
+        for path in parent.iterdir():
+            # Only service-generated UUIDs may be reclaimed without an in-memory record.
+            if path.name not in active and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", path.name):
+                candidates.append((path.lstat().st_mtime, path.name))
+        for index, (stamp, sid) in enumerate(sorted(candidates, reverse=True)):
+            if index >= max(0, MAX_SCAN_HISTORY - retained) or now - stamp > REPORT_RETENTION_SECONDS:
+                _remove_scan_artifacts({"scan_id": sid, "workspace": str(workspace)})
+    except OSError:
+        print("prufgate api: could not inspect retained scan artifacts", file=sys.stderr)
 
 
-def scan_command(battery: str, workspace: Path) -> tuple[list[str], bool]:
+def scan_command(battery: str, workspace: Path, profile: str = "battery", result_out: Optional[Path] = None) -> tuple[list[str], bool]:
     """The command for a battery, and whether its stdout is the SARIF report.
 
     From a source checkout or the container, ./prufgate.sh runs the full gate
@@ -146,30 +228,50 @@ def scan_command(battery: str, workspace: Path) -> tuple[list[str], bool]:
     Markdown. A pip install has no prufgate.sh: `prufgate check` then writes SARIF to
     stdout (engines 1-5, no Markdown report).
     """
+    if profile == "core":
+        cmd = cli_command("check", str(workspace), "--format", "sarif")
+        if battery in ("fast", "check"):
+            cmd.append("--changed")
+        if result_out:
+            cmd.extend(("--result-out", str(result_out)))
+        return cmd, True
     prufgate_script = PRUFGATE_ROOT / "prufgate.sh"
     if prufgate_script.is_file():
         return ["bash", str(prufgate_script), battery], False
-    cmd = [sys.executable, "-m", "prufgate.cli", "check", str(workspace), "--format", "sarif"]
+    cmd = cli_command("check", str(workspace), "--format", "sarif")
     if battery in ("fast", "check"):
-        cmd.insert(5, "--changed")
+        cmd.insert(-2, "--changed")
     return cmd, True
 
 
 def run_scan_process(scan_id: str, cmd: list[str], cwd: Path, env: Dict[str, str]) -> tuple[int, str, str]:
     """Run one scan in its own process group so DELETE can stop it."""
-    proc = subprocess.Popen(
-        cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=env, start_new_session=True,
-    )
     with SCANS_LOCK:
+        if scan_id not in SCANS:
+            return 130, "", "Scan cancelled before process startup"
+        # DELETE takes the same lock: startup and registration are one operation.
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+            env=env, start_new_session=True,
+        )
         SCAN_PROCESSES[scan_id] = proc
     try:
         stdout, stderr = proc.communicate(timeout=SCAN_TIMEOUT)
         return proc.returncode, stdout, stderr
     except subprocess.TimeoutExpired:
-        _terminate_scan_process(scan_id)
+        _stop_process(proc)
+        # Drain and close pipes after killing; never leave an unreaped Popen behind.
+        try:
+            proc.communicate(timeout=PROCESS_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
         return 124, "", f"Scan timed out after {SCAN_TIMEOUT} seconds"
     finally:
+        _stop_process(proc)
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
         with SCANS_LOCK:
             SCAN_PROCESSES.pop(scan_id, None)
 
@@ -186,6 +288,7 @@ def execute_scan_worker(scan_id: str, battery: str, workspace: str, target_url: 
             return
         SCANS[scan_id]["status"] = "running"
         SCANS[scan_id]["started_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        profile = SCANS[scan_id].get("profile", "battery")
 
     start_time = time.time()
     ws_path = Path(workspace)
@@ -204,12 +307,13 @@ def execute_scan_worker(scan_id: str, battery: str, workspace: str, target_url: 
         env["PRUFGATE_REPORTS_DIR"] = str(isolated_reports_dir)
         env["PRUFGATE_NO_AI_ADJUDICATE"] = "1"  # the REST API never calls AI adjudication
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(PRUFGATE_ROOT), env.get("PYTHONPATH")]))
+        env.pop("TARGET_URL", None)
         if target_url:
             env["TARGET_URL"] = target_url
-        cmd, sarif_on_stdout = scan_command(battery, ws_path)
+        cmd, sarif_on_stdout = scan_command(battery, ws_path, profile, isolated_reports_dir / "prufgate-result.json")
         exit_code, stdout, stderr = run_scan_process(scan_id, cmd, ws_path, env)
         if sarif_on_stdout and exit_code in (0, 1):
-            sarif_path.write_text(stdout, encoding="utf-8")
+            safe_write_text(sarif_path, stdout, encoding="utf-8")
             stdout = ""
     except Exception as e:
         exit_code, stdout, stderr = 2, "", f"Execution error: {e}"
@@ -220,11 +324,13 @@ def execute_scan_worker(scan_id: str, battery: str, workspace: str, target_url: 
     p0 = p1 = p2 = p3 = 0
     counted = False
     findings_error = None
+    metadata, normalized = {}, []
+    effective_blockers = 0
     # The base the battery compared with (its changed scope writes it; empty means
     # HEAD): the configuration is read there, like the engines do.
     ref_file = isolated_reports_dir / "raw" / "base_ref"
     try:
-        cfg_ref = (ref_file.read_text(encoding="utf-8").strip() or "HEAD") if ref_file.is_file() and not ref_file.is_symlink() else None
+        cfg_ref = (safe_read_text(ref_file, encoding="utf-8").strip() or "HEAD") if ref_file.is_file() and not ref_file.is_symlink() else None
     except OSError:
         cfg_ref = None
     try:
@@ -238,13 +344,23 @@ def execute_scan_worker(scan_id: str, battery: str, workspace: str, target_url: 
             findings_error += f". Execution error: {stderr.strip()[-500:]}"
     else:
         try:
-            sarif_data = json.loads(sarif_path.read_text(encoding="utf-8"))
+            sarif_data = validate_sarif(read_json(safe_read_text(sarif_path, encoding="utf-8")))
+            metadata = metadata_from_sarif(sarif_data)
             for run in sarif_data.get("runs", []):
                 # Only the findings the gate reports: low-confidence rules stay hidden unless enabled.
                 for res in visible(run.get("results", []), enable_low):
-                    if res.get("suppressions"):
+                    if any(s.get("status", "accepted") == "accepted" for s in res.get("suppressions", [])):
                         continue  # an honoured inline ignore: listed, never counted
                     sev = (res.get("properties") or {}).get("severity") or {"error": "P1", "warning": "P2"}.get(res.get("level"), "P3")
+                    props = res.get("properties", {})
+                    effective_blockers += props.get("blocking", sev in ("P0", "P1")) is True
+                    location = (res.get("locations") or [{}])[0].get("physicalLocation", {})
+                    normalized.append({"rule": res.get("ruleId", "unknown-rule"), "severity": sev,
+                                       "engine": props.get("engine", props.get("tool", "prufgate")),
+                                       "file": location.get("artifactLocation", {}).get("uri", "workspace"),
+                                       "line": location.get("region", {}).get("startLine", 1),
+                                       "message": res.get("message", {}).get("text", ""),
+                                       "confidence": props.get("confidence")})
                     if sev == "P0":
                         p0 += 1
                     elif sev == "P1":
@@ -257,35 +373,68 @@ def execute_scan_worker(scan_id: str, battery: str, workspace: str, target_url: 
         except (OSError, ValueError, AttributeError) as e:
             findings_error = f"SARIF report could not be read: {e.__class__.__name__}"
 
-    # Keep the latest finished report at reports/ for `prufgate_summary` and humans.
-    for src in (sarif_path, markdown_path):
-        if src.is_file() and not src.is_symlink():
-            try:
-                safe_write_text(reports_root / src.name, src.read_text(encoding="utf-8"))
-            except OSError:
-                pass
+    if not counted and profile == "core":
+        try:
+            fallback = validate_result(read_json(safe_read_text(isolated_reports_dir / "prufgate-result.json")))
+            metadata, normalized = fallback, fallback["findings"]
+        except (OSError, ValueError):
+            pass
 
-    if exit_code >= 2 or not counted:
+    if counted and exit_code in (0, 1) and (exit_code == 0) != (effective_blockers == 0):
+        findings_error = "scanner exit code disagrees with blocking findings"
+        exit_code = 2
+    if exit_code not in (0, 1) or not counted:
         verdict = "ERROR"
     else:
         verdict = "PASSED" if exit_code == 0 else "FAILED"
 
+    incomplete = metadata.get("incomplete_reasons", []) if exit_code not in (0, 1) else []
+    issues = [findings_error] if findings_error else []
+    if exit_code not in (0, 1) and not incomplete:
+        issues += metadata.get("errors") or ["Scan execution did not complete."]
+    if metadata.get("scan_status") in ("error", "incomplete") and exit_code in (0, 1):
+        issues.append("SARIF records an unsuccessful scan despite a successful exit code.")
+    result = make_result(normalized, root=ws_path, coverage=metadata.get("coverage"), errors=issues,
+                         incomplete=incomplete, profile=metadata.get("profile", profile),
+                         # The scan already applied policy and dismissals: never twice.
+                         enforcement=metadata.get("enforcement"), revision=metadata.get("revision"))
+    if metadata.get("governance"):
+        result["governance"] = metadata["governance"]
+    exit_code = result["exit_code"]
+    if result["scan_status"] in ("incomplete", "error"):
+        verdict = "ERROR"
+
     with SCANS_LOCK:
         if scan_id in SCANS:
+            # Cancellation cannot publish reports after removing the scan record.
+            if counted and exit_code in (0, 1):
+                for src in (sarif_path, markdown_path):
+                    if src.is_file() and not src.is_symlink():
+                        try:
+                            safe_write_text(reports_root / src.name, safe_read_text(src, encoding="utf-8"))
+                        except OSError:
+                            pass
             SCANS[scan_id].update({
+                **{key: value for key, value in result.items() if key != "exit_code"},
                 "status": "completed",
                 "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "elapsed_seconds": elapsed,
                 "exit_code": exit_code,
                 "verdict": verdict,
-                "blockers": p0 + p1 if counted else None,
-                "advisories": p2 + p3 if counted else None,
+                "blockers": result["summary"]["blockers"] if counted else None,
+                "advisories": result["summary"]["advisories"] if counted else None,
                 "findings_summary": {"p0": p0, "p1": p1, "p2": p2, "p3": p3} if counted else None,
                 "findings_error": findings_error,
                 "sarif_path": str(sarif_path) if sarif_path.exists() else None,
                 "markdown_path": str(markdown_path) if markdown_path.exists() else None,
-                "log": (stdout + "\n" + stderr).strip(),
+                "log": redact((stdout + "\n" + stderr).strip()),
             })
+            deleted = False
+        else:
+            deleted = True
+    if deleted:
+        _remove_scan_artifacts({"scan_id": scan_id, "workspace": workspace})
+    prune_scan_history(ws_path)
 
 
 OPENAPI_SPEC = {
@@ -330,6 +479,8 @@ OPENAPI_SPEC = {
                                         "enum": list(BATTERIES),
                                         "default": "review"
                                     },
+                                    "profile": {"type": "string", "enum": ["core", "battery"], "default": "battery",
+                                                "description": "core matches CLI check and editor scans; battery includes the shell gate when installed"},
                                     "workspace": {
                                         "type": "string",
                                         "default": ".",
@@ -453,7 +604,8 @@ SWAGGER_HTML = """<!DOCTYPE html>
   <title>PrufGate REST API Documentation</title>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui.css">
+  <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui.css"
+        integrity="sha384-+yyzNgM3K92sROwsXxYCxaiLWxWJ0G+v/9A+qIZ2rgefKgkdcmJI+L601cqPD/Ut" crossorigin="anonymous">
   <style>
     body { margin: 0; background: #0f172a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
     .swagger-ui .topbar { display: none; }
@@ -469,7 +621,8 @@ SWAGGER_HTML = """<!DOCTYPE html>
     <span class="badge">v{VERSION}</span>
   </div>
   <div id="swagger-ui"></div>
-  <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-bundle.js"></script>
+  <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-bundle.js"
+          integrity="sha384-qn5tagrAjZi8cSmvZ+k3zk4+eDEEUcP9myuR2J6V+/H6rne++v6ChO7EeHAEzqxQ" crossorigin="anonymous"></script>
   <script>
     window.onload = function() {
       window.ui = SwaggerUIBundle({
@@ -487,6 +640,59 @@ SWAGGER_HTML = """<!DOCTYPE html>
 </body>
 </html>
 """
+# The page loads only the pinned, integrity-checked Swagger UI files and its own
+# inline start-up script (allowed by hash); the UI applies inline styles.
+_SWAGGER_SCRIPT = SWAGGER_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+SWAGGER_CSP = (
+    "default-src 'none'; "
+    "script-src https://unpkg.com 'sha256-"
+    + base64.b64encode(hashlib.sha256(_SWAGGER_SCRIPT.encode("utf-8")).digest()).decode("ascii") + "'; "
+    "style-src https://unpkg.com 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
+
+
+class PrufGateHTTPServer(ThreadingHTTPServer):
+    """Bound request threads and the lifetime of every accepted connection."""
+
+    daemon_threads = True
+
+    def __init__(self, address, handler):
+        self._connections = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self._last_prune = 0.0
+        super().__init__(address, handler)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(HTTP_TIMEOUT)
+        return connection, address
+
+    def process_request(self, request, client_address):
+        if not self._connections.acquire(blocking=False):
+            try:
+                request.settimeout(0.1)
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._connections.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connections.release()
+
+    def service_actions(self):
+        if time.monotonic() - self._last_prune >= 60:
+            self._last_prune = time.monotonic()
+            prune_scan_history()
 
 
 class PrufGateAPIHandler(BaseHTTPRequestHandler):
@@ -499,8 +705,25 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
     server_version = "PrufGate"
     sys_version = ""
 
+    def handle(self) -> None:
+        # A socket timeout alone resets on every byte and permits a slow drip forever.
+        def expire():
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        deadline = threading.Timer(HTTP_TIMEOUT, expire)
+        deadline.daemon = True
+        deadline.start()
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass  # The connection deadline or client closed the socket.
+        finally:
+            deadline.cancel()
+
     def _send_json(self, status: int, data: Any) -> None:
-        payload = json.dumps(data, indent=2).encode("utf-8")
+        payload = json.dumps(redact_result(data), indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
@@ -509,12 +732,16 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _send_text(self, status: int, text: str, content_type: str = "text/plain") -> None:
-        payload = text.encode("utf-8")
+    def _send_text(self, status: int, text: str, content_type: str = "text/plain", csp: str = "") -> None:
+        # A page with its own CSP is this module's constant (integrity hashes would
+        # read as secrets); everything else may carry scan output and is redacted.
+        payload = (text if csp else redact(text)).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", f"{content_type}; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        if csp:
+            self.send_header("Content-Security-Policy", csp)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -525,6 +752,8 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
         return False
 
     def _read_body(self) -> bytes:
+        if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) > 1:
+            raise RequestError(400, "send one Content-Length without Transfer-Encoding")
         raw_len = self.headers.get("Content-Length", "0")
         try:
             length = int(raw_len)
@@ -534,7 +763,13 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
             raise RequestError(400, "invalid Content-Length")
         if length > MAX_BODY_BYTES:
             raise RequestError(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
-        return self.rfile.read(length) if length else b""
+        try:
+            body = self.rfile.read(length) if length else b""
+        except TimeoutError:
+            raise RequestError(408, "request body deadline exceeded") from None
+        if len(body) != length:
+            raise RequestError(400, "incomplete request body")
+        return body
 
     def _get_scan(self, scan_id: str) -> Optional[Dict[str, Any]]:
         with SCANS_LOCK:
@@ -559,7 +794,7 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
             return
 
         if path in ("/docs", "/api"):
-            self._send_text(200, SWAGGER_HTML.replace("{VERSION}", __version__), content_type="text/html")
+            self._send_text(200, SWAGGER_HTML.replace("{VERSION}", __version__), content_type="text/html", csp=SWAGGER_CSP)
             return
 
         if path == "/api/v1/scans":
@@ -602,7 +837,7 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
             sarif_file = scan.get("sarif_path")
             if sarif_file and Path(sarif_file).exists():
                 try:
-                    self._send_json(200, json.loads(Path(sarif_file).read_text(encoding="utf-8")))
+                    self._send_json(200, json.loads(safe_read_text(Path(sarif_file), encoding="utf-8")))
                 except (OSError, ValueError):
                     self._send_json(500, {"error": "Failed to parse SARIF report", "scan_id": scan_id})
             else:
@@ -611,7 +846,7 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
 
         rep_file = scan.get("markdown_path")
         if rep_file and Path(rep_file).exists():
-            self._send_text(200, Path(rep_file).read_text(encoding="utf-8"), content_type="text/markdown")
+            self._send_text(200, safe_read_text(Path(rep_file), encoding="utf-8"), content_type="text/markdown")
         else:
             self._send_json(404, {"error": "Report not generated or missing", "scan_id": scan_id})
 
@@ -631,9 +866,10 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
         with SCANS_LOCK:
             if scan_id in SCANS:
                 found = True
-                del SCANS[scan_id]
+                record = SCANS.pop(scan_id)
         if found:
             _terminate_scan_process(scan_id)
+            _remove_scan_artifacts({"scan_id": scan_id, "workspace": record.get("workspace")})
             self._send_json(200, {"message": "Scan deleted", "scan_id": scan_id})
         else:
             self._send_json(404, {"error": "Scan not found", "scan_id": scan_id})
@@ -653,23 +889,23 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
     def _start(self, record: Dict[str, Any], battery: str, workspace: Path,
                target_url: Optional[str], is_async: bool = True) -> Optional[Dict[str, Any]]:
         """Register and start a scan, or refuse when too many are running."""
+        prune_scan_history(workspace)
         with SCANS_LOCK:
-            if sum(1 for s in SCANS.values() if s.get("status") in ("queued", "running")) >= MAX_RUNNING:
+            active = {sid for sid, s in SCANS.items() if s.get("status") in ("queued", "running")} | set(SCAN_PROCESSES)
+            if len(active) >= MAX_RUNNING:
                 raise RequestError(429, "too many scans are running; retry later")
-            # Bound completed scan history so memory never grows without limit
-            if len(SCANS) >= MAX_SCAN_HISTORY:
-                completed_ids = [
-                    sid for sid, s in SCANS.items() if s.get("status") not in ("queued", "running")
-                ]
-                for sid in completed_ids[: max(1, len(SCANS) - MAX_SCAN_HISTORY + 1)]:
-                    SCANS.pop(sid, None)
             SCANS[record["scan_id"]] = record
         if is_async:
-            threading.Thread(
-                target=execute_scan_worker,
-                args=(record["scan_id"], battery, str(workspace), target_url),
-                daemon=True,
-            ).start()
+            try:
+                threading.Thread(
+                    target=execute_scan_worker,
+                    args=(record["scan_id"], battery, str(workspace), target_url),
+                    daemon=True,
+                ).start()
+            except RuntimeError:
+                with SCANS_LOCK:
+                    SCANS.pop(record["scan_id"], None)
+                raise RequestError(503, "could not start scan worker") from None
             return None
         execute_scan_worker(record["scan_id"], battery, str(workspace), target_url)
         return self._get_scan(record["scan_id"])
@@ -691,6 +927,11 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
         battery = validate_battery(payload.get("battery", "review"))
         workspace = resolve_workspace(payload.get("workspace", "."))
         target_url = validate_target_url(payload.get("target_url"))
+        profile = payload.get("profile", "battery")
+        if profile not in ("core", "battery"):
+            raise RequestError(400, "profile must be core or battery")
+        if profile == "core" and target_url:
+            raise RequestError(400, "core profile is static; request battery for live probes")
         is_async = payload.get("async", payload.get("is_async", True)) is not False
         dry_run = payload.get("dry_run", False) is not False
 
@@ -708,6 +949,7 @@ class PrufGateAPIHandler(BaseHTTPRequestHandler):
         record = {
             "scan_id": scan_id,
             "battery": battery,
+            "profile": profile,
             "workspace": str(workspace),
             "target_url": target_url,
             "status": "queued",
@@ -776,7 +1018,7 @@ def is_loopback(host: str) -> bool:
 def configure(token: Optional[str] = None, webhook_secret: Optional[str] = None,
               max_running: Optional[int] = None) -> bool:
     """Set the server's credentials. Returns True when the token was generated."""
-    global API_TOKEN, WEBHOOK_SECRET, MAX_RUNNING
+    global API_TOKEN, WEBHOOK_SECRET, MAX_RUNNING, HTTP_TIMEOUT, MAX_CONNECTIONS, MAX_SCAN_HISTORY, REPORT_RETENTION_SECONDS
     token = token if token is not None else os.environ.get("PRUFGATE_API_TOKEN", "")
     generated = not token
     API_TOKEN = token or secrets.token_urlsafe(32)
@@ -787,6 +1029,14 @@ def configure(token: Optional[str] = None, webhook_secret: Optional[str] = None,
         except ValueError:
             max_running = 2
     MAX_RUNNING = max(1, max_running)
+    for name, default in (("HTTP_TIMEOUT", 30), ("MAX_CONNECTIONS", 16), ("MAX_SCAN_HISTORY", 200), ("REPORT_RETENTION_SECONDS", 86400)):
+        setting = {"HTTP_TIMEOUT": "HTTP_TIMEOUT", "MAX_CONNECTIONS": "MAX_CONNECTIONS",
+                   "MAX_SCAN_HISTORY": "MAX_HISTORY", "REPORT_RETENTION_SECONDS": "RETENTION_SECONDS"}[name]
+        try:
+            value = int(os.environ.get("PRUFGATE_API_" + setting, str(default)))
+        except ValueError:
+            value = default
+        globals()[name] = max(1, value)
     return generated
 
 
@@ -795,7 +1045,7 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
     if not is_loopback(host) and generated:
         print("Refusing to listen on a non-loopback address without PRUFGATE_API_TOKEN set.", file=sys.stderr)
         sys.exit(2)
-    server = ThreadingHTTPServer((host, port), PrufGateAPIHandler)
+    server = PrufGateHTTPServer((host, port), PrufGateAPIHandler)
     print("══════════════════════════════════════════════════════════════════════")
     print(f"  PrufGate REST API Server listening on http://{host}:{port}")
     print(f"  Workspace root:               {workspace_root()}")
@@ -809,7 +1059,16 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down PrufGate REST API Server.")
-        server.shutdown()
+    finally:
+        server.server_close()
+        with SCANS_LOCK:
+            cancelled = [SCANS.pop(sid) for sid in list(SCANS)
+                         if SCANS[sid].get("status") in ("queued", "running")]
+            active_ids = list(SCAN_PROCESSES)
+        for scan_id in active_ids:
+            _terminate_scan_process(scan_id)
+        for record in cancelled:
+            _remove_scan_artifacts(record)
 
 
 def main() -> None:

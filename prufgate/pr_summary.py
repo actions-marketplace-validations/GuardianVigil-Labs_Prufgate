@@ -44,6 +44,8 @@ from prufgate.diff_guard.tamper_detector import (  # noqa: E402
 )
 from prufgate.diff_scope import _HUNK_RE, _unquote_git_path  # noqa: E402
 from prufgate.review.adjudicate import redact  # noqa: E402
+from prufgate.safe_fs import safe_read_text  # noqa: E402
+from prufgate.scan_result import metadata_from_sarif  # noqa: E402
 
 MARKER = "<!-- prufgate:pr-summary -->"
 # GitHub refuses comment bodies over 65,536 characters.
@@ -77,6 +79,8 @@ class Finding:
     path: str
     line: int
     message: str
+    fingerprint: str = ""
+    blocking: Optional[bool] = None
 
 
 @dataclass
@@ -84,6 +88,9 @@ class Report:
     findings: List[Finding] = field(default_factory=list)
     ignored: int = 0  # honoured inline ignores (SARIF suppression kind inSource)
     dismissed: int = 0  # AI-dismissed (kind external)
+    baselined: int = 0
+    reviewed: int = 0
+    metadata: dict = field(default_factory=dict)
 
     def count(self, *severities: str) -> int:
         return sum(1 for f in self.findings if f.severity in severities)
@@ -105,21 +112,29 @@ def read_sarif(path: Path) -> Report:
     """The findings of a SARIF 2.1.0 report. A result with a suppression is counted,
     not listed. Raises SummaryError when the file is missing or not SARIF."""
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc = json.loads(safe_read_text(path, encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise SummaryError(f"cannot read the SARIF report {path}: {exc}") from exc
     runs = doc.get("runs") if isinstance(doc, dict) else None
-    if not isinstance(runs, list):
+    if not isinstance(runs, list) or not runs or not all(isinstance(run, dict) for run in runs):
         raise SummaryError(f"{path} is not a SARIF report: it has no runs")
     report = Report()
+    try:
+        report.metadata = metadata_from_sarif(doc)
+    except ValueError as exc:
+        raise SummaryError("invalid versioned scan metadata") from exc
     for run in runs:
         results = run.get("results") if isinstance(run, dict) else None
         for res in results if isinstance(results, list) else []:
             if not isinstance(res, dict):
                 continue
-            sups = [s for s in res.get("suppressions") or [] if isinstance(s, dict)]
+            sups = [s for s in res.get("suppressions") or [] if isinstance(s, dict) and s.get("status", "accepted") == "accepted"]
             if sups:
-                if any(s.get("kind") == "external" for s in sups):
+                if (res.get("properties") or {}).get("dismissal"):
+                    report.reviewed += 1
+                elif any(s.get("justification", "").lower().startswith("in the prufgate baseline") for s in sups):
+                    report.baselined += 1
+                elif any(s.get("kind") == "external" for s in sups):
                     report.dismissed += 1
                 else:
                     report.ignored += 1
@@ -139,7 +154,9 @@ def read_sarif(path: Path) -> Report:
                     line = 1
             message = res.get("message")
             text = message.get("text") if isinstance(message, dict) else ""
-            report.findings.append(Finding(str(res.get("ruleId") or "unknown-rule"), severity, uri, line, str(text or "")))
+            fingerprint = str((res.get("partialFingerprints") or {}).get("prufgateFindingHash/v1", ""))
+            report.findings.append(Finding(str(res.get("ruleId") or "unknown-rule"), severity, uri, line, str(text or ""), fingerprint,
+                                          props.get("blocking") if type(props.get("blocking")) is bool else None))
     report.findings.sort(key=lambda f: (SEVERITIES.index(f.severity), f.path, f.line, f.rule))
     return report
 
@@ -269,11 +286,13 @@ def render(
     max_findings: int = 10,
     changes_note: str = "",
 ) -> str:
-    blocking = report.count("P0", "P1")
+    blocking = sum(f.blocking if f.blocking is not None else f.severity in ("P0", "P1") for f in report.findings)
     warnings = report.count("P2")
     notes = report.count("P3")
     if exit_code is None:
-        exit_code = 1 if blocking else 0
+        exit_code = report.metadata.get("exit_code", 1 if blocking else 0)
+    if report.metadata.get("scan_status") in ("incomplete", "error"):
+        exit_code = 2
     if exit_code == 0:
         title = "PrufGate: no blocking findings"
     elif exit_code == 1:
@@ -289,6 +308,9 @@ def render(
         ]
     counts = [f"**{blocking}** blocking (P0/P1)", f"**{warnings}** {'warning' if warnings == 1 else 'warnings'} (P2)",
               f"**{notes}** {'note' if notes == 1 else 'notes'} (P3)"]
+    advisory_high = sum(f.severity in ("P0", "P1") and f.blocking is False for f in report.findings)
+    if advisory_high:
+        counts.append(f"**{advisory_high}** advisory under policy (P0/P1)")
     if report.ignored:
         counts.append(f"{report.ignored} ignored with a reason")
     if report.dismissed:
@@ -321,6 +343,66 @@ def render(
         cut = body.rfind("\n- ", 0, MAX_BODY - 200)
         body = body[: cut if cut > 0 else MAX_BODY - 200] + "\n\n_The summary was cut to fit; the SARIF report has every finding._\n"
     return body
+
+
+def workflow_summary(result: dict, comparison: Optional[dict] = None) -> str:
+    """PR-facing facts and next actions; every repository-derived string is escaped."""
+    status = result.get("scan_status", "unknown")
+    cov, gov = result.get("coverage", {}), result.get("governance", {})
+    counts = result.get("summary", {})
+    out = ["", "**Review workflow**", "", f"Scan status: {code(status)}; enforcement: {code(result.get('enforcement', {}).get('mode', 'strict'))}."]
+    if comparison is None:
+        out.append("New versus existing findings: not measured; supply a previous SARIF report for a stable-fingerprint comparison.")
+    elif comparison.get("available"):
+        out.append(f"New findings: **{comparison['new']}**; existing active findings: **{comparison['existing']}**; no longer reported: **{comparison['resolved']}**.")
+    else:
+        out.append("New versus existing findings: unknown — " + code(comparison.get("reason", "Stable fingerprints are missing.")) + ".")
+    out.append(f"Existing debt: **{gov.get('baselined_findings', 'unknown')}** findings matched the baseline; **{gov.get('registered_known_debt_entries', 'unknown')}** registered known-debt entries.")
+    if gov.get("known_debt_ceilings"):
+        out.append("Numeric debt allowances (not measured counts): " + ", ".join(code(f"{rule}: {limit}") for rule, limit in sorted(gov["known_debt_ceilings"].items())) + ".")
+    out.append(f"Reviewed dismissals applied: **{len(gov.get('dismissed', []))}**; pending ledger changes: **{gov.get('pending_changes', 0)}**.")
+    attention = [entry for entry in gov.get("states", []) if entry.get("state") in ("pending", "expired")]
+    for entry in attention[:10]:
+        out.append(f"- Dismissal {code(entry.get('dismissal_id', 'unknown'), 50)}: {code(entry.get('state'))}; owner {code(entry.get('owner', 'unassigned'))}; expires {code(entry.get('expires') or 'not set')}.")
+    if len(attention) > 10:
+        out.append(f"- {len(attention) - 10} more dismissal records are in the local ledger and result artifact.")
+    out.append(f"Coverage: {code(cov.get('files_checked') if cov.get('files_checked') is not None else 'unknown')} files; {code(cov.get('lines_checked') if cov.get('lines_checked') is not None else 'unknown')} input lines.")
+    reasons = result.get("errors", []) + result.get("incomplete_reasons", [])
+    skips = [entry for entry in cov.get("engines", []) if entry.get("status") in ("skipped", "error", "incomplete")]
+    out += ["", "**Incomplete, failed or skipped checks**", ""]
+    out += ["- " + code(reason, 400) for reason in reasons]
+    out += [f"- {code(entry.get('engine', 'check'))}: {code(entry.get('status'))} — {code(entry.get('reason') or 'No reason supplied', 240)}" for entry in skips]
+    if not reasons and not skips:
+        out.append("- None reported within the selected scan profile.")
+    actions = []
+    if status in ("incomplete", "error"):
+        actions.append("Repair the failed inputs or checks and rerun. This scan cannot establish a pass.")
+    if counts.get("blockers", 0):
+        actions.append(f"Fix or request review of {counts['blockers']} policy blocker(s); use prufgate explain RULE for rule-specific guidance.")
+    if counts.get("advisories", 0):
+        actions.append("Triage the advisory findings. Promote selected rules only after validating their precision in this codebase.")
+    if gov.get("pending_changes"):
+        actions.append("Have a maintainer review the dismissal ledger changes; approvals added by this PR do not apply to its scan.")
+    expired = [s for s in gov.get("states", []) if s.get("state") == "expired"]
+    if expired:
+        actions.append("Review expired dismissals and fix the restored findings or submit a new reviewed request.")
+    if gov.get("baselined_findings") or gov.get("registered_known_debt_entries"):
+        actions.append("Reduce recorded debt as fixes land; refresh the baseline through normal review.")
+    if not actions:
+        actions.append("Review the reported coverage and change facts; no policy blocker was reported in completed checks.")
+    out += ["", "**Recommended next actions**", "", *["- " + action for action in actions]]
+    return "\n".join(out) + "\n"
+
+
+def compare_reports(report: Report, previous: Report) -> dict:
+    if report.metadata and previous.metadata:
+        if report.metadata.get("profile") != previous.metadata.get("profile") or report.metadata.get("coverage", {}).get("scope") != previous.metadata.get("coverage", {}).get("scope"):
+            return {"available": False, "reason": "Reports cover different profiles or scopes."}
+    if any(not f.fingerprint for f in report.findings + previous.findings):
+        return {"available": False}
+    current = {(f.rule, f.path, f.fingerprint) for f in report.findings}
+    old = {(f.rule, f.path, f.fingerprint) for f in previous.findings}
+    return {"available": True, "new": len(current - old), "existing": len(current & old), "resolved": len(old - current)}
 
 
 def _render_changes(changes: List[FileChange], base_ref: Optional[str]) -> List[str]:
@@ -439,7 +521,7 @@ def pr_number_from_event(path: Optional[str]) -> Optional[int]:
     if not path:
         return None
     try:
-        event = json.loads(Path(path).read_text(encoding="utf-8"))
+        event = json.loads(safe_read_text(Path(path), encoding="utf-8"))
     except (OSError, ValueError):
         return None
     number = (event.get("pull_request") or {}).get("number") if isinstance(event, dict) else None
@@ -455,7 +537,7 @@ def resolve_base(reports_dir: Path, explicit: Optional[str]) -> Optional[str]:
     if explicit:
         return explicit
     try:
-        recorded = (reports_dir / "raw" / "base_ref").read_text(encoding="utf-8").strip()
+        recorded = safe_read_text(reports_dir / "raw" / "base_ref", encoding="utf-8").strip()
     except OSError:
         recorded = ""
     if recorded:
@@ -477,6 +559,7 @@ def main(
     repo: Optional[str] = None,
     pr: Optional[int] = None,
     opener: Opener = _default_opener,
+    previous_sarif: Optional[str] = None,
 ) -> int:
     root = Path(workspace).resolve()
     reports_dir = Path(os.environ.get("PRUFGATE_REPORTS_DIR") or root / "reports")
@@ -497,6 +580,22 @@ def main(
     else:
         note = "no base ref, so there is nothing to compare"
     body = render(report, changes, base_ref, exit_code, max_findings, note)
+    comparison = None
+    if previous_sarif:
+        try:
+            comparison = compare_reports(report, read_sarif(Path(previous_sarif)))
+        except SummaryError as exc:
+            print(f"prufgate pr-summary: previous report could not be read: {exc}", file=sys.stderr)
+            return 2
+    metadata = report.metadata
+    if not metadata:
+        blockers = sum(f.blocking if f.blocking is not None else f.severity in ("P0", "P1") for f in report.findings)
+        metadata = {"scan_status": "error" if exit_code not in (None, 0, 1) else "findings" if report.findings else "clean",
+                    "summary": {"blockers": blockers, "advisories": len(report.findings) - blockers},
+                    "errors": ["The gate could not finish; inspect its execution log."] if exit_code not in (None, 0, 1) else [],
+                    "coverage": {}, "governance": {}, "enforcement": {"mode": "not reported"}}
+    body += workflow_summary(metadata, comparison)
+    body = body[:MAX_BODY] if len(body) > MAX_BODY else body
     sys.stdout.write(body)
     sys.stdout.flush()
     if not post:

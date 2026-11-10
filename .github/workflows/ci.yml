@@ -13,6 +13,47 @@ permissions:
   contents: read
 
 jobs:
+  vscode-extension:
+    name: VS Code extension (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Install locked extension dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Compile extension
+        run: npm run build
+      - name: Typecheck extension
+        run: npm run typecheck
+      - name: Test extension
+        run: npm test
+      - name: Set up Python for integration consistency checks
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install locked scanner dependencies
+        run: python -m pip install --require-hashes -r ../../requirements.txt
+      - name: Check editor and real CLI result consistency
+        shell: bash
+        env:
+          PRUFGATE_TEST_PYTHON: python
+        run: npm run test:integration
+
   python-versions:
     name: Unit tests on Python ${{ matrix.python }}${{ matrix.label }}
     # Python 3.9 is the oldest supported version and is not built for the
@@ -85,6 +126,11 @@ jobs:
       - name: Lint Python Modules with Ruff
         run: |
           ruff check --config configs/ruff.toml prufgate/ tests/
+
+      - name: Verify frozen external corpus and measure upstream agreement
+        run: |
+          python3 scripts/build_evaluation_corpus.py
+          python3 prufgate/cli.py evaluate --cases bench/testdata/independent --independent-only --format json --output reports/independent-evaluation.json
 
       - name: Validate Shell Script Execution Bits & Syntax
         run: |

@@ -3,3 +3,5 @@
 # Regenerate: uv pip compile --universal --python-version 3.11 --generate-hashes requirements.in -o requirements.txt
 PyYAML==6.0.3
 setuptools>=84.1.0
+# Python 3.9 and 3.10 read TOML with tomli (tomllib from 3.11).
+tomli==2.2.1; python_version < '3.11'

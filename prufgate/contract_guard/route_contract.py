@@ -19,6 +19,7 @@ if str(_THIS_DIR.parent.parent) not in sys.path:
 from prufgate import inline_ignore  # noqa: E402
 from prufgate.bola.bola_engine import DiscoveredRoute, discover_all_routes  # noqa: E402
 from prufgate.contract_guard.dependency_guard import Finding  # noqa: E402
+from prufgate.source_text import views  # noqa: E402
 
 FRONTEND_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".vue", ".svelte"}
 
@@ -107,9 +108,12 @@ def scan_file_route_contracts(
         return findings
 
     lines = content.splitlines()
+    searchable, executable, _ = views(content, norm_rel)
     calls: list[tuple[int, str, str, str]] = []  # (line_no, method, raw_path, line_snippet)
 
-    for m in FETCH_CALL_RE.finditer(content):
+    for m in FETCH_CALL_RE.finditer(searchable):
+        if not executable[m.start():m.start() + 1].strip():
+            continue
         raw_url = m.group(2)
         opts = m.group(3) or ""
         m_method = FETCH_METHOD_RE.search(opts)
@@ -118,14 +122,18 @@ def scan_file_route_contracts(
         snippet = lines[line_no - 1].strip() if 1 <= line_no <= len(lines) else raw_url
         calls.append((line_no, method, raw_url, snippet))
 
-    for m in AXIOS_CALL_RE.finditer(content):
+    for m in AXIOS_CALL_RE.finditer(searchable):
+        if not executable[m.start():m.start() + 1].strip():
+            continue
         method = m.group(1).upper()
         raw_url = m.group(3)
         line_no = content[: m.start()].count("\n") + 1
         snippet = lines[line_no - 1].strip() if 1 <= line_no <= len(lines) else raw_url
         calls.append((line_no, method, raw_url, snippet))
 
-    for m in SWR_CALL_RE.finditer(content):
+    for m in SWR_CALL_RE.finditer(searchable):
+        if not executable[m.start():m.start() + 1].strip():
+            continue
         raw_url = m.group(2)
         line_no = content[: m.start()].count("\n") + 1
         snippet = lines[line_no - 1].strip() if 1 <= line_no <= len(lines) else raw_url

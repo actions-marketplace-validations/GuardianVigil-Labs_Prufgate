@@ -42,7 +42,7 @@ ALLOWED_IPV4 = re.compile(
 ALLOWED_EMAIL = re.compile(
     r"@(?:(?:[a-z0-9-]+\.)*(?:example|example\.(?:com|org|net)|test|invalid|localhost)"
     r"|guardianvigil\.io|users\.noreply\.github\.com)$"
-    r"|^(?:noreply@github\.com|git@[\w.-]+)$",
+    r"|^(?:noreply@github\.com|support@github\.com|git@[\w.-]+)$",
     re.I,
 )
 AI_NAMES = r"(?:claude|anthropic|copilot|cursor|gemini|chatgpt|openai|codex|antigravity|devin|windsurf|aider|opencode)"
@@ -224,6 +224,7 @@ class PublicRepositoryHygiene(unittest.TestCase):
             "write to alice@example.com, bob@corp.example or security@guardianvigil.io",
             "the container home /home/prufgate/.cache and the runner /home/runner/work",
             "Co-authored-by: A Person <123+a@users.noreply.github.com>",
+            "Signed-off-by: dependabot[bot] <support@github.com>",
             "published by GuardianVigil",
             "clone git@github.com:org/repo.git with netmask 255.255.255.0 into /Users/Shared/tmp",
             "src = \"import pytest\\n\\n@pytest.fixture\\ndef test_user(): ...\"",

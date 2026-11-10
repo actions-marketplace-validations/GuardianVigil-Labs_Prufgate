@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import re
 import subprocess
@@ -33,10 +34,21 @@ from prufgate.config import (  # noqa: E402
     PrufGateConfig,
 )
 from prufgate.console import utf8_output  # noqa: E402
+from prufgate.coverage import merge as merge_coverage  # noqa: E402
+from prufgate.privacy import redact, redact_data  # noqa: E402
+from prufgate.process import git_command  # noqa: E402
 from prufgate.report_formats import gitlab_code_quality, junit_xml  # noqa: E402
+from prufgate.result_validation import read_json, validate_findings  # noqa: E402
 from prufgate.review.adjudicate import adjudicate  # noqa: E402
 from prufgate.rules import SARIF_RANK, confidence, visible  # noqa: E402
+from prufgate.safe_fs import safe_read_text, safe_write_text  # noqa: E402
 from prufgate.sarif import add_partial_fingerprints  # noqa: E402
+from prufgate.scan_result import (  # noqa: E402
+    ai_privacy,
+    attach_sarif,
+    make_result,
+    markdown_summary,
+)
 
 # ANSI Color Codes
 RESET = "\033[0m"
@@ -62,19 +74,42 @@ class Finding:
         origin: str = "",
         spans: Optional[List[tuple]] = None,
         anchored: bool = False,
+        blocking: Optional[bool] = None,
     ):
         self.tool = tool
         self.origin = origin or tool  # "ai-review" for an AI review comment
         self.rule_id = rule_id
         self.severity = severity
-        self.message = message.strip().replace("\n", " ")
+        self.message = redact(message.strip().replace("\n", " "))
         self.file_path = file_path
         self.line = line
-        self.details = details.strip()
+        self.details = redact(details.strip())
         # Line ranges the finding covers, for the changed-lines scope (diff_scope).
         self.spans = spans or [(line, line)]
         # Already limited to the change by the runner (gitleaks over the PR's commits).
         self.anchored = anchored
+        self.blocking = severity in ("P0", "P1") if blocking is None else blocking
+
+    @property
+    def file_path(self) -> str:
+        """The reported path, always through the full secret rules."""
+        return redact(self._file_path)
+
+    @file_path.setter
+    def file_path(self, value: str) -> None:
+        self._file_path = value
+
+    @property
+    def raw_file_path(self) -> str:
+        """The path before redaction, for identity only (dedup, scope, baseline); never reported."""
+        return self._file_path
+
+    def workspace_file_path(self, workspace_dir: Optional[Path]) -> str:
+        """The reported path relative to the workspace when it lies inside it, then redacted.
+
+        Relative before redacting: a deep absolute checkout path (a macOS temporary folder)
+        reads as one long opaque token to the secret rules."""
+        return redact(workspace_relative_path(self._file_path, workspace_dir))
 
     @property
     def confidence(self) -> str:
@@ -93,38 +128,35 @@ class Finding:
         }
 
 
-def safe_write_text(path: Path, text: str) -> None:
-    """Write `path` without following a symlink: the reports folder lives in the
-    scanned repository, which may plant `reports/prufgate.sarif -> elsewhere`."""
-    if path.parent.is_symlink():
-        raise OSError(f"refusing to write into a symlinked directory: {path.parent}")
-    if path.is_symlink():
-        path.unlink()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
 def get_git_info() -> tuple[str, str]:
     workspace = Path(os.environ.get("WORKSPACE", "/workspace")).resolve().name or "workspace"
     commit = "unknown"
     try:
         commit = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL, text=True
+            git_command("rev-parse", "--short", "HEAD"), stderr=subprocess.DEVNULL, text=True
         ).strip()
     except Exception:
         pass
     return workspace, commit
 
 
-def parse_raw_results(raw_dir: Path) -> List[Finding]:
+def read_engine_output(path: Path, partial: bool = False) -> list[dict]:
+    tool = next(k for k, name in ENGINE_OUTPUTS.items() if name == path.name)
+    data = read_json(safe_read_text(path, encoding="utf-8"))
+    if partial and tool == "bola-matrix" and isinstance(data, dict) and data.get("status") == "incomplete":
+        data = data.get("findings")
+    return validate_findings(data, tool)
+
+
+def parse_raw_results(raw_dir: Path, workspace_dir: Optional[Path] = None) -> List[Finding]:
+    """Every engine's findings, workspace-relative, deduplicated on their real paths."""
     findings: List[Finding] = []
 
     # 1. Engine 1: Production Anti-Fabrication Engine (anti_fabrication.json)
     af_file = raw_dir / "anti_fabrication.json"
     if af_file.exists() and af_file.stat().st_size > 0:
         try:
-            af_data = json.loads(af_file.read_text(encoding="utf-8"))
+            af_data = read_engine_output(af_file)
             if isinstance(af_data, list):
                 for item in af_data:
                     ln = int(item.get("line", 1))
@@ -141,14 +173,14 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                             spans=[(ln, max(ln, end_ln))],
                         )
                     )
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             pass
 
     # 2. Engine 2: Test Integrity & Anti-Reward-Hacking Engine (test_integrity.json)
     ti_file = raw_dir / "test_integrity.json"
     if ti_file.exists() and ti_file.stat().st_size > 0:
         try:
-            ti_data = json.loads(ti_file.read_text(encoding="utf-8"))
+            ti_data = read_engine_output(ti_file)
             if isinstance(ti_data, list):
                 for item in ti_data:
                     rule_name = item.get("rule", "test-integrity-violation")
@@ -169,14 +201,14 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                             spans=[(ln, max(ln, end_ln))],
                         )
                     )
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             pass
 
     # 3. Engine 3: Diff-Scoped Agent Tampering Guard (diff_guard.json)
     dg_file = raw_dir / "diff_guard.json"
     if dg_file.exists() and dg_file.stat().st_size > 0:
         try:
-            dg_data = json.loads(dg_file.read_text(encoding="utf-8"))
+            dg_data = read_engine_output(dg_file)
             if isinstance(dg_data, list):
                 for item in dg_data:
                     rule_name = item.get("rule", "diff-tampering-violation")
@@ -194,14 +226,14 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                             details=item.get("snippet", "")[:200],
                         )
                     )
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             pass
 
     # 4. Engine 4: Ghost Dependency, API Contract & Environment Drift Guard (contract_guard.json)
     cg_file = raw_dir / "contract_guard.json"
     if cg_file.exists() and cg_file.stat().st_size > 0:
         try:
-            cg_data = json.loads(cg_file.read_text(encoding="utf-8"))
+            cg_data = read_engine_output(cg_file)
             cg_items = cg_data.get("findings", []) if isinstance(cg_data, dict) else cg_data
             if isinstance(cg_items, list):
                 for item in cg_items:
@@ -223,14 +255,14 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                             spans=[(ln, max(ln, end_ln))],
                         )
                     )
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             pass
 
     # 5. Engine 5: Universal Multi-Tenant BOLA / IDOR Engine (bola_matrix.json)
     bola_file = raw_dir / "bola_matrix.json"
     if bola_file.exists() and bola_file.stat().st_size > 0:
         try:
-            bola_data = json.loads(bola_file.read_text(encoding="utf-8"))
+            bola_data = read_engine_output(bola_file, partial=True)
             if isinstance(bola_data, list):
                 for item in bola_data:
                     b_line = int(item.get("line", 1))
@@ -245,16 +277,17 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                             details=f"{item.get('details', '')} {item.get('curl_poc', '')}"[:300],
                             # The whole handler: removing its guard is a change to the route.
                             spans=[(b_line, max(b_line, int(item.get("end_line") or b_line)))],
+                            anchored=item.get("rule_id") in {"BOLA-CROSS-TENANT-ACCESS", "BOLA-UNAUTHENTICATED-ACCESS", "BOLA-PROBE-REDIRECT-REFUSED", "bfla-role-allowed", "bfla-allow-denied"},
                         )
                     )
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             pass
 
     # 6. Engine 6: Hybrid Semantic Diff Reviewer (pr_review.json)
     pr_file = raw_dir / "pr_review.json"
     if pr_file.exists() and pr_file.stat().st_size > 0:
         try:
-            pr_data = json.loads(pr_file.read_text(encoding="utf-8"))
+            pr_data = read_engine_output(pr_file)
             if isinstance(pr_data, list):
                 for item in pr_data:
                     findings.append(
@@ -266,10 +299,10 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                             message=f"{item.get('title')}: {item.get('message')}",
                             file_path=item.get("file", "unknown"),
                             line=int(item.get("line", 1)),
-                            details=item.get("suggestion", "")[:200],
+                            details=(item.get("suggestion") or "")[:200],
                         )
                     )
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             pass
 
     # 7. Optional Accelerator: Gitleaks (gitleaks.json)
@@ -277,9 +310,10 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
     for gl_file in (raw_dir / "gitleaks.json", raw_dir / "gitleaks_worktree.json"):
         if gl_file.exists() and gl_file.stat().st_size > 0:
             try:
-                data = json.loads(gl_file.read_text(encoding="utf-8"))
+                data = read_engine_output(gl_file)
                 if isinstance(data, list):
                     for item in data:
+                        item = redact_data(item, (str(item.get("Secret") or ""), str(item.get("Match") or "")))
                         findings.append(
                             Finding(
                                 tool="gitleaks",
@@ -288,19 +322,19 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                                 message=f"Secret detected: {item.get('Description', 'Hardcoded secret')}",
                                 file_path=item.get("File", "unknown"),
                                 line=item.get("StartLine", 1),
-                                details=f"Match: {item.get('Match', '')[:80]}",
+                                details="Secret value omitted.",
                                 # Found in a commit of the scanned range: the change added it.
                                 anchored=bool(item.get("Commit")),
                             )
                         )
-            except (json.JSONDecodeError, OSError):
+            except (ValueError, OSError):
                 pass
 
     # 8. Optional Accelerator: ast-grep (ast_grep.json)
     ast_file = raw_dir / "ast_grep.json"
     if ast_file.exists() and ast_file.stat().st_size > 0:
         try:
-            data = json.loads(ast_file.read_text(encoding="utf-8"))
+            data = read_engine_output(ast_file)
             for item in data:
                 # ast-grep lines are 0-based.
                 rng = item.get("range", {})
@@ -317,25 +351,25 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                         spans=[(start, max(start, end))],
                     )
                 )
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             pass
 
     # 9. Optional Accelerator: Zizmor (zizmor.json)
     zizmor_file = raw_dir / "zizmor.json"
     if zizmor_file.exists() and zizmor_file.stat().st_size > 0:
         try:
-            data = json.loads(zizmor_file.read_text(encoding="utf-8"))
+            data = read_engine_output(zizmor_file)
             if isinstance(data, list):
                 for item in data:
                     findings.append(zizmor_finding(item))
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             pass
 
     # 10. Custom gate & hook failures (*.fail)
     for fail_file in raw_dir.glob("*.fail"):
         gate_name = fail_file.stem
         log_file = raw_dir / f"{gate_name}.log"
-        details = log_file.read_text(errors="ignore") if log_file.exists() else "Gate exited non-zero"
+        details = safe_read_text(log_file, errors="ignore") if log_file.exists() else "Gate exited non-zero"
         tail_lines = [line for line in details.splitlines() if line.strip()][-5:]
         summary_details = " | ".join(tail_lines) if tail_lines else "Verification failed"
         findings.append(
@@ -364,6 +398,8 @@ def parse_raw_results(raw_dir: Path) -> List[Finding]:
                 )
             )
 
+    for f in findings:
+        f.file_path = workspace_relative_path(f.raw_file_path, workspace_dir)
     return deduplicate_findings(findings)
 
 
@@ -428,7 +464,7 @@ def scope_to_change(findings: List[Finding], ranges: Optional[diff_scope.Ranges]
         return findings
     kept = [
         f for f in findings
-        if f.anchored or diff_scope.in_scope(ranges, f.tool, f.rule_id, f.file_path, f.spans, workspace_dir)
+        if f.anchored or diff_scope.in_scope(ranges, f.tool, f.rule_id, f.raw_file_path, f.spans, workspace_dir)
     ]
     if len(kept) < len(findings):
         print(f"prufgate: {len(findings) - len(kept)} finding(s) on lines this change did not touch were not reported "
@@ -474,7 +510,8 @@ def deduplicate_findings(findings: List[Finding]) -> List[Finding]:
     """Deduplicate identical findings reported across overlapping scanners while preserving highest severity."""
     dedup_map: Dict[tuple, Finding] = {}
     for f in findings:
-        norm_file = re.sub(r"^(?:/workspace/|\./|/)+", "", f.file_path or "workspace")
+        # The real path, not the redacted display value: redaction can give two files one name.
+        norm_file = re.sub(r"^(?:/workspace/|\./|/)+", "", f.raw_file_path or "workspace")
         norm_rule = f.rule_id.strip().lower()
         if norm_rule.upper().startswith(("CVE-", "GHSA-")):
             key: tuple = ("vuln_id", norm_rule.upper())
@@ -489,8 +526,8 @@ def deduplicate_findings(findings: List[Finding]) -> List[Finding]:
             dedup_map[key] = f
         else:
             existing = dedup_map[key]
-            if existing.file_path in ("workspace", "unknown") and f.file_path not in ("workspace", "unknown"):
-                existing.file_path = f.file_path
+            if existing.raw_file_path in ("workspace", "unknown") and f.raw_file_path not in ("workspace", "unknown"):
+                existing.file_path = f.raw_file_path
             if SEVERITY_RANK.get(f.severity, 9) < SEVERITY_RANK.get(existing.severity, 9):
                 existing.severity = f.severity
             existing.anchored = existing.anchored or f.anchored or (f.tool in diff_scope.DIFF_ANCHORED_TOOLS)
@@ -533,7 +570,7 @@ def filter_baseline_findings(findings: List[Finding], workspace_dir: Path, ref: 
     entries = _entries(read_baseline(workspace_dir, ref))
     if not entries:
         return findings
-    listed = Matcher(entries, workspace_dir).match_all([(f.file_path, f.rule_id, f.line) for f in findings])
+    listed = Matcher(entries, workspace_dir).match_all([(f.raw_file_path, f.rule_id, f.line) for f in findings])
     return [f for f, hit in zip(findings, listed) if not hit]
 
 
@@ -565,10 +602,17 @@ def engine_errors(raw_dir: Path, manifest: Dict[str, Dict[str, Any]]) -> Dict[st
         if status == "error":
             errors[tool] = str(info.get("detail") or "failed")
             continue
+        if status not in ("executed", "skipped"):
+            errors[tool] = "invalid execution status"
+            continue
         if status != "executed":
             continue
-        code = int(info.get("exit_code", 0) or 0)
-        if tool in CORE_ENGINES and code >= 2:
+        code = info.get("exit_code", 0)
+        if type(code) is not int:
+            errors[tool] = "invalid execution exit code"
+            continue
+        accepted = {"zizmor": {0, 10, 11, 12, 13, 14}}.get(tool, {0, 1})
+        if code not in accepted:
             errors[tool] = f"exited {code}"
             continue
         out = ENGINE_OUTPUTS.get(tool)
@@ -576,7 +620,9 @@ def engine_errors(raw_dir: Path, manifest: Dict[str, Dict[str, Any]]) -> Dict[st
             continue
         path = raw_dir / out
         try:
-            json.loads(path.read_text(encoding="utf-8"))
+            items = read_engine_output(path)
+            if code != 0 and not items:
+                errors[tool] = "finding exit code without any findings"
         except FileNotFoundError:
             errors[tool] = f"exited {code} and wrote no {out}"
         except (OSError, ValueError):
@@ -589,7 +635,7 @@ def engine_errors(raw_dir: Path, manifest: Dict[str, Dict[str, Any]]) -> Dict[st
         path = raw_dir / out
         if tool not in errors and path.exists():
             try:
-                json.loads(path.read_text(encoding="utf-8"))
+                read_engine_output(path)
             except (OSError, ValueError):
                 errors[tool] = f"{out} is not valid JSON"
     return errors
@@ -602,15 +648,19 @@ def load_execution_manifest(raw_dir: Path) -> Dict[str, Dict[str, Any]]:
     if not manifest_file.is_file():
         return manifest
     try:
-        for line in manifest_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+        for line in safe_read_text(manifest_file, encoding="utf-8", errors="ignore").splitlines():
             if not line.strip():
                 continue
-            obj = json.loads(line)
+            obj = read_json(line)
             tool = obj.get("tool")
             if tool:
                 detail = obj.get("detail") if obj.get("detail") is not None else obj.get("note", "")
-                exit_code = int(obj.get("exit_code", 0) or 0)
+                exit_code = obj.get("exit_code", 0)
+                if type(exit_code) is not int:
+                    raise ValueError("invalid exit code")
                 duration_s = float(obj.get("duration_seconds", 0.0) or 0.0)
+                if not math.isfinite(duration_s) or duration_s < 0:
+                    raise ValueError("invalid duration")
                 status = obj.get("status", "executed")
                 manifest[tool] = {
                     "status": status,
@@ -619,8 +669,29 @@ def load_execution_manifest(raw_dir: Path) -> Dict[str, Dict[str, Any]]:
                     "duration_seconds": duration_s,
                 }
     except Exception:
-        pass
+        manifest["execution-manifest"] = {"status": "error", "detail": "execution manifest is malformed", "exit_code": 2}
     return manifest
+
+
+def workspace_relative_path(file_path: str, workspace_dir: Optional[Path]) -> str:
+    """`file_path` relative to `workspace_dir` when it lies inside it, else unchanged."""
+    if not workspace_dir:
+        return file_path
+    raw = file_path.replace("\\", "/")
+    # The workspace and an absolute finding path may name the same folder through a symlink
+    # (macOS: /var -> /private/var), so both spellings of each are compared.
+    prefixes = {str(p).replace("\\", "/").rstrip("/") + "/" for p in (workspace_dir, workspace_dir.resolve())}
+    spellings = [raw]
+    if os.path.isabs(raw):
+        try:
+            spellings.append(str(Path(raw).resolve()).replace("\\", "/"))
+        except (OSError, RuntimeError):
+            pass
+    for spelled in spellings:
+        prefix = next((p for p in prefixes if spelled.startswith(p)), None)
+        if prefix:
+            return spelled[len(prefix) :]
+    return file_path
 
 
 def _normalize_sarif_uri(file_path: str, workspace_dir: Optional[Path] = None) -> str:
@@ -630,22 +701,7 @@ def _normalize_sarif_uri(file_path: str, workspace_dir: Optional[Path] = None) -
         return "PRUFGATE_AUDIT_TARGET"
     if raw.startswith(("http://", "https://")):
         return "PRUFGATE_DYNAMIC_TARGET"
-    raw = raw.replace("\\", "/")
-    if workspace_dir:
-        # The workspace and an absolute finding path may name the same folder through a symlink
-        # (macOS: /var -> /private/var), so both spellings of each are compared.
-        prefixes = {str(p).replace("\\", "/").rstrip("/") + "/" for p in (workspace_dir, workspace_dir.resolve())}
-        spellings = [raw]
-        if os.path.isabs(raw):
-            try:
-                spellings.append(str(Path(raw).resolve()).replace("\\", "/"))
-            except (OSError, RuntimeError):
-                pass
-        for spelled in spellings:
-            prefix = next((p for p in prefixes if spelled.startswith(p)), None)
-            if prefix:
-                raw = spelled[len(prefix) :]
-                break
+    raw = workspace_relative_path(raw.replace("\\", "/"), workspace_dir)
     raw = re.sub(r"^(?:/workspace/|\./|/)+", "", raw)
     return raw or "PRUFGATE_AUDIT_TARGET"
 
@@ -698,7 +754,8 @@ def generate_sarif(
         if f.severity == "P3":
             level = "note"
 
-        norm_uri = _normalize_sarif_uri(f.file_path, workspace_dir)
+        location = f.workspace_file_path(workspace_dir)
+        norm_uri = _normalize_sarif_uri(location, workspace_dir)
 
         result: Dict[str, Any] = {
             "ruleId": f.rule_id,
@@ -718,7 +775,7 @@ def generate_sarif(
                 "tool": f.tool,
                 "severity": f.severity,
                 "confidence": f.confidence,
-                "rawTarget": f.file_path,
+                "rawTarget": location,
                 "details": f.details,
             },
         }
@@ -745,6 +802,7 @@ def generate_sarif(
         ],
     }
 
+    sarif = redact_data(sarif)
     safe_write_text(output_path, json.dumps(sarif, indent=2))
     return sarif
 
@@ -757,6 +815,8 @@ def generate_markdown(
     errors: Optional[Dict[str, str]] = None,
     suppressed: Optional[List[tuple[Finding, str]]] = None,
     ai_dismissed: Optional[List[tuple[Finding, str]]] = None,
+    scan_status: Optional[str] = None,
+    blocking_count: Optional[int] = None,
 ) -> None:
     workspace, commit = get_git_info()
     suppressed = suppressed or []
@@ -767,15 +827,18 @@ def generate_markdown(
     p2 = [f for f in findings if f.severity == "P2"]
     p3 = [f for f in findings if f.severity == "P3"]
 
-    if errors:
+    if scan_status == "incomplete":
+        verdict_badge = "⚠️ **INCOMPLETE**"
+        verdict_text = "INCOMPLETE — Requested verification could not be established. Confirmed findings remain listed."
+    elif errors:
         verdict_badge = "⚠️ **ERROR (an engine did not finish)**"
         verdict_text = "ERROR — " + "; ".join(f"{t}: {r}" for t, r in sorted(errors.items())) + ". The scan is incomplete, so it cannot pass."
-    elif p0 or p1:
+    elif (blocking_count if blocking_count is not None else len(p0) + len(p1)):
         verdict_badge = "🔴 **FAIL (Blockers Detected)**"
         verdict_text = "FAILED — Resolve all P0 and P1 issues before merging."
     else:
-        verdict_badge = "🟢 **PASS (Clean)**"
-        verdict_text = "PASSED — All gates and invariant checks verified cleanly."
+        verdict_badge = "🟢 **PASS (No blockers)**"
+        verdict_text = "PASSED — No blocking findings in completed checks. See coverage for skipped checks and advisories."
 
     manifest = manifest or {}
     all_tools = sorted(set(f.tool for f in findings) | set(manifest.keys()) | set(errors))
@@ -798,9 +861,9 @@ def generate_markdown(
             detail_with_dur = f"{m_detail}{dur_str}" if m_detail else (f"{int(m_dur)}s" if m_dur > 0 else "")
             if t in errors:
                 status = f"⚠️ ERROR ({errors[t]})"
-            elif tp0 > 0 or tp1 > 0:
+            elif any(f.blocking for f in tf):
                 status = "🔴 FAIL"
-            elif tp2 > 0:
+            elif tf:
                 status = "🟡 WARN"
             elif m_status.startswith("skipped") and len(tf) == 0:
                 status = f"⚪ SKIPPED ({detail_with_dur or 'not applicable'})"
@@ -816,7 +879,7 @@ def generate_markdown(
 
     critical_findings = p0 + p1
     if not critical_findings:
-        crit_sec = "✨ **Zero Critical (P0) or High (P1) issues found.** Codebase conforms to all PrufGate invariants."
+        crit_sec = "No P0/P1 findings were reported within the selected scope. Coverage and failed or skipped checks constrain this result."
     else:
         rows = []
         for f in critical_findings:
@@ -931,7 +994,7 @@ Findings an AI provider judged not real (`ai_adjudicate`). They do not block; hi
 
     template = default_template
     if template_path and template_path.is_file():
-        template = template_path.read_text(encoding="utf-8")
+        template = safe_read_text(template_path, encoding="utf-8")
 
     content = template.format(
         VERDICT_BADGE=verdict_badge,
@@ -954,13 +1017,14 @@ Findings an AI provider judged not real (`ai_adjudicate`). They do not block; hi
         VERDICT_TEXT=verdict_text,
     )
 
-    safe_write_text(output_path, content)
+    safe_write_text(output_path, redact(content))
 
 
 def print_ansi_table(
     findings: List[Finding],
     manifest: Optional[Dict[str, Dict[str, Any]]] = None,
     errors: Optional[Dict[str, str]] = None,
+    blocking_count: Optional[int] = None,
 ) -> None:
     errors = errors or {}
     p0 = sum(1 for f in findings if f.severity == "P0")
@@ -988,7 +1052,7 @@ def print_ansi_table(
             tp1 = sum(1 for f in tf if f.severity == "P1")
             tp2 = sum(1 for f in tf if f.severity == "P2")
             tp3 = sum(1 for f in tf if f.severity == "P3")
-            status = f"{RED}✘ ERROR{RESET}   " if t in errors else f"{RED}✘ FAILED{RESET}" if (tp0 > 0 or tp1 > 0) else (f"{YELLOW}⚠ WARN{RESET}  " if tp2 > 0 else f"{GREEN}✔ PASS{RESET}  ")
+            status = f"{RED}✘ ERROR{RESET}   " if t in errors else f"{RED}✘ FAILED{RESET}" if any(f.blocking for f in tf) else (f"{YELLOW}⚠ WARN{RESET}  " if tf else f"{GREEN}✔ PASS{RESET}  ")
             print(f"║ {t[:28]:<28} ║ {tp0:>4} ║ {tp1:>4} ║ {tp2:>4} ║ {tp3:>4} ║ {status:<17} ║")
 
     print(f"{BOLD}╠══════════════════════════════╩══════╩══════╩══════╩══════╩═══════════════════╣{RESET}")
@@ -997,7 +1061,7 @@ def print_ansi_table(
         print(f"║ {RED}{BOLD}VERDICT: ERROR (an engine did not finish; the scan is incomplete){RESET}          ║")
         for t, reason in sorted(errors.items()):
             print(f"║   {t}: {reason}")
-    elif p0 > 0 or p1 > 0:
+    elif (blocking_count if blocking_count is not None else p0 + p1) > 0:
         print(f"║ {RED}{BOLD}VERDICT: FAILED (P0/P1 Blockers Detected){RESET}                                  ║")
     else:
         print(f"║ {GREEN}{BOLD}VERDICT: PASSED (Zero Critical Blockers){RESET}                                    ║")
@@ -1005,7 +1069,7 @@ def print_ansi_table(
     print()
 
 
-def main() -> None:
+def _main() -> None:
     utf8_output()
     workspace_env = os.environ.get("WORKSPACE")
     if workspace_env:
@@ -1022,10 +1086,15 @@ def main() -> None:
         print(f"prufgate: {reports_dir} or its raw/ folder is a symlink; refusing to write reports through it.", file=sys.stderr)
         sys.exit(2)
     reports_dir.mkdir(parents=True, exist_ok=True)
+    pending = make_result([], errors=["Scan has not completed."], profile="battery")
+    from prufgate.workflow import revision
+    pending["revision"] = revision(workspace_dir)
+    safe_write_text(reports_dir / "prufgate-result.json", json.dumps(pending, indent=2))
+    safe_write_text(reports_dir / "prufgate-result.status", "error\n")
 
     # A config that does not load is an error (the run cannot pass), reported like a crashed engine.
     ref_file = raw_dir / BASE_REF_FILE
-    base_ref = (ref_file.read_text(encoding="utf-8").strip() if ref_file.is_file() else "") or None
+    base_ref = (safe_read_text(ref_file, encoding="utf-8").strip() if ref_file.is_file() else "") or None
     if ref_file.is_file() and base_ref is None:
         # A changed scan of the working-tree diff: it compares with HEAD, so an
         # uncommitted baseline or config edit must not apply to it either.
@@ -1037,7 +1106,7 @@ def main() -> None:
         config_error, cfg = str(exc), PrufGateConfig()
     enable_low = cfg.enable_low_confidence
 
-    findings = parse_raw_results(raw_dir)
+    findings = parse_raw_results(raw_dir, workspace_dir)
     try:
         ranges = diff_scope.load(raw_dir / CHANGED_LINES_FILE)
     except (OSError, ValueError, TypeError) as e:
@@ -1073,7 +1142,9 @@ def main() -> None:
                 )
             )
         findings = filter_confidence(findings, enable_low)
+        before_baseline = len(findings)
         findings = filter_baseline_findings(findings, workspace_dir, base_ref)
+        baselined_count = before_baseline - len(findings)
     except GitDiffError as e:
         print(f"prufgate: cannot read the baseline at base ref {base_ref!r}: {e}", file=sys.stderr)
         sys.exit(2)
@@ -1084,13 +1155,14 @@ def main() -> None:
 
     suppressed = load_suppressions(raw_dir)
     if ranges is not None:
-        suppressed = [(f, r) for f, r in suppressed if diff_scope.in_scope(ranges, f.tool, f.rule_id, f.file_path, f.spans, workspace_dir)]
+        suppressed = [(f, r) for f, r in suppressed if diff_scope.in_scope(ranges, f.tool, f.rule_id, f.raw_file_path, f.spans, workspace_dir)]
 
     # Only the configuration in effect (at the base ref) turns it on: it can dismiss
     # findings, so no environment variable or flag a change could set may.
     ai_dismissed: List[tuple[Finding, str]] = []
     # The MCP server, the REST API and the agent hooks set PRUFGATE_NO_AI_ADJUDICATE.
-    if not config_error and cfg.ai_adjudicate.enabled and not os.environ.get("PRUFGATE_NO_AI_ADJUDICATE"):
+    ai_enabled = bool(not config_error and cfg.ai_adjudicate.enabled and os.environ.get("PRUFGATE_ALLOW_EXTERNAL_AI") == "1" and not os.environ.get("PRUFGATE_NO_AI_ADJUDICATE"))
+    if ai_enabled:
         verdicts, note = adjudicate(
             [(f.rule_id, f.file_path, f.line, f.message, f.origin) for f in findings],
             workspace_dir,
@@ -1101,21 +1173,88 @@ def main() -> None:
         ai_dismissed = [(findings[i], reason) for i, reason in verdicts.items()]
         findings = [f for i, f in enumerate(findings) if i not in verdicts]
 
+    measured = []
+    for path in raw_dir.glob("*.coverage.json"):
+        try:
+            measured.append(read_json(safe_read_text(path)))
+        except (OSError, ValueError):
+            errors[path.stem] = "Coverage output is unreadable."
+    engine_coverage = [{"engine": tool, "status": "error" if tool in errors else "completed" if info.get("status") == "executed" else "skipped",
+                        "reason": errors.get(tool) or info.get("detail", "") or ("Optional tool was not requested or unavailable." if info.get("status") == "skipped" else ""),
+                        "input_counts": "unknown" if tool in ("gitleaks", "gitleaks-worktree", "ast-grep", "zizmor") else "measured"}
+                       for tool, info in manifest.items()]
+    coverage = merge_coverage(measured, engine_coverage)
+    coverage.update(scope="changed" if ranges is not None else "workspace", base_ref=base_ref)
+    coverage["exclusions"] += [{"pattern": pattern, "reason": "Configured exclusion"} for pattern in cfg.exclude]
+    coverage["measurement"] += " External scanners do not report file/line totals; their additional input coverage is unknown."
+    incomplete = []
+    fatal = dict(errors)
+    bola_output = raw_dir / "bola_matrix.json"
+    if "bola-matrix" in fatal and bola_output.is_file():
+        try:
+            partial = read_json(safe_read_text(bola_output))
+            if isinstance(partial, dict) and partial.get("status") == "incomplete":
+                incomplete.append(str(partial.get("error", "Live verification incomplete.")))
+                coverage["live_probe"] = partial.get("coverage")
+                fatal.pop("bola-matrix")
+                for entry in engine_coverage:
+                    if entry["engine"] == "bola-matrix":
+                        entry["status"] = "incomplete"
+        except (OSError, ValueError):
+            pass
+    result = make_result([f.to_dict() for f in findings], root=workspace_dir, profile="battery", coverage=coverage,
+                         errors=[f"{tool}: {reason}" for tool, reason in fatal.items()], incomplete=incomplete,
+                         privacy=ai_privacy(ai_enabled, os.environ.get("PRUFGATE_AI_PROVIDER")))
+    if ai_enabled:
+        result["privacy"]["external_ai"]["outcome"] = redact(note)
+    findings = [Finding(tool=item.get("tool", item["engine"]), rule_id=item["rule"], severity=item["severity"],
+                        message=item["message"], file_path=item["file"], line=item["line"], details=item.get("details", ""), blocking=item["blocking"])
+                for item in result["findings"]]
+    result["governance"]["inline_suppressions"] = [{"file": f.file_path, "rule": f.rule_id, "reason": reason} for f, reason in suppressed]
+    result["governance"]["baselined_findings"] = baselined_count
+    result["governance"]["inline_audit"] = inline_ignore.load(raw_dir / SUPPRESSIONS_FILE)
+    safe_write_text(reports_dir / "prufgate-result.json", json.dumps(result, indent=2))
+    safe_write_text(reports_dir / "prufgate-result.status", result["scan_status"] + "\n")
     sarif = generate_sarif(
         findings, reports_dir / "prufgate.sarif", workspace_dir=workspace_dir, suppressed=suppressed, ai_dismissed=ai_dismissed
     )
+    attach_sarif(sarif, result)
+    safe_write_text(reports_dir / "prufgate.sarif", json.dumps(sarif, indent=2))
     safe_write_text(reports_dir / "gl-code-quality-report.json", gitlab_code_quality(sarif, errors))
     safe_write_text(reports_dir / "prufgate-junit.xml", junit_xml(sarif, errors))
     generate_markdown(
         findings, None, reports_dir / "prufgate-review.md", manifest=manifest, errors=errors, suppressed=suppressed,
         ai_dismissed=ai_dismissed,
+        scan_status=result["scan_status"],
+        blocking_count=result["summary"]["blockers"],
     )
-    print_ansi_table(findings, manifest=manifest, errors=errors)
+    markdown_path = reports_dir / "prufgate-review.md"
+    safe_write_text(markdown_path, safe_read_text(markdown_path) + "\n" + markdown_summary(result))
+    print_ansi_table(findings, manifest=manifest, errors=errors, blocking_count=result["summary"]["blockers"])
+    print(f"Scan status: {result['scan_status']}")
 
-    if errors:
+    sys.exit(result["exit_code"])
+
+
+def main() -> None:
+    try:
+        _main()
+    except (Exception, SystemExit) as exc:
+        code = exc.code if isinstance(exc, SystemExit) else 2
+        if code not in (0, 1, None):
+            directory = Path(os.environ.get("PRUFGATE_REPORTS_DIR", str(Path(os.environ.get("WORKSPACE", os.getcwd())) / "reports")))
+            path = directory / "prufgate-result.json"
+            if not path.exists():
+                try:
+                    result = make_result([], errors=[f"Gate could not complete ({exc.__class__.__name__})."], profile="battery")
+                    safe_write_text(path, json.dumps(result, indent=2))
+                    safe_write_text(path.with_suffix(".status"), "error\n")
+                except OSError:
+                    pass
+        if isinstance(exc, SystemExit):
+            raise
+        print(f"prufgate: gate error: {exc.__class__.__name__}", file=sys.stderr)
         sys.exit(2)
-    has_blockers = any(f.severity in ("P0", "P1") for f in findings)
-    sys.exit(1 if has_blockers else 0)
 
 
 if __name__ == "__main__":

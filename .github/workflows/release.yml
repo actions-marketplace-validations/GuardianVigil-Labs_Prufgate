@@ -1,11 +1,13 @@
 name: Release
 
 # Runs only when a maintainer pushes a v* tag to the public repository (the tag
-# ruleset lets only admins create one). No token or key is stored anywhere:
+# ruleset lets only admins create one). The only stored token is the Marketplace one below;
 # PyPI accepts the packages through Trusted Publishing (OIDC), the image is
 # signed keyless with Sigstore, and provenance and SBOM attestations are signed
 # the same way. Order: checks -> build -> PyPI (owner approval, environment
-# `pypi`) -> image -> GitHub release. How to verify: SECURITY.md.
+# `pypi`) -> image -> GitHub release, and checks -> vscode -> Marketplace
+# (owner approval, environment `vscode-marketplace`, secret VSCE_PAT).
+# How to verify: SECURITY.md.
 on:
   push:
     tags: ['v*']
@@ -184,9 +186,93 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
+  vscode:
+    name: Build the VS Code extension
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No dependency cache in a release job. v4 caches only when asked; package-manager-cache
+      # keeps it off (and tells zizmor so) if the pin moves to v5, which caches by default.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: The extension version matches the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: test "v$(node -p "require('./package.json').version")" = "${TAG}"
+      - name: Build, typecheck and test
+        run: |
+          npm run build
+          npm run typecheck
+          npm test
+      - name: Package the .vsix
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir "${GITHUB_WORKSPACE}/vsix"
+          npx --no-install vsce package --no-dependencies --out "${GITHUB_WORKSPACE}/vsix/prufgate-${TAG#v}.vsix"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vsix
+          path: vsix/
+          if-no-files-found: error
+
+  marketplace:
+    name: Publish to the VS Code Marketplace
+    # Publish only after the GitHub release has attested and attached this exact .vsix.
+    needs: [vscode, release]
+    # The Marketplace takes no pre-release versions (1.1.0-rc.1): those ship on the GitHub release only.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    # The owner approves this job; VSCE_PAT is stored only in this environment.
+    environment:
+      name: vscode-marketplace
+      url: https://marketplace.visualstudio.com/items?itemName=GuardianVigil.prufgate
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: editors/vscode
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install the locked vsce
+        working-directory: editors/vscode
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vsix
+          path: vsix/
+      - name: Publish the packaged .vsix
+        working-directory: editors/vscode
+        env:
+          TAG: ${{ github.ref_name }}
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -z "${VSCE_PAT}" ]; then
+            echo "::error::VSCE_PAT is not set in the vscode-marketplace environment; nothing was published."
+            exit 1
+          fi
+          # vsce reads the token from VSCE_PAT; it is never on the command line.
+          npx --no-install vsce publish --packagePath "${GITHUB_WORKSPACE}/vsix/prufgate-${TAG#v}.vsix"
+
   release:
     name: GitHub release
-    needs: [build, image]
+    needs: [build, image, vscode]
     runs-on: ubuntu-latest
     permissions:
       contents: write           # create the release
@@ -208,9 +294,13 @@ jobs:
           path: dist/
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          name: vsix
+          path: dist/
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
           name: sbom
           path: sbom/
-      - name: Provenance of the wheel, sdist and zipapp
+      - name: Provenance of the wheel, sdist, zipapp and VS Code extension
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/*
@@ -236,10 +326,11 @@ jobs:
           - One file, Python 3.9+ only: \`python3 prufgate.pyz --version\` (verify it first, below)
           - \`docker run --rm -v "\$PWD:/workspace" ghcr.io/guardianvigil-labs/prufgate:${version}\`
           - GitHub Action: \`uses: GuardianVigil-Labs/Prufgate@${TAG}\` (pin the commit SHA of this tag)
+          - VS Code: \`code --install-extension GuardianVigil.prufgate\`, or \`code --install-extension prufgate-${version}.vsix\` from this release
 
           ## Verify
 
-          \`SHA256SUMS\` lists the wheel and sdist, which are the files on PyPI, and \`prufgate.pyz\`. The image is signed keyless with Sigstore. The wheel, the sdist, the zipapp and the image carry build provenance; the wheel (\`prufgate-wheel.cdx.json\`) and the image carry an SBOM:
+          \`SHA256SUMS\` lists the wheel and sdist, which are the files on PyPI, \`prufgate.pyz\`, and \`prufgate-${version}.vsix\`, the file on the VS Code Marketplace. The image is signed keyless with Sigstore. The wheel, the sdist, the zipapp, the .vsix and the image carry build provenance; the wheel (\`prufgate-wheel.cdx.json\`) and the image carry an SBOM:
 
           \`\`\`sh
           sha256sum -c SHA256SUMS
@@ -247,6 +338,7 @@ jobs:
           gh attestation verify prufgate-${version}-py3-none-any.whl --repo ${GITHUB_REPOSITORY} \\
             --bundle prufgate-${version}-py3-none-any.whl.intoto.jsonl   # offline
           gh attestation verify prufgate.pyz --repo ${GITHUB_REPOSITORY}
+          gh attestation verify prufgate-${version}.vsix --repo ${GITHUB_REPOSITORY}
           cosign verify ghcr.io/guardianvigil-labs/prufgate:${version} \\
             --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \\
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
@@ -261,7 +353,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for f in dist/*.whl dist/*.tar.gz dist/*.pyz; do
+          for f in dist/*.whl dist/*.tar.gz dist/*.pyz dist/*.vsix; do
             gh attestation download "${f}" --repo "${GITHUB_REPOSITORY}" >/dev/null
             mv "sha256:$(sha256sum "${f}" | cut -d' ' -f1).jsonl" "${f}.intoto.jsonl"
             gh attestation verify "${f}" --bundle "${f}.intoto.jsonl" --repo "${GITHUB_REPOSITORY}"

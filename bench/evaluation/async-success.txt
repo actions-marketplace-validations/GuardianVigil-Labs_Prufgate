@@ -1,0 +1,18 @@
+-- label.yaml --
+category: fabrication
+description: Syntax and control flow example async-success
+must_fire: [canned-error-fallback]
+must_not_fire: []
+evaluation:
+  origin: synthetic
+  language: python
+  framework: asyncio
+  author: maintainer-role
+  reviewers: []
+  split: regression
+-- head/app.py --
+async def run():
+    try:
+        return await calculate()
+    except ValueError:
+        return {"ok": True}

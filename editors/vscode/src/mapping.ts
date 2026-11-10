@@ -29,7 +29,7 @@ export function mapFindings(stdout: string, folder: string): Mapped[] {
   const out: Mapped[] = [];
   for (const f of data) {
     if (!f || typeof f !== "object") continue;
-    const { rule, severity, file, line, message, confidence } = f as Record<string, unknown>;
+    const { rule, severity, file, line, message, confidence, blocking } = f as Record<string, unknown>;
     if (typeof rule !== "string" || typeof severity !== "string" || typeof file !== "string" || !file) continue;
     const abs = path.resolve(root, file);
     const rel = path.relative(root, abs);
@@ -37,11 +37,17 @@ export function mapFindings(stdout: string, folder: string): Mapped[] {
     const n = typeof line === "number" && Number.isFinite(line) ? Math.max(0, Math.floor(line) - 1) : 0;
     const conf = typeof confidence === "string" && confidence ? confidence : "unknown";
     const text = typeof message === "string" && message ? message : rule;
+    const extra = f as Record<string, unknown>;
+    const explanation = extra.explanation && typeof extra.explanation === "object" ? extra.explanation as Record<string, unknown> : undefined;
+    const evidence = extra.evidence && typeof extra.evidence === "object" ? extra.evidence as Record<string, unknown> : undefined;
+    const caveats = Array.isArray(explanation?.could_be_incorrect_when) ? explanation.could_be_incorrect_when.filter(v => typeof v === "string").join(" ") : "";
+    const details = explanation
+      ? `\nReasoning: ${explanation.reasoning ?? ""}\nSuggested fix: ${explanation.suggested_fix ?? ""}\nCould be incorrect when: ${caveats}` : "";
     out.push({
       file: abs,
       line: n,
-      level: levelFor(severity),
-      message: `[${severity}] ${text} (${rule}, confidence ${conf})`,
+      level: blocking === false && (severity === "P0" || severity === "P1") ? "warning" : levelFor(severity),
+      message: `[${severity}] ${text} (${rule}, confidence ${conf})${details}${typeof evidence?.code === "string" ? "\nCode:\n" + evidence.code : ""}`,
       rule,
     });
   }

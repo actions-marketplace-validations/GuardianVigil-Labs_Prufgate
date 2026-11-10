@@ -763,6 +763,8 @@ def _check_simple(words: list[str], depth: int) -> str | None:
     if not words:
         return None
     tool, args = PurePosixPath(words[0]).name, words[1:]
+    if tool in ("prufgate", "prufgate.pyz") and args[:1] == ["dismiss"] and len(args) > 1 and args[1] != "list":
+        return f"Dismissal ledger changes require explicit operator review. {RUN_IT_YOURSELF}"
     if tool == _REDIRECT:
         for target in _in_cwd(args[0]):
             why = protected_config(target)

@@ -25,6 +25,7 @@ from prufgate import inline_ignore  # noqa: E402
 from prufgate.config import PrufGateConfig  # noqa: E402
 from prufgate.contract_guard.dependency_guard import Finding  # noqa: E402
 from prufgate.contract_guard.env_sources import load_env_sources  # noqa: E402
+from prufgate.safe_fs import safe_read_text  # noqa: E402
 
 ENV_EXAMPLE_FILES = (
     ".env.example",
@@ -91,7 +92,7 @@ def load_documented_env_vars(workspace: Path, config: PrufGateConfig | None = No
     key_re = re.compile(r"^\s*(?:#\s*)?(?:export\s+)?([A-Z][A-Z0-9_]{1,})\s*=")
     for ef in found_files:
         try:
-            for line in ef.read_text(encoding="utf-8", errors="ignore").splitlines():
+            for line in safe_read_text(ef, encoding="utf-8", errors="ignore").splitlines():
                 m = key_re.match(line)
                 if m:
                     documented.add(m.group(1).strip())

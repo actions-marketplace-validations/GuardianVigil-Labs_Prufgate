@@ -1,0 +1,403 @@
+{
+  "schema_version": "1.0",
+  "tool_version": "1.3.0",
+  "implementation_sha256": "1fe1cf8c0644aa9501f4b3285d7289d3990a3079a871768a747f188fe98905d7",
+  "profile": "mixed",
+  "summary": {
+    "cases": 58,
+    "categories": {
+      "clean": 27,
+      "fabrication": 31
+    },
+    "overall": {
+      "tp": 13,
+      "fp": 3,
+      "fn": 18,
+      "precision": 0.812,
+      "recall": 0.419
+    },
+    "rules": {
+      "pr-disabled-tls-certificate-verification": {
+        "tp": 9,
+        "fp": 0,
+        "fn": 9,
+        "precision": 1.0,
+        "recall": 0.5,
+        "negative_cases": 18,
+        "tn": 18,
+        "false_positive_rate": 0.0
+      },
+      "unhandled-empty-catch": {
+        "tp": 4,
+        "fp": 3,
+        "fn": 9,
+        "precision": 0.571,
+        "recall": 0.308,
+        "negative_cases": 9,
+        "tn": 6,
+        "false_positive_rate": 0.333
+      }
+    },
+    "misses": [
+      {
+        "case": "bandit-pass-003",
+        "category": "fabrication",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-negative"
+      },
+      {
+        "case": "bandit-tls-010",
+        "category": "fabrication",
+        "rule": "pr-disabled-tls-certificate-verification",
+        "kind": "false-negative"
+      },
+      {
+        "case": "bandit-tls-012",
+        "category": "fabrication",
+        "rule": "pr-disabled-tls-certificate-verification",
+        "kind": "false-negative"
+      },
+      {
+        "case": "bandit-tls-014",
+        "category": "fabrication",
+        "rule": "pr-disabled-tls-certificate-verification",
+        "kind": "false-negative"
+      },
+      {
+        "case": "bandit-tls-020",
+        "category": "fabrication",
+        "rule": "pr-disabled-tls-certificate-verification",
+        "kind": "false-negative"
+      },
+      {
+        "case": "bandit-tls-022",
+        "category": "fabrication",
+        "rule": "pr-disabled-tls-certificate-verification",
+        "kind": "false-negative"
+      },
+      {
+        "case": "bandit-tls-028",
+        "category": "fabrication",
+        "rule": "pr-disabled-tls-certificate-verification",
+        "kind": "false-negative"
+      },
+      {
+        "case": "bandit-tls-032",
+        "category": "fabrication",
+        "rule": "pr-disabled-tls-certificate-verification",
+        "kind": "false-negative"
+      },
+      {
+        "case": "bandit-tls-034",
+        "category": "fabrication",
+        "rule": "pr-disabled-tls-certificate-verification",
+        "kind": "false-negative"
+      },
+      {
+        "case": "bandit-tls-036",
+        "category": "fabrication",
+        "rule": "pr-disabled-tls-certificate-verification",
+        "kind": "false-negative"
+      },
+      {
+        "case": "eslint-empty-002",
+        "category": "clean",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-positive"
+      },
+      {
+        "case": "eslint-empty-003",
+        "category": "clean",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-positive"
+      },
+      {
+        "case": "eslint-empty-004",
+        "category": "clean",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-positive"
+      },
+      {
+        "case": "pmd-empty-001",
+        "category": "fabrication",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-negative"
+      },
+      {
+        "case": "pmd-empty-003",
+        "category": "fabrication",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-negative"
+      },
+      {
+        "case": "pmd-empty-004",
+        "category": "fabrication",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-negative"
+      },
+      {
+        "case": "pmd-empty-006",
+        "category": "fabrication",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-negative"
+      },
+      {
+        "case": "pmd-empty-007",
+        "category": "fabrication",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-negative"
+      },
+      {
+        "case": "pmd-empty-008",
+        "category": "fabrication",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-negative"
+      },
+      {
+        "case": "pmd-empty-009",
+        "category": "fabrication",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-negative"
+      },
+      {
+        "case": "pmd-empty-010",
+        "category": "fabrication",
+        "rule": "unhandled-empty-catch",
+        "kind": "false-negative"
+      }
+    ],
+    "unscored_findings": [],
+    "coverage": {
+      "catalog_rules": 78,
+      "rules_with_positive_labels": 2,
+      "rules_with_negative_labels": 2,
+      "untested_rules": [
+        "BOLA-CROSS-TENANT-ACCESS",
+        "BOLA-PROBE-REDIRECT-REFUSED",
+        "BOLA-TABLE-MISSING-TENANT-COLUMN",
+        "BOLA-UNGUARDED-SERVER-ACTION",
+        "BOLA-UNSCOPED-OBJECT-ACCESS",
+        "action-authorization-guard",
+        "always-current-fake",
+        "always-true-equality",
+        "api-route-contract-mismatch",
+        "asserted-state",
+        "assertion-free-test",
+        "bfla-allow-denied",
+        "bfla-role-allowed",
+        "caught-and-ignored-test-exception",
+        "coverage-threshold-lowering",
+        "debt-ceiling-breached",
+        "demo-named-data",
+        "dependency-not-on-registry",
+        "dependency-recently-published",
+        "dependency-typosquat",
+        "diff-assertion-weakening",
+        "diff-test-count-drop",
+        "diff-test-file-deleted",
+        "differential-base-tests-fail",
+        "disconnected-form-submit",
+        "documentation-address",
+        "empty-input-digest-as-sample",
+        "env-var-drift",
+        "ghost-dependency",
+        "ghost-symbol",
+        "hardcoded-attribution",
+        "hardcoded-cve",
+        "ignore-without-reason",
+        "keyword-selected-attribution",
+        "linter-or-ci-config-weakening",
+        "linter-or-type-suppression-abuse",
+        "llm-generated-intel",
+        "mutation-no-coverage",
+        "mutation-survivor",
+        "over-mocked-sut",
+        "pr-credential-logging-in-console",
+        "pr-hardcoded-credential-in-code",
+        "pr-ignored-error-return-in-go",
+        "pr-server-action-missing-authorization-guard",
+        "pr-shell-command-injection-risk",
+        "pr-sql-injection-vector",
+        "pr-unbounded-goroutine-spawn",
+        "pr-unsanitized-html-injection-xss",
+        "prompt-invents-finding",
+        "prufgate-config-base-invalid",
+        "prufgate-config-not-applied",
+        "prufgate-config-self-exemption",
+        "pytest-collection-deselect",
+        "pytest-result-rewrite",
+        "score-on-error-path",
+        "score-outside-scoring",
+        "simulated-return-value",
+        "snapshot-blind-update-or-empty",
+        "stale-exemption",
+        "substring-decides-verdict",
+        "synthetic-delay-mock",
+        "tautological-assertion",
+        "test-config-weakening",
+        "test-fake-exit",
+        "test-input-special-casing",
+        "test-runner-monkeypatch",
+        "test-script-neutered",
+        "test-skip-or-focus-leak",
+        "transcript-history-lookup",
+        "transcript-hook-bypass",
+        "transcript-test-tamper-command",
+        "ui-verdict-literal",
+        "unimplemented-production-stub",
+        "unsafe-type-cast-cascade",
+        "verdict-on-error-path",
+        "zero-jarm-as-fingerprint"
+      ]
+    }
+  },
+  "groups": {
+    "project": {
+      "PyCQA/bandit": {
+        "cases": 41,
+        "overall": {
+          "tp": 11,
+          "fp": 0,
+          "fn": 10,
+          "precision": 1.0,
+          "recall": 0.524
+        }
+      },
+      "eslint/eslint": {
+        "cases": 6,
+        "overall": {
+          "tp": 2,
+          "fp": 3,
+          "fn": 0,
+          "precision": 0.4,
+          "recall": 1.0
+        }
+      },
+      "pmd/pmd": {
+        "cases": 11,
+        "overall": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 8,
+          "precision": null,
+          "recall": 0.0
+        }
+      }
+    },
+    "language": {
+      "java": {
+        "cases": 11,
+        "overall": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 8,
+          "precision": null,
+          "recall": 0.0
+        }
+      },
+      "javascript": {
+        "cases": 6,
+        "overall": {
+          "tp": 2,
+          "fp": 3,
+          "fn": 0,
+          "precision": 0.4,
+          "recall": 1.0
+        }
+      },
+      "python": {
+        "cases": 41,
+        "overall": {
+          "tp": 11,
+          "fp": 0,
+          "fn": 10,
+          "precision": 1.0,
+          "recall": 0.524
+        }
+      }
+    },
+    "framework": {
+      "httpx": {
+        "cases": 22,
+        "overall": {
+          "tp": 5,
+          "fp": 0,
+          "fn": 6,
+          "precision": 1.0,
+          "recall": 0.455
+        }
+      },
+      "none": {
+        "cases": 22,
+        "overall": {
+          "tp": 4,
+          "fp": 3,
+          "fn": 9,
+          "precision": 0.571,
+          "recall": 0.308
+        }
+      },
+      "requests": {
+        "cases": 14,
+        "overall": {
+          "tp": 4,
+          "fp": 0,
+          "fn": 3,
+          "precision": 1.0,
+          "recall": 0.571
+        }
+      }
+    },
+    "profile": {
+      "core": {
+        "cases": 22,
+        "overall": {
+          "tp": 4,
+          "fp": 3,
+          "fn": 9,
+          "precision": 0.571,
+          "recall": 0.308
+        }
+      },
+      "review": {
+        "cases": 36,
+        "overall": {
+          "tp": 9,
+          "fp": 0,
+          "fn": 9,
+          "precision": 1.0,
+          "recall": 0.5
+        }
+      }
+    },
+    "label_basis": {
+      "upstream-fixture": {
+        "cases": 22,
+        "overall": {
+          "tp": 4,
+          "fp": 3,
+          "fn": 9,
+          "precision": 0.571,
+          "recall": 0.308
+        }
+      },
+      "upstream-specification": {
+        "cases": 36,
+        "overall": {
+          "tp": 9,
+          "fp": 0,
+          "fn": 9,
+          "precision": 1.0,
+          "recall": 0.5
+        }
+      }
+    }
+  },
+  "evidence_manifest_sha256": "cb1ef2a5b8d90e325b43030d6f90a3ff38d4d8fd97cc9629fecb931fa392fb81",
+  "limitations": [
+    "Small non-random samples do not establish deployment accuracy.",
+    "Declared reviewers require human verification; upstream-derived labels verify local evidence, not new human review.",
+    "Once evaluated, these examples are an exposed external validation set, not a blind holdout for future tuning.",
+    "No project code, source snippets or absolute workspace paths are exported."
+  ]
+}

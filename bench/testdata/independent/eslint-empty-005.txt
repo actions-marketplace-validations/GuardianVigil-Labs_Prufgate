@@ -1,0 +1,35 @@
+# Extracted/modified for PrufGate evaluation; upstream notices and licenses are retained beside this corpus.
+-- label.yaml --
+category: fabrication
+description: ESLint no-empty invalid fixture with an empty catch under default options.
+must_fire:
+- unhandled-empty-catch
+must_not_fire: []
+evaluation:
+  language: javascript
+  framework: none
+  profile: core
+  origin: open-source
+  split: holdout
+  author: PrufGate corpus adapter
+  reviewers: []
+  label_basis: upstream-fixture
+  label_scope: explicit
+  upstream_labels:
+    manifest: manifest.json
+    case: eslint-empty-005
+    selector: invalid default catch 5
+    source_id: eslint-empty
+  source:
+    url: https://github.com/eslint/eslint
+    revision: b11bcb3675871ebffbac2088f85650718f4cf481
+    path: tests/lib/rules/no-empty.js
+    license: MIT
+    permission: Pinned upstream license; retained in licenses/eslint_license.txt
+    modifications:
+    - Extracted standalone example into an added-file diff; labels mapped to PrufGate rule IDs.
+    archive_sha256: 55675ffc787a3765039d015f5edd6832acc466cb159011e9d510692a5f5cd525
+    license_sha256: 3b6be04f862a077a4b97929dbf247299360824d9365f8603c263769303ace18c
+    upstream_sha256: 55675ffc787a3765039d015f5edd6832acc466cb159011e9d510692a5f5cd525
+-- head/src/example.js --
+try { foo() } catch (ex) {}

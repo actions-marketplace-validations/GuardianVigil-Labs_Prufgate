@@ -1,0 +1,42 @@
+# Extracted/modified for PrufGate evaluation; upstream notices and licenses are retained beside this corpus.
+-- label.yaml --
+category: fabrication
+description: PMD EmptyCatchBlock expected-problems with default properties; upstream naming/comment exceptions are retained. Case-rule presence only.
+must_fire:
+- unhandled-empty-catch
+must_not_fire: []
+evaluation:
+  language: java
+  framework: none
+  profile: core
+  origin: open-source
+  split: holdout
+  author: PrufGate corpus adapter
+  reviewers: []
+  label_basis: upstream-fixture
+  label_scope: explicit
+  upstream_labels:
+    manifest: manifest.json
+    case: pmd-empty-004
+    selector: 'test-code 4: multiple catch blocks'
+    source_id: pmd-empty
+  source:
+    url: https://github.com/pmd/pmd
+    revision: d3e2ec70efec82bb3365ba1cb67a1b25e15a146f
+    path: pmd-java/src/test/resources/net/sourceforge/pmd/lang/java/rule/errorprone/xml/EmptyCatchBlock.xml
+    license: LicenseRef-PMD-BSD-and-Apache
+    permission: Pinned upstream license; retained in licenses/pmd_license.txt
+    modifications:
+    - Extracted standalone example into an added-file diff; labels mapped to PrufGate rule IDs.
+    archive_sha256: 04acbcfdf0ccb3feaf4f10d916fc795827f449d3154c44788827d69248da96dd
+    license_sha256: 296dae48eae5658f449a89cf512b8e05386c9c5adfb23d74cfb24efa145625db
+    upstream_sha256: 04acbcfdf0ccb3feaf4f10d916fc795827f449d3154c44788827d69248da96dd
+-- head/src/example.java --
+public class Foo {
+    void foo() {
+        try {
+        } catch (Exception e) {
+        } catch (Throwable t) {
+        }
+    }
+}

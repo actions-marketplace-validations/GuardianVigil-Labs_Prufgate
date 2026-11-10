@@ -56,13 +56,15 @@ from prufgate.contract_guard.route_contract import (  # noqa: E402
     build_backend_api_index,
     scan_file_route_contracts,
 )
+from prufgate.process import git_command  # noqa: E402
+from prufgate.safe_fs import safe_read_text, safe_write_text  # noqa: E402
 
 SUPPORTED_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".py", ".go", ".rs"}
 
 
 def _git_paths(workspace: Path, args: list[str]) -> list[str]:
     res = subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+        git_command(*args),
         cwd=workspace,
         capture_output=True,
         text=True,
@@ -83,7 +85,7 @@ def _changed_files(workspace: Path, base: str | None = None) -> list[Path] | Non
     if base is not None and (not base or base.startswith("-")):
         raise ValueError(f"invalid base ref: {base!r}")
     probe = subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "rev-parse", "--is-inside-work-tree"],
+        git_command("rev-parse", "--is-inside-work-tree"),
         cwd=workspace,
         capture_output=True,
         text=True,
@@ -122,7 +124,7 @@ def _added_lines(workspace: Path, base: str | None) -> dict[str, set[int]]:
     from prufgate.diff_scope import _HUNK_RE, _unquote_git_path
 
     probe = subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "rev-parse", "--is-inside-work-tree"],
+        git_command("rev-parse", "--is-inside-work-tree"),
         cwd=workspace,
         capture_output=True,
         check=False,
@@ -213,7 +215,7 @@ def scan_contract_guard(
             continue
 
         try:
-            content = file_path.read_text(encoding="utf-8", errors="ignore")
+            content = safe_read_text(file_path, encoding="utf-8", errors="ignore")
         except OSError as e:
             raise RuntimeError(f"cannot read {rel_path}: {e}") from e
 
@@ -402,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json_out:
         out_path = Path(args.json_out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(serialized, indent=2) + "\n", encoding="utf-8")
+        safe_write_text(out_path, json.dumps(serialized, indent=2) + "\n", encoding="utf-8")
     elif findings:
         for f in findings:
             print(f)

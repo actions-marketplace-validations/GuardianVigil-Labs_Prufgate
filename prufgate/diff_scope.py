@@ -31,6 +31,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from prufgate.config import GitDiffError, _diff_base, _git  # noqa: E402
+from prufgate.safe_fs import safe_read_text  # noqa: E402
 
 Ranges = Dict[str, List[Tuple[int, int]]]
 WHOLE_FILE = (1, 10**9)
@@ -159,7 +160,7 @@ def _masked_lines(path: str) -> Tuple[str, ...]:
     )
 
     try:
-        text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        text = safe_read_text(Path(path), encoding="utf-8", errors="ignore")
     except OSError:
         return ()
     return tuple(mask(text).splitlines())
@@ -259,7 +260,7 @@ def load(path: Path) -> Optional[Ranges]:
     """Ranges written by `main`, or None when the file is absent (a full scan)."""
     if not path.is_file():
         return None
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(safe_read_text(path, encoding="utf-8"))
     return {str(k): [(int(a), int(b)) for a, b in v] for k, v in data.items()}
 
 

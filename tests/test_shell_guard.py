@@ -4,6 +4,7 @@ force pushes and removing tests or CI configuration."""
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -15,8 +16,10 @@ from unittest.mock import patch
 from prufgate.cli import main as cli_main
 from prufgate.hooks.agent_hooks import SHELL_GUARD_COMMAND, init_workspace
 from prufgate.hooks.shell_guard import check_command, run_hook
+from tests.support import installed_python
 
 ROOT = Path(__file__).resolve().parent.parent
+
 
 BLOCKED = [
     "git commit --no-verify -m 'wip'",
@@ -357,10 +360,12 @@ class HookProtocol(unittest.TestCase):
             self.assertEqual(cli_main(["shell-guard"]), 2)
 
     def test_hook_command_end_to_end(self):
-        # The installed hook, as Claude Code runs it, with the engine importable from this checkout.
+        # The installed hook, as Claude Code runs it, with a trusted editable installation.
         # This interpreter's folder comes first: on Windows it holds `python` and no `python3`.
         env = {"PATH": os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"]), "PYTHONPATH": str(ROOT)}
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as install:
+            python = installed_python(Path(install) / "venv")
+            env["PATH"] = str(python.parent) + os.pathsep + env["PATH"]
             env["HOME"] = tmp
             blocked = subprocess.run(["sh", "-c", SHELL_GUARD_COMMAND], cwd=tmp, env=env, capture_output=True,
                                      text=True, input=self._payload("git push -f"))
@@ -373,10 +378,13 @@ class HookProtocol(unittest.TestCase):
     @unittest.skipIf(sys.platform == "win32", "builds a POSIX sh shim for python3")
     def test_hook_command_falls_back_to_python(self):
         # Windows has `python` and no `python3`: here `python3` cannot import the engine, `python` can.
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as install:
             bin_dir = Path(tmp) / "bin"
             bin_dir.mkdir()
-            (bin_dir / "python").symlink_to(sys.executable)
+            python = installed_python(Path(install) / "venv")
+            launcher = bin_dir / "python"
+            launcher.write_text("#!/bin/sh\nexec " + shlex.quote(str(python)) + ' "$@"\n')
+            launcher.chmod(0o755)
             shim = bin_dir / "python3"
             shim.write_text("#!/bin/sh\nexit 1\n")
             shim.chmod(0o755)

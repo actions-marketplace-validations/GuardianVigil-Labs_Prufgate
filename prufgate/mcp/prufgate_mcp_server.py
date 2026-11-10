@@ -27,8 +27,15 @@ if str(PRUFGATE_ROOT) not in sys.path:
 
 from prufgate import __version__  # noqa: E402
 from prufgate.config import ConfigError  # noqa: E402
+from prufgate.coverage import merge as merge_coverage  # noqa: E402
+from prufgate.coverage import unavailable  # noqa: E402
 from prufgate.netguard import target_url_error  # noqa: E402
+from prufgate.privacy import redact  # noqa: E402
+from prufgate.process import git_command  # noqa: E402
+from prufgate.result_validation import read_json, validate_findings  # noqa: E402
 from prufgate.rules import low_confidence_enabled, visible  # noqa: E402
+from prufgate.safe_fs import safe_read_text  # noqa: E402
+from prufgate.scan_result import make_result, redact_result, validate_result  # noqa: E402
 
 ENGINE_DIR = PRUFGATE_ROOT / "prufgate"
 CLI = ENGINE_DIR / "cli.py"
@@ -45,6 +52,12 @@ TIMEOUT_SECONDS = int(os.environ.get("PRUFGATE_MCP_TIMEOUT", "300"))
 
 class ToolInputError(ValueError):
     """Bad tool arguments: reported to the caller as a tool error."""
+
+
+class EngineFindings(list):
+    def __init__(self, result: dict):
+        super().__init__(result["findings"])
+        self.result = result
 
 
 validate_target_url = target_url_error
@@ -72,10 +85,10 @@ def _resolve_base(ws: Path, ref: Optional[str]) -> tuple[str, Optional[str]]:
     working-tree diff". A ref that does not exist, or a clean tree with nothing
     to compare against, is an error: never an empty diff that reads as a pass."""
     if ref:
-        proc = subprocess.run(["git", "rev-parse", "--verify", "-q", "--end-of-options", f"{ref}^{{commit}}"],
+        proc = subprocess.run(git_command("rev-parse", "--verify", "-q", "--end-of-options", f"{ref}^{{commit}}"),
                               cwd=str(ws), capture_output=True, text=True)
         return (ref, None) if proc.returncode == 0 else ("", f"base ref {ref!r} is not a commit in this repository")
-    proc = subprocess.run([sys.executable, str(CLI), "base-ref", str(ws)], capture_output=True, text=True,
+    proc = subprocess.run([sys.executable, "-I", str(CLI), "base-ref", str(ws)], capture_output=True, text=True,
                           stdin=subprocess.DEVNULL, timeout=60)
     if proc.returncode != 0:
         return "", (proc.stderr.strip() or f"base-ref exited {proc.returncode}")
@@ -90,7 +103,7 @@ def _run_json(cmd: List[str], ws: Path, out_flag: Optional[str] = None, stdout_j
     """
     with tempfile.TemporaryDirectory(prefix="prufgate-mcp-") as tmp:
         out = Path(tmp) / "out.json"
-        full = [sys.executable, *cmd] + ([f"{out_flag}={out}"] if out_flag else [])
+        full = [sys.executable, "-I", *cmd] + ([f"{out_flag}={out}"] if out_flag else [])
         env = dict(os.environ, WORKSPACE=str(ws), PRUFGATE_REPORTS_DIR=str(Path(tmp) / "reports"), PRUFGATE_NO_AI_ADJUDICATE="1")
         try:
             proc = subprocess.run(
@@ -102,17 +115,37 @@ def _run_json(cmd: List[str], ws: Path, out_flag: Optional[str] = None, stdout_j
         except OSError as e:
             return None, f"could not start: {e}"
         tail = (proc.stderr or proc.stdout or "").strip()[-800:]
+        try:
+            data = read_json(proc.stdout if stdout_json else safe_read_text(out, encoding="utf-8"))
+        except FileNotFoundError:
+            return None, f"exited {proc.returncode} without writing its JSON output: {tail}"
+        except (OSError, ValueError):
+            return None, f"exited {proc.returncode} with unreadable JSON output: {tail}"
+        if isinstance(data, dict) and data.get("schema_version"):
+            try:
+                result = validate_result(data)
+                if result["exit_code"] != proc.returncode:
+                    raise ValueError("exit code disagrees with result")
+            except ValueError as exc:
+                return None, f"invalid scan result: {exc}"
+            return EngineFindings(result), "; ".join(result["errors"] + result["incomplete_reasons"]) or None
+        if proc.returncode == 2 and isinstance(data, dict) and data.get("status") == "incomplete":
+            try:
+                items = validate_findings(data.get("findings"), "unified")
+            except ValueError as exc:
+                return None, f"invalid partial findings: {exc}"
+            result = make_result(items, root=ws, profile="bola", incomplete=[str(data.get("error", "Live verification incomplete."))])
+            result["coverage"]["live_probe"] = data.get("coverage")
+            return EngineFindings(result), result["incomplete_reasons"][0]
         if proc.returncode not in (0, 1):
             return None, f"exited {proc.returncode}: {tail}"
         try:
-            data = json.loads(proc.stdout if stdout_json else out.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None, f"exited {proc.returncode} without writing its JSON output: {tail}"
-        except ValueError:
-            return None, f"exited {proc.returncode} with unreadable JSON output: {tail}"
-        items = data.get("findings", data) if isinstance(data, dict) else data
-        if not isinstance(items, list):
-            return None, "JSON output is not a list of findings"
+            kind = "pr-reviewer" if cmd[0] == str(SCRIPTS["review"]) else "contract-guard" if isinstance(data, dict) else "unified"
+            items = validate_findings(data, kind)
+        except ValueError as exc:
+            return None, f"invalid findings output: {exc}"
+        if proc.returncode == 1 and not items:
+            return None, "finding exit code without any findings"
         return items, None
 
 
@@ -121,30 +154,56 @@ def _result(
 ) -> Dict[str, Any]:
     """`cfg_ref`: the base a diff-based tool compared with ("HEAD" for the
     working-tree diff), where the configuration is read, like the engines do."""
+    source = getattr(findings, "result", None)
+    incomplete = extra.pop("_incomplete", [])
+    reports = extra.pop("_reports", [])
+    if source is not None and source["scan_status"] == "incomplete":
+        incomplete = source["incomplete_reasons"]
+        error = "; ".join(source["errors"]) or None
     findings = findings or []
     try:
         # Low-confidence rules are hidden and never block unless the config turns them on.
         findings = visible(findings, low_confidence_enabled(ws, ref=cfg_ref))
     except ConfigError as exc:
         error = "; ".join(filter(None, [error, f"config: {exc}"]))
-    blockers = sum(1 for f in findings if str(f.get("severity", "P0")).upper() in ("P0", "P1"))
+    coverage = source["coverage"] if source else merge_coverage(reports) if reports else None
+    if cfg_ref is not None:
+        coverage = dict(coverage or unavailable())
+        coverage["base_ref"] = coverage.get("base_ref") or cfg_ref
+    if coverage is not None and "steps" in extra:
+        engines = {entry["engine"]: entry for entry in coverage.get("engines", [])}
+        for name, info in extra["steps"].items():
+            if name == "check":
+                continue
+            engine = "pr-reviewer" if name == "review" else name
+            engines[engine] = {"engine": engine, "status": "completed" if info["status"] == "ok" else info["status"],
+                               "reason": info.get("reason", ""), "input_counts": "unknown"}
+        coverage["engines"] = list(engines.values())
+    profile = "core+review" if tool == "prufgate_full_scan" else "core" if tool == "prufgate_fast_scan" else "review" if tool == "prufgate_review" else "engine"
+    result = make_result(findings, root=ws, coverage=coverage, errors=[error] if error else [], incomplete=incomplete,
+                         profile=source["profile"] if source else profile, privacy=source["privacy"] if source else None,
+                         # The CLI scan already applied policy and dismissals: never twice.
+                         enforcement=source.get("enforcement") if source else None,
+                         revision=source.get("revision") if source else None)
+    if source and source.get("governance"):
+        result["governance"] = source["governance"]
+    blockers = result["summary"]["blockers"]
     res: Dict[str, Any] = {
+        **result,
         "tool": tool,
         "workspace": str(ws),
-        "status": "error" if error else "ok",
-        "passed": error is None and blockers == 0,
+        "status": "error" if error or incomplete else "ok",
         "blockers": blockers,
-        "total_findings": len(findings),
-        "findings": findings,
+        "total_findings": result["summary"]["total_findings"],
         **extra,
     }
     if error:
         res["error"] = error
-    return res
+    return redact_result(res)
 
 
 def _check_cmd(ws: Path, changed: bool, base: Optional[str]) -> List[str]:
-    cmd = [str(CLI), "check", str(ws), "--format", "json"]
+    cmd = [str(CLI), "check", str(ws), "--format", "result"]
     if changed:
         cmd.append("--changed")
     if base:
@@ -176,15 +235,22 @@ def prufgate_full_scan(workspace_path: str = ".", base_ref: Optional[str] = None
     steps: Dict[str, Any] = {}
     findings: List[Dict[str, Any]] = []
     errors: List[str] = []
+    incomplete, coverage_reports = [], []
 
     def add(name: str, items: Optional[list], err: Optional[str]) -> None:
         steps[name] = {"status": "error" if err else "ok", "findings": len(items or [])}
-        if err:
+        report = getattr(items, "result", None)
+        if report:
+            coverage_reports.append(report["coverage"])
+        if report and report["scan_status"] == "incomplete":
+            incomplete.extend(report["incomplete_reasons"])
+            steps[name]["status"] = "incomplete"
+        elif err:
             errors.append(f"{name}: {err}")
         findings.extend(items or [])
 
-    add("check", *_run_json(_check_cmd(ws, False, base), ws, stdout_json=True))
     review_base, base_err = _resolve_base(ws, base)
+    add("check", *_run_json(_check_cmd(ws, False, base or review_base or None), ws, stdout_json=True))
     if base_err:
         # The whole-workspace check ran; only the diff review has no input.
         steps["review"] = {"status": "skipped", "reason": base_err}
@@ -194,7 +260,8 @@ def prufgate_full_scan(workspace_path: str = ".", base_ref: Optional[str] = None
         add("bola_live", *_run_json(_bola_cmd(ws, target_url), ws, stdout_json=True))
     cfg_ref = None if base_err else review_base or "HEAD"
     return _result(
-        "prufgate_full_scan", ws, findings, "; ".join(errors) or None, cfg_ref=cfg_ref, steps=steps, base_ref=base, target_url=target_url
+        "prufgate_full_scan", ws, findings, "; ".join(errors) or None, cfg_ref=cfg_ref, steps=steps, base_ref=base, target_url=target_url,
+        _incomplete=incomplete, _reports=coverage_reports,
     )
 
 
@@ -275,13 +342,21 @@ def prufgate_summary(workspace_path: str = ".") -> Dict[str, Any]:
     """Read the last report written by ./prufgate.sh, without running a scan."""
     ws = _workspace(workspace_path)
     sarif, md = ws / "reports" / "prufgate.sarif", ws / "reports" / "prufgate-review.md"
+    try:
+        content = safe_read_text(md, encoding="utf-8", errors="replace")[:4000] if md.exists() else None
+        if sarif.exists():
+            # Even the report advertised to the client must be a safe file.
+            safe_read_text(sarif)
+    except OSError:
+        return {"tool": "prufgate_summary", "status": "error",
+                "error": "report could not be read safely"}
     return {
         "tool": "prufgate_summary",
         "workspace": str(ws),
         "status": "found" if sarif.exists() or md.exists() else "not_found",
         "sarif_report": str(sarif) if sarif.exists() else None,
         "markdown_report": str(md) if md.exists() else None,
-        "markdown_content": md.read_text(encoding="utf-8", errors="replace")[:4000] if md.exists() else None,
+        "markdown_content": redact(content) if content is not None else None,
     }
 
 

@@ -1,5 +1,7 @@
 # Benchmark
 
+For provenance-aware language/framework dashboards, independent-label requirements and the additional syntax evaluation seed, see [Detection quality](EVALUATION.md). The maintainer benchmark below remains a regression measurement.
+
 `prufgate bench` measures how often PrufGate is right, on a labelled corpus kept in this repository (`bench/cases/`). Tools in this space rarely publish precision; this page publishes ours, misses included, and the corpus that produced it.
 
 **Read the numbers with care.** The corpus is small, and the maintainers wrote it, cases and labels alike, alongside the engines they measure. It is a regression floor and a statement of what PrufGate is meant to catch, not an independent evaluation. Cases from other people, especially changes PrufGate gets wrong, are the most useful contribution you can make (see [Adding a case](#adding-a-case)).

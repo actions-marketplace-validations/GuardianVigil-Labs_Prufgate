@@ -1,0 +1,37 @@
+# Extracted/modified for PrufGate evaluation; upstream notices and licenses are retained beside this corpus.
+-- label.yaml --
+category: clean
+description: 'Bandit B501 independently authored predicate: supported requests/httpx calls with literal verify=False are positive; enabled/default verification is negative. No comment-group label is inferred.'
+must_fire: []
+must_not_fire:
+- pr-disabled-tls-certificate-verification
+evaluation:
+  language: python
+  framework: httpx
+  profile: review
+  origin: open-source
+  split: holdout
+  author: PrufGate corpus adapter
+  reviewers: []
+  label_basis: upstream-specification
+  label_scope: explicit
+  upstream_labels:
+    manifest: manifest.json
+    case: bandit-tls-027
+    selector: call at archived line 34
+    source_id: bandit-tls
+  source:
+    url: https://github.com/PyCQA/bandit
+    revision: 48ef27bd1bbc32f4e585c92310f7a574e87f6b04
+    path: examples/requests-ssl-verify-disabled.py
+    license: Apache-2.0
+    permission: Pinned upstream license; retained in licenses/bandit_license.txt
+    modifications:
+    - Replaced public example URL destination with https://example.com; no verification settings changed.
+    - Extracted standalone example into an added-file diff; labels mapped to PrufGate rule IDs.
+    archive_sha256: bbd4d95ab9eb458da22859538247dc9641652d3e33b0c24563472ae78f8f32ba
+    license_sha256: 09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b
+    upstream_sha256: 7da634f602141c1331242a7d681ebf2ac128dd9d23973d4b7268845a63848e21
+-- head/src/example.py --
+import httpx
+httpx.patch('https://example.com', timeout=30, verify=True)

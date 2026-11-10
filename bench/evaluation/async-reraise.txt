@@ -1,0 +1,18 @@
+-- label.yaml --
+category: clean
+description: Syntax and control flow example async-reraise
+must_fire: []
+must_not_fire: [canned-error-fallback]
+evaluation:
+  origin: synthetic
+  language: python
+  framework: asyncio
+  author: maintainer-role
+  reviewers: []
+  split: regression
+-- head/app.py --
+async def run():
+    try:
+        return await calculate()
+    except ValueError:
+        raise

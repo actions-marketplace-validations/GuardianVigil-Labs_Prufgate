@@ -42,6 +42,8 @@ from prufgate.contract_guard.dependency_guard import (
     cargo_dependencies,
     find_manifest_files,
 )
+from prufgate.process import git_command
+from prufgate.safe_fs import safe_read_text
 
 USER_AGENT = "prufgate-registry-check (+https://github.com/GuardianVigil-Labs/Prufgate)"
 TIMEOUT_SECONDS = 10
@@ -282,7 +284,7 @@ def _manifest_names(kind: str, text: str) -> list[tuple[str, str]]:
 
 
 def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=workspace, capture_output=True, text=True, timeout=30, check=False)
+    return subprocess.run(git_command(*args), cwd=workspace, capture_output=True, text=True, timeout=30, check=False)
 
 
 def added_dependencies(workspace: Path, base: str | None) -> list[tuple[str, str, str, str]]:
@@ -306,7 +308,7 @@ def added_dependencies(workspace: Path, base: str | None) -> list[tuple[str, str
     for kind, paths in find_manifest_files(workspace).items():
         for path in paths:
             rel = path.relative_to(workspace).as_posix()
-            head_text = path.read_text(encoding="utf-8", errors="ignore")
+            head_text = safe_read_text(path, encoding="utf-8", errors="ignore")
             shown = _git(workspace, "show", f"{base_commit}:{rel}")
             base_text = shown.stdout if shown.returncode == 0 else ""
             base_names |= {(e, canonical(e, n)) for e, n in _manifest_names(kind, base_text)}
@@ -330,7 +332,7 @@ def cache_path() -> Path:
 
 def _load_cache(path: Path) -> dict[str, dict[str, object]]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(safe_read_text(path, encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}

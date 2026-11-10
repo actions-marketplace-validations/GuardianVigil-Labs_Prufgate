@@ -56,6 +56,21 @@ class ParseTest(unittest.TestCase):
         lines = [f"{{/* {IGN}: r -- placeholder */}}", "bad()"]
         self.assertEqual(len(inline_ignore.context(lines, 2)), 2)
 
+    def test_jsx_apostrophe_does_not_hide_later_ignores(self):
+        lines = ["<p>Don't worry</p>", f"{{/* {IGN}: r -- placeholder */}}", "bad()"]
+        self.assertIn(IGN, " ".join(inline_ignore.context(lines, 3, "Page.tsx")))
+
+    def test_rust_lifetimes_do_not_hide_later_ignores(self):
+        lines = [
+            "fn pick<'a>(input: &'a str) -> &'a str { input }",
+            f"// {IGN}: r -- placeholder",
+            "bad()",
+        ]
+        self.assertIn(IGN, " ".join(inline_ignore.context(lines, 3, "lib.rs")))
+        # Char literals stay literals: a quote inside one does not open a string.
+        line = f"let q = '\"'; let e = '\\''; bad() // {IGN}: r -- placeholder"
+        self.assertIn(IGN, " ".join(inline_ignore.context([line], 1, "lib.rs")))
+
     def test_review_rule_ids_are_ignorable_and_match_sarif(self):
         rule = inline_ignore.review_rule_id("Unsanitized HTML Injection (XSS)")
         self.assertEqual(rule, "pr-unsanitized-html-injection-xss")

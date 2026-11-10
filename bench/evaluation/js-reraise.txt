@@ -1,0 +1,16 @@
+-- label.yaml --
+category: clean
+description: Syntax and control flow example js-reraise
+must_fire: []
+must_not_fire: [canned-error-fallback]
+evaluation:
+  origin: synthetic
+  language: javascript
+  framework: none
+  author: maintainer-role
+  reviewers: []
+  split: regression
+-- head/app.js --
+export function run() {
+  try { return calculate(); } catch (err) { throw err; }
+}

@@ -3,8 +3,16 @@ Copyright 2026 GuardianVigil
 
 This product is licensed under the Apache License, Version 2.0 (LICENSE).
 
-The source distribution and the wheel bundle no third-party code. PrufGate
-depends on PyYAML (MIT licence), which pip installs separately.
+The runtime package does not vendor third-party libraries. PrufGate depends
+on PyYAML (MIT licence), which pip installs separately.
+
+The source checkout includes third-party evaluation data adapted from Bandit,
+ESLint and PMD. These text fixtures are not runtime modules. Their attribution,
+modification notices and retained licences are in bench/testdata/independent/README.md
+and bench/testdata/independent/licenses/. Those files retain their upstream terms.
+
+This product includes software developed in part by support from the
+Defense Advanced Research Project Agency (DARPA).
 
 The container image (ghcr.io/guardianvigil-labs/prufgate) also contains, each
 under its own licence:

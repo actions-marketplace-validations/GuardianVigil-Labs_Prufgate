@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from prufgate.hooks.shell_guard import RUN_IT_YOURSELF, check_command, protected, protected_config
+from prufgate.process import cli_command
 
 AGENTS = ("claude", "codex", "copilot", "cursor", "gemini")
 EVENTS = ("pre-tool", "shell", "stop")
@@ -156,7 +157,7 @@ def run_check(cwd: str) -> tuple[int, str]:
     env["PYTHONPATH"] = os.pathsep.join(p for p in (package_parent, env.get("PYTHONPATH", "")) if p)
     try:
         r = subprocess.run(
-            [sys.executable, "-m", "prufgate.cli", "check", "--changed", "--format", "agent-hook", "."],
+            cli_command("check", "--changed", "--format", "agent-hook", "."),
             cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=_STOP_TIMEOUT,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
